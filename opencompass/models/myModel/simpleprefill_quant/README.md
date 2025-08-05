@@ -1,0 +1,1 @@
+只在prefill时量化一次kv cache的方法
