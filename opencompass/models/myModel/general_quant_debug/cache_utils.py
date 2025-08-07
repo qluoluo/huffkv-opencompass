@@ -92,9 +92,9 @@ class CustomCache(DynamicCache):
 
 
         # Split local cache into remaining and excess parts
-        cache_dict["local"], excess_tensor = (
-            cache_dict["local"][..., excess_length:, :],
+        excess_tensor, cache_dict["local"] = (
             cache_dict["local"][..., :excess_length, :],
+            cache_dict["local"][..., excess_length:, :],
         )
 
         # Apply grouping if specified
@@ -103,6 +103,9 @@ class CustomCache(DynamicCache):
 
         # Quantize excess tensor
         excess_quant_data = quant_func(excess_tensor)
+        
+        if layer_idx == 8:
+            print(f"{layer_idx=}, {excess_length=}, compress shape = {excess_tensor.shape}")
 
         # Update mid cache
         self._update_mid_cache(cache_dict, excess_quant_data, layer_idx)
@@ -121,8 +124,6 @@ class CustomCache(DynamicCache):
         )
 
     def _update_mid_cache(self, cache_dict: dict, quant_data, layer_idx=-1):
-        # if self.group_size <= 0:
-        #     raise NotImplementedError("Group size == 0 not supported for update_mid_cache")
 
         """Update mid cache with quantized data."""
         if cache_dict["mid"] is not None:
@@ -205,6 +206,10 @@ class CustomCache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
 
+        if layer_idx == 8:
+            print(f"{layer_idx=}, now update kv cache {key_states.shape}")
+            self.print_cache_stats(layer_idx)
+
         
         if len(self.key_cache) <= layer_idx:
             self.prefill_stage = True
@@ -224,8 +229,9 @@ class CustomCache(DynamicCache):
                 f"prefill input length too short: {key_states.shape[-2]=} <= {self.global_length=} + {self.local_length=}"
 
             # Setup global cache
-            self.key_cache[layer_idx]["global"] = key_states[..., :self.global_length, :]
-            self.value_cache[layer_idx]["global"] = value_states[..., :self.global_length, :]
+            if self.global_length > 0:
+                self.key_cache[layer_idx]["global"] = key_states[..., :self.global_length, :]
+                self.value_cache[layer_idx]["global"] = value_states[..., :self.global_length, :]
             key_states = key_states[..., self.global_length:, :]
             value_states = value_states[..., self.global_length:, :]
 
@@ -243,8 +249,8 @@ class CustomCache(DynamicCache):
             self.group_size, self.value_quant_func
         )
 
-        if layer_idx == 0:
-            print(f"{layer_idx=}")
+        if layer_idx == 8:
+            print(f"{layer_idx=}, now return kv cache {ret_key_cache.shape}")
             self.print_cache_stats(layer_idx)
 
         return ret_key_cache, ret_value_cache
@@ -277,7 +283,7 @@ class CustomCache(DynamicCache):
 
     def print_cache_stats(self, layer_idx: int) -> None:
         if layer_idx >= len(self.key_cache):
-            print(f"Layer {layer_idx} does not exist")
+            print(f"Layer {layer_idx}: global={0}  mid={0}  local={0}")
             return
         g = self.get_cache_length(layer_idx, "global")
         m = self.get_cache_length(layer_idx, "mid")

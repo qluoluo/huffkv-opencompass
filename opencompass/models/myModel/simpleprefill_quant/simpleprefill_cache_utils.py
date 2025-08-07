@@ -45,14 +45,16 @@ class SimplePrefill_Cache(DynamicCache):
         # 更新已处理的token计数（仅在首层更新）
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
+
+        print(f"{layer_idx} Input shape = {key_states.shape}")
         
         # 处理GQA情况（分组查询注意力）
         bsz, num_heads, seq_len, head_dim = query_states.shape
         _, num_kv_heads, _, _ = key_states.shape
-        if num_heads != num_kv_heads:
-            num_groups = num_heads // num_kv_heads
-            key_states = repeat_kv(key_states, num_groups)
-            value_states = repeat_kv(value_states, num_groups)
+        # if num_heads != num_kv_heads:
+        #     num_groups = num_heads // num_kv_heads
+        #     key_states = repeat_kv(key_states, num_groups)
+        #     value_states = repeat_kv(value_states, num_groups)
         
         # 确保该层缓存已初始化
         self._initialize_layer_cache(layer_idx)
@@ -72,6 +74,7 @@ class SimplePrefill_Cache(DynamicCache):
         # 存储更新后的缓存
         if current_key_cache is None:
             print(f"Prefill Stage in {layer_idx=}")
+            print(f"Compress shape = {ret_key_cache.shape}")
             from .quant_utils import quantize_tensor, dequantize_tensor
             self.key_cache[layer_idx] = dequantize_tensor(*quantize_tensor(ret_key_cache, 
                                                             self.kvcache_settings['k_bits'], 
@@ -83,6 +86,8 @@ class SimplePrefill_Cache(DynamicCache):
             print(f"Decode Stage in {layer_idx=}")
             self.key_cache[layer_idx] = ret_key_cache
             self.value_cache[layer_idx] = ret_value_cache
+        
+        print(f"{layer_idx} Return shape = {ret_key_cache.shape}")
         
         return ret_key_cache, ret_value_cache
 

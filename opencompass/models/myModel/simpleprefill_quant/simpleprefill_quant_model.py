@@ -39,6 +39,9 @@ class LlamaForCausalLM_SimplePrefill_OC(HuggingFaceCausalLM):
             "window_size": 128,
             "sparse_num": 128,
             "pool_kernel_size": -1,
+            "global_residual_length": 0,
+            "local_residual_length": 0,
+            "group_size": -1,
         }
 
         # 使用字典推导式提取值并设置默认值
