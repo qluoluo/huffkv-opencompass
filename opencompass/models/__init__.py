@@ -58,21 +58,21 @@ from .myModel.hf_niah_model import HuggingFaceCausalLMForNIAH
 
 try:
     from .myModel.general_quant.general_quant_model import LlamaForCausalLM_GeneralQuant_OC
+    from .myModel.general_quant_prefill.general_quant_model import LlamaForCausalLM_GeneralQuant_Prefill_OC
 except:
     pass
 
 try:
     from .myModel.kivi.kivi_model import LlamaForCausalLM_KIVI_OC
+    from .myModel.kivi_prefill.kivi_model import LlamaForCausalLM_KIVI_OC as LlamaForCausalLM_KIVI_Prefill_OC
 except:
     pass
 
 try:
     from .myModel.huffkv.huffkv_quant_model import LlamaForCausalLM_HuffKV_OC
+    from .myModel.huffkv_8_5.huffkv_quant_model import LlamaForCausalLM_HuffKV_OC as LlamaForCausalLM_HuffKV_8_5_OC
 except:
     pass
-
-
-from .myModel.huffkv_8_5.huffkv_quant_model import LlamaForCausalLM_HuffKV_OC
 
 
 try:

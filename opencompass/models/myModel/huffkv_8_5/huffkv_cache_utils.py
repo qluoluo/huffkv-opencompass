@@ -55,7 +55,7 @@ class HuffKVCache(DynamicCache):
                     token_group_size=self.kvcache_settings['k_tgsz'],
                     name=f"layer{layer_idx}_k", 
                     debug=self.debug,
-                    minus_mean=True,
+                    minus_mean=self.kvcache_settings['minus_mean'],
                 ), 
                 "window": None
             })
@@ -67,7 +67,7 @@ class HuffKVCache(DynamicCache):
                     token_group_size=self.kvcache_settings['v_tgsz'],
                     name=f"layer{layer_idx}_v", 
                     debug=self.debug,
-                    minus_mean=True,
+                    minus_mean=self.kvcache_settings['minus_mean'],
                 ), 
                 "window": None
             })

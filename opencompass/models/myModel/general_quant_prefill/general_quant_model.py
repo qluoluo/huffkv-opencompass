@@ -19,11 +19,11 @@ PromptType = Union[PromptList, str]
 # from .huggingface import HuggingFaceCausalLM
 # from opencompass.models.huggingface import HuggingFaceCausalLM
 from opencompass.models.myModel.hf_strip_model import HuggingFaceCausalLM_Strip as HuggingFaceCausalLM
-from .huffkv_modeling_llama import LlamaForCausalLM
+from .modeling_llama_general_quant import LlamaForCausalLM
 from transformers import LlamaConfig
 
 @MODELS.register_module()
-class LlamaForCausalLM_HuffKV_OC(HuggingFaceCausalLM):
+class LlamaForCausalLM_GeneralQuant_Prefill_OC(HuggingFaceCausalLM):
     def _load_model(self,
                     path: str,
                     kwargs: dict,
@@ -32,19 +32,15 @@ class LlamaForCausalLM_HuffKV_OC(HuggingFaceCausalLM):
 
         model_kwargs = kwargs
         config_kvcache_settings = {
-            "k_bits": 4,
-            "k_cgsz": -1,
-            "k_tgsz": -1,
-
-            "v_bits": 4,
-            "v_cgsz": -1,
-            "v_tgsz": -1,
-
-            "minus_mean": False,
-            
-            "window_size": 128,
-            "sparse_num": 128,
-            "pool_kernel_size": -1,
+            "k_bits": None,
+            "v_bits": None,
+            "k_quant_dim": None, # [bsz, num_heads, seq_len, head_dim] KIVI: k->head_dim*numheads v: seq_len
+            "v_quant_dim": None,
+            "global_residual_length": None, # global_size
+            "local_residual_length": None, # local_size
+            "key_group_size": -1, # seq_len -> group_size
+            "value_group_size": -1,
+            "rope_scaling": None,
         }
 
         # 使用字典推导式提取值并设置默认值
@@ -56,11 +52,21 @@ class LlamaForCausalLM_HuffKV_OC(HuggingFaceCausalLM):
         # 从预训练路径加载配置
         config = LlamaConfig.from_pretrained(path)
 
+        # 将提取的值赋值给 config 对象
+        for key, value in config_kvcache_settings.items():
+            setattr(config, key, value)
+        
+        from types import SimpleNamespace
+        config_kvcache_settings = SimpleNamespace(**config_kvcache_settings)
         config.kvcache_settings = config_kvcache_settings
+
+        # CACHE_DIR = './cache'
 
         self.model = LlamaForCausalLM.from_pretrained(
             pretrained_model_name_or_path=path,
             config=config,
+            # cache_dir=CACHE_DIR,
+            # low_cpu_mem_usage=True,
             **model_kwargs
         )
 
