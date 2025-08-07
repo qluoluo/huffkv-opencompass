@@ -281,7 +281,7 @@ class LlamaAttention(nn.Module):
             #     key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
             # else:
             #     past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            key_states, value_states = past_key_value.update(query_states, key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         #####################################################################################
 
         attention_interface: Callable = eager_attention_forward

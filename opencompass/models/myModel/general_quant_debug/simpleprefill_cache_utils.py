@@ -49,8 +49,8 @@ class SimplePrefill_Cache(DynamicCache):
         print(f"{layer_idx} Input shape = {key_states.shape}")
         
         # 处理GQA情况（分组查询注意力）
-        bsz, num_heads, seq_len, head_dim = query_states.shape
-        _, num_kv_heads, _, _ = key_states.shape
+        # bsz, num_heads, seq_len, head_dim = query_states.shape
+        bsz, num_kv_heads, seq_len, head_dim = key_states.shape
         # if num_heads != num_kv_heads:
         #     num_groups = num_heads // num_kv_heads
         #     key_states = repeat_kv(key_states, num_groups)
@@ -77,11 +77,11 @@ class SimplePrefill_Cache(DynamicCache):
             print(f"Compress shape = {ret_key_cache.shape}")
             from .quant_utils import quantize_tensor, dequantize_tensor
             self.key_cache[layer_idx] = dequantize_tensor(*quantize_tensor(ret_key_cache, 
-                                                            self.kvcache_settings['k_bits'], 
-                                                            self.kvcache_settings['k_quant_dim']))
+                                                            self.kvcache_settings.k_bits, 
+                                                            self.kvcache_settings.k_quant_dim))
             self.value_cache[layer_idx] = dequantize_tensor(*quantize_tensor(ret_value_cache, 
-                                                            self.kvcache_settings['v_bits'], 
-                                                            self.kvcache_settings['v_quant_dim']))
+                                                            self.kvcache_settings.v_bits, 
+                                                            self.kvcache_settings.v_quant_dim))
 
             # print(f"{(self.key_cache[layer_idx] - ret_key_cache).flatten()[:10]=}")
             # print(f"{(self.key_cache[layer_idx] - ret_key_cache).abs().mean()=}")

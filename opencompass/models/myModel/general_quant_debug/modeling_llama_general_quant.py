@@ -559,7 +559,8 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if type(past_key_values) is DynamicCache:
             print("-------------Replace DynamicCache with a custom Cache class-------------", flush=True)
-            from .cache_utils import CustomCache
+            # from .cache_utils import CustomCache
+            from .simpleprefill_cache_utils import SimplePrefill_Cache as CustomCache
             past_key_values = CustomCache(self.config)
             # print(f"{past_key_values.key_cache_dict[0]}")
 

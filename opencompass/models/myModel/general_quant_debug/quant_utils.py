@@ -13,14 +13,18 @@ def quantize_tensor(x, nbit, dim):
     # 量化
     x_quantized = ((x - zero_point) / scale).round().clamp(0, 2**nbit - 1).to(dtype=torch.int64)
 
-    print(f"Quant func {x_quantized.shape=}, {x_quantized.dtype=}, {scale.shape=}, {scale.dtype=}, {zero_point.shape=}, {zero_point.dtype=}")
+    # print(f"GQ-DEBUG Quant func {nbit=} {dim=} \n{x_quantized.shape=}, {x_quantized.dtype=}, {x_quantized.flatten()[:10]=}\n \
+    #     {scale.shape=}, {scale.dtype=}\n \
+    #     {zero_point.shape=}, {zero_point.dtype=}")
     
     return x_quantized, scale, zero_point
 
 def dequantize_tensor(x_quantized, scale, zero_point):
     # 还原
 
-    print(f"Quant func {x_quantized.shape=}, {x_quantized.dtype=}, {scale.shape=}, {scale.dtype=}, {zero_point.shape=}, {zero_point.dtype=}")
+    # print(f"GQ-DEBUG DeQuant func \n{x_quantized.shape=}, {x_quantized.dtype=}, {x_quantized.flatten()[:10]=}\n \
+    #     {scale.shape=}, {scale.dtype=}\n \
+    #     {zero_point.shape=}, {zero_point.dtype=}")
 
     x_dequantized = x_quantized * scale + zero_point
     return x_dequantized

@@ -30,7 +30,7 @@ class LlamaForCausalLM_KIVI_OC(HuggingFaceCausalLM):
         model_kwargs = kwargs
         k_bits, v_bits, group_size, residual_length = model_kwargs.pop("k_bits"), model_kwargs.pop("v_bits"), model_kwargs.pop("group_size"), model_kwargs.pop("residual_length")
         use_flash = model_kwargs.pop("use_flash", True)
-        rope_scaling = model_kwargs.pop('rope_scaling', None)
+        # rope_scaling = model_kwargs.pop('rope_scaling', None)
 
         # if model_kwargs.get("torch_dtype", "torch.bfloat16") == "torch.bfloat16":
         #     model_kwargs["torch_dtype"] = torch.bfloat16
@@ -47,7 +47,7 @@ class LlamaForCausalLM_KIVI_OC(HuggingFaceCausalLM):
         config.group_size = group_size
         config.residual_length = residual_length # the number of recent fp16 tokens
         config.use_flash = use_flash
-        config.rope_scaling = rope_scaling
+        # config.rope_scaling = rope_scaling
         CACHE_DIR = './cache'
 
         print(f"{model_kwargs=}")

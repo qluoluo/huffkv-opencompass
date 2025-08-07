@@ -36,10 +36,16 @@ class LlamaForCausalLM_GeneralQuant_OC(HuggingFaceCausalLM):
             "v_bits": None,
             "k_quant_dim": None, # [bsz, num_heads, seq_len, head_dim] KIVI: k->head_dim*numheads v: seq_len
             "v_quant_dim": None,
-            "global_residual_length": None, # global_size
-            "local_residual_length": None, # local_size
-            "group_size": -1, # seq_len -> group_size
-            "rope_scaling": None,
+            "window_size": 128,
+            "sparse_num": 128,
+            "pool_kernel_size": -1,
+            "global_residual_length": 0,
+            "local_residual_length": 0,
+            "group_size": -1,
+            # "global_residual_length": None, # global_size
+            # "local_residual_length": None, # local_size
+            # "group_size": -1, # seq_len -> group_size
+            # "rope_scaling": None,
         }
 
         # 使用字典推导式提取值并设置默认值
@@ -52,8 +58,8 @@ class LlamaForCausalLM_GeneralQuant_OC(HuggingFaceCausalLM):
         config = LlamaConfig.from_pretrained(path)
 
         # 将提取的值赋值给 config 对象
-        for key, value in config_kvcache_settings.items():
-            setattr(config, key, value)
+        # for key, value in config_kvcache_settings.items():
+        #     setattr(config, key, value)
         
         from types import SimpleNamespace
         config_kvcache_settings = SimpleNamespace(**config_kvcache_settings)
