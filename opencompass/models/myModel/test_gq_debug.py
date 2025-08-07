@@ -6,7 +6,7 @@ from peft import PeftModel
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
-from general_quant.modeling_llama_general_quant import LlamaForCausalLM
+from general_quant_debug.modeling_llama_general_quant import LlamaForCausalLM
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = "7"
 
@@ -22,9 +22,8 @@ config_kvcache_settings = {
     "k_quant_dim": -2, # [bsz, num_heads, seq_len, head_dim] KIVI: k->head_dim*numheads v: seq_len
     "v_quant_dim": -2,
     "global_residual_length": 4, # global_size
-    "local_residual_length": 128, # local_size
-    "key_group_size": -1, # seq_len -> group_size
-    "value_group_size": -1,
+    "local_residual_length": 100, # local_size
+    "group_size": -1, # seq_len -> group_size
     "rope_scaling": None,
 }
 from types import SimpleNamespace
@@ -53,8 +52,12 @@ tokenizer = AutoTokenizer.from_pretrained(
 # 测试生成
 # text = "User: Please write a story about a robot and a fish.\nAssistant:"
 # text = "User: Please introduce yourself.\nAssistant:"
-text = "hello " * (4 * 1024)
-
+# text = "hello " * (4 * 1024)
+text = "User: Please find the magic number in the text." + "Sky is blue, grass is green, sun is red." * 500 + \
+    "The magic number is 9376283." + \
+    "Sky is blue, grass is green, sun is red." * 500 + \
+    "\n\nUser:"
+    
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")
 outputs = model.generate(**inputs, max_new_tokens=100,

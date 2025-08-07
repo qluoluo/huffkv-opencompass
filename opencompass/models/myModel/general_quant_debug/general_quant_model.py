@@ -38,8 +38,7 @@ class LlamaForCausalLM_GeneralQuant_OC(HuggingFaceCausalLM):
             "v_quant_dim": None,
             "global_residual_length": None, # global_size
             "local_residual_length": None, # local_size
-            "key_group_size": -1, # seq_len -> group_size
-            "value_group_size": -1,
+            "group_size": -1, # seq_len -> group_size
             "rope_scaling": None,
         }
 

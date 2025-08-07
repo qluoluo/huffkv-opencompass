@@ -16,6 +16,7 @@ class SimplePrefill_Cache(DynamicCache):
         self.kvcache_settings = config.kvcache_settings
 
         print("-------------------- SimplePrefill_Cache init --------------------")
+        self.debug = True
 
     def _initialize_layer_cache(self, layer_idx: int):
         """初始化指定层的缓存空间"""
