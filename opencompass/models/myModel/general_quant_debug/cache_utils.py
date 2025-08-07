@@ -8,7 +8,7 @@ from .quant_utils import quantize_tensor, dequantize_tensor
 
 class CustomCache(DynamicCache):
     """
-    Custom cache implementation with two-tier storage (mid, local) 
+    Custom cache implementation with three-tier storage (global, mid, local) 
     and independent quantization for key and value tensors.
     """
     
@@ -20,6 +20,8 @@ class CustomCache(DynamicCache):
             CustomCache.CustomCache_init = True
             print("-------------------- CustomCache init --------------------")
 
+        # self.key_cache: List[dict] = []
+        # self.value_cache: List[dict] = []
         self.key_cache = []
         self.value_cache = []
         self._seen_tokens = 0
@@ -51,9 +53,30 @@ class CustomCache(DynamicCache):
     def _initialize_layer_cache(self, layer_idx: int):
         """Initialize cache dictionaries for a new layer if not present."""
         if len(self.key_cache) <= layer_idx:
-            # Remove global from initialization
-            self.key_cache.append({"mid": None, "local": None})
-            self.value_cache.append({"mid": None, "local": None})
+            self.key_cache.append({"global": None, "mid": None, "local": None})
+            self.value_cache.append({"global": None, "mid": None, "local": None})
+
+    def _setup_global_cache(self, key_states: torch.Tensor, value_states: torch.Tensor, 
+                          current_key_cache: dict, current_value_cache: dict, 
+                          global_length: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Set up global cache with the first `global_length` tokens.
+        Returns the remaining key_states and value_states after global extraction.
+        """
+        if current_key_cache["global"] is None:
+            if key_states.shape[-2] < global_length:
+                raise ValueError(
+                    f"global_length ({global_length}) must be less than or equal to "
+                    f"key_states.shape[-2] ({key_states.shape[-2]})"
+                )
+
+            current_key_cache["global"] = key_states[..., :global_length, :]
+            current_value_cache["global"] = value_states[..., :global_length, :]
+
+            key_states = key_states[..., global_length:, :]
+            value_states = value_states[..., global_length:, :]
+
+        return key_states, value_states
 
     def _update_local_cache(self, key_states: torch.Tensor, value_states: torch.Tensor,
                           current_key_cache: dict, current_value_cache: dict):
@@ -77,9 +100,7 @@ class CustomCache(DynamicCache):
             group_size: Group size for quantization
             quant_func: Quantization function to use
         """
-        return
-
-        if cache_dict["local"] is None or cache_dict["local"].shape[-2] <= local_length:
+        if cache_dict["local"].shape[-2] <= local_length:
             return
 
         excess_length = cache_dict["local"].shape[-2] - local_length
@@ -145,12 +166,15 @@ class CustomCache(DynamicCache):
         return key_cache, value_cache
 
     def _reconstruct_cache(self, layer_idx: int, is_key: bool) -> torch.Tensor:
-        """Reconstruct full cache tensor from mid and local parts."""
+        """Reconstruct full cache tensor from global, mid, and local parts."""
+        if layer_idx >= len(self.key_cache):
+            return None
         cache_dict = self.key_cache[layer_idx] if is_key else self.value_cache[layer_idx]
         dequant_func = self.key_dequant_func if is_key else self.value_dequant_func
         group_size = self.key_group_size if is_key else self.value_group_size
 
-        # Get cache components - global removed
+        # Get cache components
+        global_cache = cache_dict.get("global")
         mid_cache_quant = cache_dict.get("mid")
         local_cache = cache_dict.get("local")
 
@@ -165,8 +189,10 @@ class CustomCache(DynamicCache):
                 mid_cache.shape[-1]
             )
 
-        # Concatenate cache parts - global removed
+        # Concatenate cache parts
         cache_parts = []
+        if global_cache is not None:
+            cache_parts.append(global_cache)
         if mid_cache is not None:
             cache_parts.append(mid_cache)
         if local_cache is not None:
@@ -191,7 +217,8 @@ class CustomCache(DynamicCache):
         """
         Update cache with new key-value states.
         
-        The cache uses a two-tier system:
+        The cache uses a three-tier system:
+        - Global: Fixed-size cache for the beginning tokens
         - Mid: Quantized cache for intermediate tokens (with grouping)
         - Local: Full-precision cache for recent tokens
         """
@@ -199,9 +226,14 @@ class CustomCache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
 
-        # Calculate cache lengths - global removed
+        store_key_cache, store_value_cache = self[layer_idx]
+        ret_key_cache = torch.cat([store_key_cache, key_states], dim=-2) if store_key_cache is not None else key_states
+        ret_value_cache = torch.cat([store_value_cache, value_states], dim=-2) if store_value_cache is not None else value_states
+
+        # Calculate cache lengths
+        global_length = self.kvcache_settings.global_residual_length
         base_local_length = self.kvcache_settings.local_residual_length
-        mid_length = self._seen_tokens - base_local_length
+        mid_length = self._seen_tokens - global_length - base_local_length
         
         key_local_length, value_local_length = self._calculate_local_lengths(mid_length)
 
@@ -212,7 +244,12 @@ class CustomCache(DynamicCache):
         current_key_cache = self.key_cache[layer_idx]
         current_value_cache = self.value_cache[layer_idx]
 
-        # Directly update local cache with all states (global removed)
+        # Setup global cache (only on first update)
+        key_states, value_states = self._setup_global_cache(
+            key_states, value_states, current_key_cache, current_value_cache, global_length
+        )
+
+        # Update local cache
         self._update_local_cache(key_states, value_states, current_key_cache, current_value_cache)
 
         # Process excess in local caches (move to mid with quantization)
@@ -229,7 +266,7 @@ class CustomCache(DynamicCache):
         self.key_cache[layer_idx] = current_key_cache
         self.value_cache[layer_idx] = current_value_cache
 
-        return self[layer_idx]
+        return ret_key_cache, ret_value_cache
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Return the sequence length of the cached states for a given layer."""
@@ -239,7 +276,8 @@ class CustomCache(DynamicCache):
 
         key_cache = self.key_cache[layer_idx]
         
-        # Calculate lengths - global removed
+        # Calculate lengths of each cache component
+        global_length = key_cache['global'].shape[-2] if key_cache['global'] is not None else 0
         local_length = key_cache['local'].shape[-2] if key_cache['local'] is not None else 0
         
         # Calculate mid length (considering group size)
@@ -247,8 +285,8 @@ class CustomCache(DynamicCache):
             if self.key_group_size > 0:
                 mid_length = key_cache['mid'][0].shape[-3] * self.key_group_size
             else:
-                mid_length = key_cache['mid'][0].shape[-2]  # Assuming first element has shape info
+                mid_length = key_cache['mid'].shape[-2]
         else:
             mid_length = 0
 
-        return mid_length + local_length
+        return global_length + mid_length + local_length

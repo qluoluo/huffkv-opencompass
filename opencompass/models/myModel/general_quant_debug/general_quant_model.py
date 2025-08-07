@@ -23,7 +23,7 @@ from .modeling_llama_general_quant import LlamaForCausalLM
 from transformers import LlamaConfig
 
 @MODELS.register_module()
-class LlamaForCausalLM_GeneralQuant_Prefill_OC(HuggingFaceCausalLM):
+class LlamaForCausalLM_GeneralQuant_OC(HuggingFaceCausalLM):
     def _load_model(self,
                     path: str,
                     kwargs: dict,

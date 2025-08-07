@@ -58,7 +58,7 @@ from .myModel.hf_niah_model import HuggingFaceCausalLMForNIAH
 
 try:
     from .myModel.general_quant.general_quant_model import LlamaForCausalLM_GeneralQuant_OC
-    from .myModel.general_quant_prefill.general_quant_model import LlamaForCausalLM_GeneralQuant_Prefill_OC
+    from .myModel.general_quant_debug.general_quant_model import LlamaForCausalLM_GeneralQuant_OC as LlamaForCausalLM_GeneralQuant_Debug_OC
 except:
     pass
 

@@ -277,10 +277,10 @@ class LlamaAttention(nn.Module):
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            if past_key_value.get_seq_length(self.layer_idx) > 0:
-                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            else:
-                past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # if past_key_value.get_seq_length(self.layer_idx) > 0:
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            # else:
+            #     past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
         #####################################################################################
 
         attention_interface: Callable = eager_attention_forward
