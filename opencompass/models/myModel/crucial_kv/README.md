@@ -1,0 +1,2 @@
+只保留重要token（全精度），window外的token全部丢弃
+后续decode只会append到window后
