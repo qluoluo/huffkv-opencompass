@@ -9,7 +9,7 @@ from transformers.models.llama.modeling_llama import repeat_kv
 from .huffkv_quant_storage import QuantStorage
 
 
-class ClusterKVCache(DynamicCache):
+class HuffKVCache(DynamicCache):
     """
     Custom cache implementation with three-tier storage based on attention importance:
     - Sparse: Selected sparse KV pairs based on attention scores
@@ -17,13 +17,13 @@ class ClusterKVCache(DynamicCache):
     - Window: Recent KV pairs in full precision
     """
     
-    ClusterKVCache_init = False
+    HuffKVCache_init = False
     
     def __init__(self, config) -> None:
         super().__init__()
-        if not ClusterKVCache.ClusterKVCache_init:
-            ClusterKVCache.ClusterKVCache_init = True
-            print("-------------------- ClusterKVCache init --------------------")
+        if not HuffKVCache.HuffKVCache_init:
+            HuffKVCache.HuffKVCache_init = True
+            print("-------------------- HuffKVCache init --------------------")
 
         self.key_cache = []
         self.value_cache = []
