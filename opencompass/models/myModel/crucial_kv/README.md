@@ -1,2 +1,4 @@
 只保留重要token（全精度），window外的token全部丢弃
 后续decode只会append到window后
+
+具体做法是quant_storage函数只返回后面append进来全精度的部分

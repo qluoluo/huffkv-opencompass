@@ -41,8 +41,7 @@ from .rendu_api import Rendu  # noqa: F401
 from .sensetime_api import SenseTime  # noqa: F401
 from .stepfun_api import StepFun  # noqa: F401
 from .turbomind import TurboMindModel  # noqa: F401
-from .turbomind_with_tf_above_v4_33 import \
-    TurboMindModelwithChatTemplate  # noqa: F401
+from .turbomind_with_tf_above_v4_33 import TurboMindModelwithChatTemplate  # noqa: F401
 from .unigpt_api import UniGPT  # noqa: F401
 from .vllm import VLLM  # noqa: F401
 from .vllm_with_tf_above_v4_33 import VLLMwithChatTemplate  # noqa: F401
@@ -57,25 +56,38 @@ from .myModel.hf_strip_model import HuggingFaceCausalLM_Strip
 from .myModel.hf_niah_model import HuggingFaceCausalLMForNIAH
 
 try:
-    from .myModel.general_quant.general_quant_model import LlamaForCausalLM_GeneralQuant_OC
-    from .myModel.general_quant_debug.general_quant_model import LlamaForCausalLM_GeneralQuant_OC as LlamaForCausalLM_GeneralQuant_Debug_OC
+    from .myModel.general_quant.general_quant_model import (
+        LlamaForCausalLM_GeneralQuant_OC,
+    )
+    from .myModel.general_quant_debug.general_quant_model import (
+        LlamaForCausalLM_GeneralQuant_OC as LlamaForCausalLM_GeneralQuant_Debug_OC,
+    )
+    from .myModel.general_quant_v0816.quant_model import LlamaForCausalLM_GQ_V0816_OC
 except:
     pass
 
 try:
     from .myModel.kivi.kivi_model import LlamaForCausalLM_KIVI_OC
-    from .myModel.kivi_prefill.kivi_model import LlamaForCausalLM_KIVI_OC as LlamaForCausalLM_KIVI_Prefill_OC
 except:
     pass
 
 try:
     from .myModel.huffkv.huffkv_quant_model import LlamaForCausalLM_HuffKV_OC
-    from .myModel.huffkv_8_5.huffkv_quant_model import LlamaForCausalLM_HuffKV_OC as LlamaForCausalLM_HuffKV_8_5_OC
+    from .myModel.huffkv_8_5.huffkv_quant_model import (
+        LlamaForCausalLM_HuffKV_OC as LlamaForCausalLM_HuffKV_8_5_OC,
+    )
 except:
     pass
 
 
 try:
-    from .myModel.simpleprefill_quant.simpleprefill_quant_model import LlamaForCausalLM_SimplePrefill_OC
+    from .myModel.simpleprefill_quant.simpleprefill_quant_model import (
+        LlamaForCausalLM_SimplePrefill_OC,
+    )
+except:
+    pass
+
+try:
+    from .myModel.crucial_kv.quant_model import LlamaForCausalLM_CrucialKV_OC
 except:
     pass
