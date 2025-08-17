@@ -26,7 +26,7 @@ from transformers import LlamaConfig
 
 
 @MODELS.register_module()
-class LlamaForCausalLM_CrucialKV_OC(HuggingFaceCausalLM):
+class LlamaForCausalLM_GQ_V0816_OC(HuggingFaceCausalLM):
     def _load_model(
         self,
         path: str,

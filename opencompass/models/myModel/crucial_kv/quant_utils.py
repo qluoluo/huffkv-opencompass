@@ -1,17 +1,17 @@
 import torch
 
-def quantize_tensor(x, nbit, dim):
+def quantize_tensor(x, nbits, dim):
     # 沿着指定维度找到最大值和最小值
     x_min = x.min(dim=dim, keepdim=True).values
     x_max = x.max(dim=dim, keepdim=True).values
     
     # 计算scale和zero_point
-    scale = (x_max - x_min) / (2**nbit - 1)
+    scale = (x_max - x_min) / (2**nbits - 1)
     
     zero_point = x_min
     
     # 量化
-    x_quantized = ((x - zero_point) / scale).round().clamp(0, 2**nbit - 1).to(dtype=torch.int64)
+    x_quantized = ((x - zero_point) / scale).round().clamp(0, 2**nbits - 1).to(dtype=torch.int64)
     
     return x_quantized, scale, zero_point
 
@@ -20,7 +20,7 @@ def dequantize_tensor(x_quantized, scale, zero_point):
     x_dequantized = x_quantized * scale + zero_point
     return x_dequantized
 
-def quantize(x, nbit, dim, global_residual_length=0, local_residual_length=128, group_size=-1):
+def quantize(x, nbits, dim, global_residual_length=0, local_residual_length=128, group_size=-1):
     seq_len = x.shape[-2]
     mid_len = seq_len - local_residual_length - global_residual_length
     
@@ -45,7 +45,7 @@ def quantize(x, nbit, dim, global_residual_length=0, local_residual_length=128, 
         x = x.view(*x.shape[:-2], num_groups, group_size, x.shape[-1])
     
     # 对每个组进行差分操作
-    x_quantized, scale, zero_point = quantize_tensor(x, nbit=nbit, dim=dim)
+    x_quantized, scale, zero_point = quantize_tensor(x, nbits=nbits, dim=dim)
     
     # 返回 global、local、每组第一个 feature 和量化后的差分
     return x_global, x_local, x_quantized, scale, zero_point
@@ -70,11 +70,11 @@ if __name__ == "__main__":
     # 创建一个随机张量
     # tensor = torch.randn((2, 3))
     tensor = torch.tensor([[1.0, 2.2, 3.0], [4.0, 5.6, 6.2]])
-    nbit = 4
+    nbits = 4
     dim = -1  # 假设我们沿着第二个维度进行量化
 
     # 量化
-    quantized_tensor, scale, zero_point = quantize_tensor(tensor, nbit=nbit, dim=dim)
+    quantized_tensor, scale, zero_point = quantize_tensor(tensor, nbits=nbits, dim=dim)
 
     print(f"{tensor.shape=}, {quantized_tensor.shape=}, {scale.shape=}, {zero_point.shape=}")
 
