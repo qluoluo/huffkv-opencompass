@@ -96,9 +96,9 @@ class QuantStorage:
         ret_data_list = []
 
         # 添加prefill部分（需要反量化）
-        if self._quantized_prefill_data is not None:
-            prefill_dequantized = self.decompress_func(*self._quantized_prefill_data)
-            ret_data_list.append(prefill_dequantized)
+        # if self._quantized_prefill_data is not None:
+        #     prefill_dequantized = self.decompress_func(*self._quantized_prefill_data)
+        #     ret_data_list.append(prefill_dequantized)
 
         # 添加append部分（已经是未量化的）
         if self._decode_data is not None:
