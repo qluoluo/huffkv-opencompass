@@ -104,6 +104,9 @@ class QuantStorage:
         if self._decode_data is not None:
             ret_data_list.append(self._decode_data)
 
+        if len(ret_data_list) == 0:
+            return None
+
         ret_data = torch.cat(ret_data_list, dim=-2)
 
         if self.minus_mean:
