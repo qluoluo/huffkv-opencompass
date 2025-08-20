@@ -189,18 +189,21 @@ class TaylorKVCache(DynamicCache):
         # Keep only the last window_size tokens
         if new_window_keys.shape[-2] > self.window_size:
             self.remain_cache[layer_idx].append(
-                new_window_keys[..., : -self.window_size, :]
-            )
-            self.remain_cache[layer_idx].append(
+                new_window_keys[..., : -self.window_size, :],
                 new_window_values[..., : -self.window_size, :]
             )
+            # self.remain_cache[layer_idx].append(
+            #     new_window_values[..., : -self.window_size, :]
+            # )
 
     def __getitem__(self, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Retrieve and reconstruct full key-value cache for a layer."""
         key_cache = self._reconstruct_cache(layer_idx, is_key=True)
         value_cache = self._reconstruct_cache(layer_idx, is_key=False)
 
-        store_states = self.remain_cache[layer_idx].get_states()
+        store_states = (None, 0)
+        if len(self.remain_cache) > layer_idx:
+            store_states = self.remain_cache[layer_idx].get_states()
 
         return (key_cache, value_cache), store_states
 

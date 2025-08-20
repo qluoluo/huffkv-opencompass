@@ -350,7 +350,7 @@ class LlamaAttention(nn.Module):
                 from .estimate_attn_utils import (
                     taylor_num_estimate, taylor_den_estimate
                 )
-                from attn_utils import flash_part_attn
+                from .attn_utils import flash_part_attn
 
                 flash_output_up, flash_output_down = flash_part_attn(
                     query_states.transpose(1,2),
@@ -368,6 +368,8 @@ class LlamaAttention(nn.Module):
                     query_states,
                     taylor_prefill_stats,
                 )
+
+                # import ipdb; ipdb.set_trace()
 
                 attn_output = (flash_output_up + taylor_up) / (flash_output_down + taylor_down)
                 attn_output = attn_output.transpose(1,2)

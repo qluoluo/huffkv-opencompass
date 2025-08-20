@@ -6,66 +6,51 @@ def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
     例如：x[..., Dk] -> idx_from_end=1；x[..., Dv, Dk] -> idx_from_end=2。
     """
     for _ in range(n):
-        x = x.unsqueeze(-idx_from_end-0)
+        x = x.unsqueeze(-idx_from_end-1)
     return x
 
 @torch.no_grad()
 def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
-    """
-    预处理中心化统计量（一次性），供二阶泰勒近似使用。
-    K: [B, H, N, d_k], V: [B, H, N, d_v]
-    返回:
-      {
-        "n": 标量 float(N),
-        "kappa": [B,H,d_k],
-        "V":     [B,H,d_v],
-        "M":     [B,H,d_v,d_k],
-        "U":     [B,H,d_v,d_k,d_k],
-        "Sigma": [B,H,d_k,d_k]
-      }
-    """
+    # K: [B,H,N,d_k]  V: [B,H,N,d_v]
     assert K.dim() == 4 and V.dim() == 4, "K,V 应为 [B, H, N, d]"
     B, H, N, d_k = K.shape
     d_v = V.shape[-1]
     device = K.device
 
-    # 均值、求和（沿 seq_len=N）
-    kappa = K.mean(dim=2)                 # [B,H,d_k]
-    Vsum  = V.sum(dim=2)                  # [B,H,d_v]
+    # 均值/求和
+    kappa = K.mean(dim=2)          # [B,H,d_k]
+    Vsum  = V.sum(dim=2)           # [B,H,d_v]
 
-    # 原始矩（按 batch/head 分开求）
-    # A = sum_i v_i ⊗ k_i     -> [B,H,d_v,d_k]
-    A = torch.einsum('bhnd,bhnk->bhdk', V, K)
+    # 原始矩
+    A   = torch.einsum('bhnd,bhnk->bhdk', V, K)                # [B,H,d_v,d_k]
+    B_t = torch.einsum('bhnd,bhnk,bhnl->bhdkl', V, K, K)       # [B,H,d_v,d_k,d_k]
+    D   = torch.einsum('bhnk,bhnl->bhkl', K, K)                # [B,H,d_k,d_k]
 
-    # B = sum_i v_i ⊗ (k_i k_i^T) -> [B,H,d_v,d_k,d_k]
-    B_t = torch.einsum('bhnd,bhnk,bhnl->bhdkl', V, K, K)
+    # 中心化一阶
+    M = A - Vsum[..., None] * kappa[..., None, :]              # [B,H,d_v,d_k]
 
-    # D = sum_i k_i k_i^T -> [B,H,d_k,d_k]
-    D = torch.einsum('bhnk,bhnl->bhkl', K, K)
+    # 外积形式的三项（避免易错广播）
+    # kappa A^T: [B,H,d_v,d_k,d_k]
+    KA_T = torch.einsum('bhk,bhdl->bhdkl', kappa, A)
+    # A kappa^T: [B,H,d_v,d_k,d_k]
+    AK_T = torch.einsum('bhdk,bhl->bhdkl', A, kappa)
+    # kappa kappa^T: [B,H,d_k,d_k]
+    KK_T = torch.einsum('bhk,bhl->bhkl', kappa, kappa)
 
-    # 中心化
-    # M = A - Vsum[:, :, :, None] * kappa[:, :, None, :]
-    M = A - Vsum[..., :, None] * kappa[..., None, :]
+    # 关键修复：在 dim=2 插一个轴，让形状对上 [B,H,1,d_k,d_k]
+    U = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(2)  # [B,H,d_v,d_k,d_k]
 
-    # U_j = B_j - kappa A_j^T - A_j kappa^T + V_j (kappa kappa^T)
-    k_row = kappa[..., None, :]             # [B,H,1,d_k]
-    k_col = kappa[..., :, None]             # [B,H,d_k,1]
-    A_row = A[..., None, :]                 # [B,H,d_v,1,d_k]
-    A_col = A[..., :, None]                 # [B,H,d_v,d_k,1]
-
-    U = B_t - (A_col * k_row) - (k_col * A_row) \
-        + Vsum[..., None, None] * (k_col * k_row)  # [B,H,d_v,d_k,d_k]
-
-    Sigma = D - (N * torch.einsum('bhk,bhl->bhkl', kappa, kappa))  # [B,H,d_k,d_k]
+    Sigma = D - (N * KK_T)                                             # [B,H,d_k,d_k]
 
     return {
         "n": torch.tensor(float(N), device=device),
-        "kappa": kappa,   # [B,H,d_k]
-        "V": Vsum,        # [B,H,d_v]
-        "M": M,           # [B,H,d_v,d_k]
-        "U": U,           # [B,H,d_v,d_k,d_k]
-        "Sigma": Sigma    # [B,H,d_k,d_k]
+        "kappa": kappa,    # [B,H,d_k]
+        "V": Vsum,         # [B,H,d_v]
+        "M": M,            # [B,H,d_v,d_k]
+        "U": U,            # [B,H,d_v,d_k,d_k]
+        "Sigma": Sigma,    # [B,H,d_k,d_k]
     }
+
 
 @torch.no_grad()
 def taylor_num_estimate(q: torch.Tensor, stats: dict):

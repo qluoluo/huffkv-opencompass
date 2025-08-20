@@ -2,7 +2,7 @@ import torch
 from typing import Optional, Tuple, List, Dict
 
 from .estimate_attn_utils import (
-    preprocess_stats,
+    preprocess_stats_bh,
     # taylor_den,  # 由上层负责具体 attn 计算，这里不再使用
     # taylor_num
 )
@@ -71,14 +71,15 @@ class RemainKVCacheStorage:
 
         if self._prefill_stats is None:
             # 作为 prefill：逐 (b,h) 保存二阶泰勒统计量（输入 [S,D*]）
-            stats_grid: List[List[Dict]] = []
-            for b in range(B):
-                row: List[Dict] = []
-                for h in range(H):
-                    stats = preprocess_stats(K[b, h], V[b, h])  # K[b,h]: [S,Dk], V[b,h]: [S,Dv]
-                    row.append(stats)
-                stats_grid.append(row)
-            self._prefill_stats = stats_grid
+            # stats_grid: List[List[Dict]] = []
+            # for b in range(B):
+            #     row: List[Dict] = []
+            #     for h in range(H):
+            #         stats = preprocess_stats(K[b, h], V[b, h])  # K[b,h]: [S,Dk], V[b,h]: [S,Dv]
+            #         row.append(stats)
+            #     stats_grid.append(row)
+            # self._prefill_stats = stats_grid
+            self._prefill_stats = preprocess_stats_bh(K, V)
             self._prefill_len = S
             if self.debug:
                 print(f"[{self.name}] prefill saved -> B={B}, H={H}, S={S}")
@@ -106,9 +107,7 @@ class RemainKVCacheStorage:
     @torch.no_grad()
     def get_states(self) -> Tuple[Optional[List[List[Dict]]], int]:
         """
-        返回 prefill 的统计量与长度：
-          - 若没有 prefill，则为 (None, 0)
-          - prefill_stats 为 [B][H] 的嵌套列表，元素是 preprocess_stats 的字典
+        返回 prefill 的统计量与长度
         """
         return self._prefill_stats, self._prefill_len
 
