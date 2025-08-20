@@ -91,3 +91,8 @@ try:
     from .myModel.crucial_kv.quant_model import LlamaForCausalLM_CrucialKV_OC
 except:
     pass
+
+try:
+    from .myModel.taylor_kv.oc_model import LlamaForCausalLM_TaylorKV_OC
+except:
+    pass
