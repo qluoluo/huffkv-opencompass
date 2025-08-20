@@ -70,15 +70,6 @@ class RemainKVCacheStorage:
         self.cache_length += int(S)
 
         if self._prefill_stats is None:
-            # 作为 prefill：逐 (b,h) 保存二阶泰勒统计量（输入 [S,D*]）
-            # stats_grid: List[List[Dict]] = []
-            # for b in range(B):
-            #     row: List[Dict] = []
-            #     for h in range(H):
-            #         stats = preprocess_stats(K[b, h], V[b, h])  # K[b,h]: [S,Dk], V[b,h]: [S,Dv]
-            #         row.append(stats)
-            #     stats_grid.append(row)
-            # self._prefill_stats = stats_grid
             self._prefill_stats = preprocess_stats_bh(K, V)
             self._prefill_len = S
             if self.debug:
@@ -109,7 +100,7 @@ class RemainKVCacheStorage:
         """
         返回 prefill 的统计量与长度
         """
-        return self._prefill_stats, self._prefill_len
+        return self._prefill_stats
 
     def get_length(self) -> int:
         """返回累计的 seq_len 之和（每次 append 只加当前段的 S）。"""

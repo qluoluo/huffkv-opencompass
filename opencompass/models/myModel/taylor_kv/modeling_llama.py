@@ -330,7 +330,7 @@ class LlamaAttention(nn.Module):
             assert type(past_key_value) == TaylorKVCache
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            (key_states, value_states), (taylor_prefill_stats, taylor_prefill_len) = past_key_value.update(
+            (key_states, value_states), taylor_prefill_stats = past_key_value.update(
                 query_states, key_states, value_states, self.layer_idx, cache_kwargs
             )
 
