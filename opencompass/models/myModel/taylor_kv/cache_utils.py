@@ -42,7 +42,8 @@ class TaylorKVCache(DynamicCache):
         self.debug = self.kvcache_settings.get("debug", False)
         if type(self.debug) is str:
             self.debug = self.debug.lower() == "true"
-        self.debug = True
+        # self.debug = True
+        self.debug = False
 
         # Minimum sequence length required for meaningful importance selection
         self.min_seq_length = self.sparse_num + self.window_size
@@ -201,7 +202,7 @@ class TaylorKVCache(DynamicCache):
         key_cache = self._reconstruct_cache(layer_idx, is_key=True)
         value_cache = self._reconstruct_cache(layer_idx, is_key=False)
 
-        store_states = (None, 0)
+        store_states = None
         if len(self.remain_cache) > layer_idx:
             store_states = self.remain_cache[layer_idx].get_states()
 

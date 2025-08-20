@@ -358,6 +358,8 @@ class LlamaAttention(nn.Module):
                     value_states.transpose(1,2),
                     causal=self.is_causal,
                 )
+                flash_output_up = flash_output_up.transpose(1,2)
+                flash_output_down = flash_output_down.transpose(1,2)
 
                 taylor_up = taylor_num_estimate(
                     query_states,
@@ -369,10 +371,14 @@ class LlamaAttention(nn.Module):
                     taylor_prefill_stats,
                 )
 
+                # print(f"{flash_output_up.shape=}, {flash_output_down.shape=}")
+                # print(f"{taylor_up.shape=}, {taylor_down.shape=}")
+
                 # import ipdb; ipdb.set_trace()
 
                 attn_output = (flash_output_up + taylor_up) / (flash_output_down + taylor_down)
-                attn_output = attn_output.transpose(1,2)
+                attn_output = attn_output.to(query_states.dtype)
+                # attn_output = attn_output.transpose(1,2)
 
 
         #####################################################################################

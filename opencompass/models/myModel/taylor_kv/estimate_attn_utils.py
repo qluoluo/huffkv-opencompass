@@ -7,7 +7,9 @@ def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
 
 @torch.no_grad()
 def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
+    # print(f"preprocess_stats_bh input {K.shape=} {V.shape=}")
     assert K.dim() == 4 and V.dim() == 4, "K,V 应为 [B, H, N, d]"
+
     B, H, N, d_k = K.shape
     d_v = V.shape[-1]
     device, dtype = K.device, K.dtype
@@ -42,9 +44,11 @@ def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
 def taylor_num_estimate(q: torch.Tensor, stats: dict):
     """
     N(q) ≈ e^{q·kappa} [ V + M q + 1/2 * (U : (q⊗q)) ]
-    q: [..., d_k]，其前导维需与 stats 的 [B,H] 对齐，可再带任意额外维度
+    q: [B, H, S, d_k]
     返回: [..., d_v]
     """
+    # print(f"taylor_num_estimate input {q.shape=}")
+    assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
 
     # ✅ 修正：不减 1
@@ -70,9 +74,10 @@ def taylor_num_estimate(q: torch.Tensor, stats: dict):
 def taylor_den_estimate(q: torch.Tensor, stats: dict):
     """
     Z(q) ≈ e^{q·kappa} [ n + 1/2 * q^T Σ q ]
-    q: [..., d_k]
+    q: [B, H, S, d_k]
     返回: [..., 1]  （方便与分子 [..., d_v] 相除）
     """
+    assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
 
     # ✅ 修正：不减 1
