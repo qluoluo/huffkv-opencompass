@@ -18,6 +18,9 @@ work_dirs
 outputs
 models/*
 configs/internal/
+
+oc-eval-result
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
