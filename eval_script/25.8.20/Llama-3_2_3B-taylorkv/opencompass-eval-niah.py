@@ -12,7 +12,8 @@ with read_base():
     from opencompass.configs.summarizers.needlebench import needlebench_32k_summarizer as summarizer
 
 # 全局配置
-MODEL_PATH = "/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B"
+# MODEL_PATH = "/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B"
+MODEL_PATH = "/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B"
 MAX_SEQ_LEN = 32 * 1024
 MAX_OUT_LEN = 50
 BATCH_SIZE = 1
@@ -64,11 +65,12 @@ for config in QUANT_CONFIGS:
     #     "v_quant_dim": config["v_quant_dim"],
     #     **COMMON_QUANT_KWARGS
     # }
-    model_kwargs = COMMON_QUANT_KWARGS.update(config)
+    model_kwargs = COMMON_QUANT_KWARGS | config
     
     models.append(dict(
         type=LlamaForCausalLM_OC,
-        abbr=config["abbr"],
+        # abbr=config["abbr"],
+        abbr=abbr,
         path=MODEL_PATH,
         model_kwargs=model_kwargs,
     ))
