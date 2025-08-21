@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 from transformers.models.llama.modeling_llama import repeat_kv
 
-from .sparse_cache_storage import RemainKVCacheStorage
+from .cache_storage import RemainKVCacheStorage
 
 
 class TaylorKVCache(DynamicCache):
