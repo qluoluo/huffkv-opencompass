@@ -72,8 +72,8 @@ class RemainKVCacheStorage:
         if self._prefill_stats is None:
             self._prefill_stats = preprocess_stats_bh(K, V)
             self._prefill_len = S
-            if self.debug:
-                print(f"[{self.name}] prefill saved -> B={B}, H={H}, S={S}")
+            # if self.debug:
+            #     print(f"[{self.name}] prefill saved -> B={B}, H={H}, Prefill Length={S}")
         else:
             # 作为 decode：沿 seq_len 维拼接
             if self._decode_K is None:
@@ -82,9 +82,9 @@ class RemainKVCacheStorage:
             else:
                 self._decode_K = torch.cat([self._decode_K, K], dim=2)
                 self._decode_V = torch.cat([self._decode_V, V], dim=2)
-            if self.debug:
-                Sd = self._decode_K.shape[2]
-                print(f"[{self.name}] decode appended -> B={B}, H={H}, Sd={Sd}")
+            # if self.debug:
+            #     Sd = self._decode_K.shape[2]
+            #     print(f"[{self.name}] decode appended -> B={B}, H={H}, Decode length={Sd}")
 
     @torch.no_grad()
     def get_cache(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -105,3 +105,6 @@ class RemainKVCacheStorage:
     def get_length(self) -> int:
         """返回累计的 seq_len 之和（每次 append 只加当前段的 S）。"""
         return self.cache_length
+
+    def get_split_length(self) -> int:
+        return self.cache_length - self._decode_K.shape[-2], self._decode_K.shape[-2]

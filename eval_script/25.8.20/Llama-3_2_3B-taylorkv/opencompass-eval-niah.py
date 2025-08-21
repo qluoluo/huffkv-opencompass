@@ -23,7 +23,7 @@ RUN_CFG = dict(num_gpus=1, num_procs=1)
 DEFAULT_MODEL_KWARGS = dict(
     device_map='cuda',
     trust_remote_code=True,
-    torch_dtype="float16",
+    torch_dtype="bfloat16",
     attn_implementation='flash_attention_2',
 )
 
@@ -42,7 +42,7 @@ QUANT_CONFIGS = [
     # {"abbr": "GQ-kt2-vc2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -1},
     # {"abbr": "GQ-kt2-vt2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -2},
 
-    {"abbr": "TaylorKV", "window_size": 128, "sparse_num": 128},
+    {"abbr": "TaylorKV", "window_size": 256, "sparse_num": 256, "debug": True},
 ]
 
 # 通用量化参数

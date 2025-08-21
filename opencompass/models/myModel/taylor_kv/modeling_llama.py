@@ -334,19 +334,30 @@ class LlamaAttention(nn.Module):
                 query_states, key_states, value_states, self.layer_idx, cache_kwargs
             )
 
+            # taylor_prefill_stats = None
+
+            # if self.layer_idx == 0:
+            #     print(f"attn forward {key_states.shape=} {value_states.shape=}")
+
             attn_weights = None
             if taylor_prefill_stats is None:
-                print('taylor Prefill stage')
                 # Prefill阶段
                 # 还未保存taylor的状态，此时直接使用flash attn计算即可
+                # if self.layer_idx == 0:
+                #     print("modeling_llama use origin flash attn")
+
                 from flash_attn import flash_attn_func
                 attn_output = flash_attn_func(
                     query_states.transpose(1,2),
                     key_states.transpose(1,2),
                     value_states.transpose(1,2),
-                ).transpose(1,2)
+                    causal=self.is_causal,
+                )
             else:
-                print('taylor Decode stage')
+                # Decode阶段
+                # if self.layer_idx == 0:
+                #     print("modeling_llama use mix taylor flash attn")
+
                 from .estimate_attn_utils import (
                     taylor_num_estimate, taylor_den_estimate
                 )
@@ -358,8 +369,8 @@ class LlamaAttention(nn.Module):
                     value_states.transpose(1,2),
                     causal=self.is_causal,
                 )
-                flash_output_up = flash_output_up.transpose(1,2)
-                flash_output_down = flash_output_down.transpose(1,2)
+                # flash_output_up = flash_output_up.transpose(1,2)
+                # flash_output_down = flash_output_down.transpose(1,2)
 
                 taylor_up = taylor_num_estimate(
                     query_states,
@@ -371,15 +382,20 @@ class LlamaAttention(nn.Module):
                     taylor_prefill_stats,
                 )
 
+                taylor_up = taylor_up.transpose(1,2)
+                taylor_down = taylor_down.transpose(1,2)
+
                 # print(f"{flash_output_up.shape=}, {flash_output_down.shape=}")
                 # print(f"{taylor_up.shape=}, {taylor_down.shape=}")
 
-                # import ipdb; ipdb.set_trace()
 
+                # attn_output = flash_output_up / flash_output_down
                 attn_output = (flash_output_up + taylor_up) / (flash_output_down + taylor_down)
+                
                 attn_output = attn_output.to(query_states.dtype)
                 # attn_output = attn_output.transpose(1,2)
 
+        # print(f'Fake attn output.shape = {attn_output.shape}')
 
         #####################################################################################
 
@@ -407,6 +423,9 @@ class LlamaAttention(nn.Module):
         #     scaling=self.scaling,
         #     **kwargs,
         # )
+
+        # if self.layer_idx == 0:
+        #     print(f'True attn output.shape = {attn_output.shape}')
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

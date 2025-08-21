@@ -43,7 +43,7 @@ class TaylorKVCache(DynamicCache):
         if type(self.debug) is str:
             self.debug = self.debug.lower() == "true"
         # self.debug = True
-        self.debug = False
+        # self.debug = False
 
         # Minimum sequence length required for meaningful importance selection
         self.min_seq_length = self.sparse_num + self.window_size
@@ -64,8 +64,9 @@ class TaylorKVCache(DynamicCache):
                 }
             )
             self.remain_cache.append(
-                RemainKVCacheStorage(debug=self.debug)
+                RemainKVCacheStorage(debug=self.debug if layer_idx==0 else False)
             )
+
     def _select_sparse_kv(
         self,
         query_states: torch.Tensor,
@@ -141,8 +142,8 @@ class TaylorKVCache(DynamicCache):
         seq_len = key_states.shape[-2]
         window_size = self.window_size
 
-        self.key_cache[layer_idx]['window'] = key_states[..., :-window_size, :]
-        self.value_cache[layer_idx]['window'] = value_states[..., :-window_size, :]
+        self.key_cache[layer_idx]['window'] = key_states[..., -window_size:, :]
+        self.value_cache[layer_idx]['window'] = value_states[..., -window_size:, :]
 
         # Select sparse and remain KV pairs
         sparse_key, sparse_value, remain_key, remain_value = self._select_sparse_kv(
@@ -155,14 +156,6 @@ class TaylorKVCache(DynamicCache):
 
         self.remain_cache[layer_idx].append(remain_key, remain_value)
 
-        if self.debug:
-            print("prefill_stage fill in cache")
-            print(
-                f"sparse: {self.key_cache[layer_idx]['sparse'].shape[-2] if self.key_cache[layer_idx]['sparse'] is not None else 0} \
-                compressed: {self.remain_cache[layer_idx].get_length()} \
-                window: {self.key_cache[layer_idx]['window'].shape[-2] if self.key_cache[layer_idx]['window'] is not None else 0}"
-            )
-
     def _update_window_cache(
         self,
         key_states: torch.Tensor,
@@ -172,6 +165,8 @@ class TaylorKVCache(DynamicCache):
         # current_value_cache: dict,
     ):
         """Update window cache with new tokens, maintaining window size."""
+        window_size = self.window_size
+
         if self.key_cache[layer_idx]["window"] is not None:
             # Concatenate new states
             new_window_keys = torch.cat(
@@ -184,8 +179,8 @@ class TaylorKVCache(DynamicCache):
             new_window_keys = key_states
             new_window_values = value_states
 
-        self.key_cache[layer_idx]["window"] = new_window_keys[..., -self.window_size :, :]
-        self.value_cache[layer_idx]["window"] = new_window_values[..., -self.window_size :, :]
+        self.key_cache[layer_idx]["window"] = new_window_keys[..., -window_size:, :]
+        self.value_cache[layer_idx]["window"] = new_window_values[..., -window_size:, :]
 
         # Keep only the last window_size tokens
         if new_window_keys.shape[-2] > self.window_size:
@@ -205,6 +200,10 @@ class TaylorKVCache(DynamicCache):
         store_states = None
         if len(self.remain_cache) > layer_idx:
             store_states = self.remain_cache[layer_idx].get_states()
+            # store_key, store_value = self.remain_cache[layer_idx].get_cache()
+            # if store_key is not None:
+            #     key_cache = torch.cat([key_cache, store_key], dim=-2)
+            #     value_cache = torch.cat([value_cache, store_value], dim=-2)
 
         return (key_cache, value_cache), store_states
 
@@ -270,7 +269,7 @@ class TaylorKVCache(DynamicCache):
         if layer_idx == 0:
             self._seen_tokens += key_states.shape[-2]
 
-        if self.debug:
+        if self.debug and layer_idx == 0:
             print(f"{self.__class__.__name__} update {layer_idx=}, {query_states.shape[-2]=}")
 
         bsz, num_kv_heads, seq_len, head_dim = key_states.shape
@@ -285,9 +284,9 @@ class TaylorKVCache(DynamicCache):
 
         (store_key_cache, store_value_cache), store_taylor_states = self[layer_idx]
 
-        if self.debug:
+        if self.debug and layer_idx == 0:
             print(
-                f"cache utils update get len {store_key_cache.shape[-2] if store_value_cache is not None else 0}"
+                f"Cache get store len {store_key_cache.shape[-2] if store_value_cache is not None else 0}"
             )
 
         ret_key_cache, ret_value_cache = None, None
@@ -317,6 +316,10 @@ class TaylorKVCache(DynamicCache):
                 query_states,
                 layer_idx,
             )
+
+            if self.debug and layer_idx == 0:
+                print("prefill_stage fill")
+                self.print_cache_length(layer_idx)
         else:
             # Decoding stage
             # Subsequent updates: only update window cache
@@ -324,6 +327,10 @@ class TaylorKVCache(DynamicCache):
                 key_states, value_states,
                 layer_idx
             )
+
+            if self.debug and layer_idx == 0:
+                print("decode_stage fill")
+                self.print_cache_length(layer_idx)
 
         return (ret_key_cache, ret_value_cache), store_taylor_states
 
@@ -347,3 +354,10 @@ class TaylorKVCache(DynamicCache):
         remain_length = self.remain_cache[layer_idx].get_length()
 
         return sparse_length + remain_length + window_length
+
+    def print_cache_length(self, layer_idx):
+        print(
+                f"sparse: {self.key_cache[layer_idx]['sparse'].shape[-2] if self.key_cache[layer_idx]['sparse'] is not None else 0} \
+                compressed: {self.remain_cache[layer_idx].get_length()} \
+                window: {self.key_cache[layer_idx]['window'].shape[-2] if self.key_cache[layer_idx]['window'] is not None else 0}"
+            )

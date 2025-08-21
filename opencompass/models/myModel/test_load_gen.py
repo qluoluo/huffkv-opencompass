@@ -10,7 +10,8 @@ from taylor_kv.modeling_llama import LlamaForCausalLM
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = "7"
 
-model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+# model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+model_path = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
 
 print(f"{os.path.basename(model_path)=}")
 
@@ -46,15 +47,21 @@ tokenizer = AutoTokenizer.from_pretrained(
 # text = "User: Please write a story about a robot and a fish.\nAssistant:"
 # text = "User: Please introduce yourself.\nAssistant:"
 text = "hello " * (4 * 1024)
+with open("needle_bench_0.txt", "r", encoding='utf-8') as f:
+    text = f.read().strip().strip('\\n')
+
+# import ipdb; ipdb.set_trace()
+
+print(f"{text[-100:]=}")
 
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")
 outputs = model.generate(**inputs, max_new_tokens=100,
     repetition_penalty=1.5,          # 重复惩罚系数 >1.0 表示惩罚
-    do_sample=True,                # 启用采样（用于更自然的结果）
+    do_sample=False,                # 启用采样（用于更自然的结果）
     top_k=50,                        # Top-k 采样
     top_p=0.95,                      # Top-p (nucleus) 采样
     temperature=0.7,
 )
 print("### Generate Content:")
-print(tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:], skip_special_tokens=True))
+print(tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:]))

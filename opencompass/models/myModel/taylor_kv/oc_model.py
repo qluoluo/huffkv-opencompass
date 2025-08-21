@@ -44,6 +44,8 @@ class LlamaForCausalLM_TaylorKV_OC(HuggingFaceCausalLM):
             "window_size": 128,
             "sparse_num": 128,
             "pool_kernel_size": -1,
+            "debug": True,
+            # "debug": False,
         }
 
         # 使用字典推导式提取值并设置默认值
