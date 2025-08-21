@@ -94,5 +94,6 @@ except:
 
 try:
     from .myModel.taylor_kv.oc_model import LlamaForCausalLM_TaylorKV_OC
+    from .myModel.simple_taylorkv.oc_model import LlamaForCausalLM_Simple_TaylorKV_OC
 except:
     pass
