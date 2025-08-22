@@ -1,3 +1,4 @@
+import os
 import torch
 from typing import Optional, Tuple, List, Dict
 
@@ -24,8 +25,15 @@ class RemainKVCacheStorage:
                     由上层完成具体 attention 计算
     """
 
-    def __init__(self, name: str = "unnamed", debug: bool = False):
+    def __init__(self, 
+                 name: str = "unnamed", 
+                 cluster_k: int = 0,
+                 group_size: int = 0,
+                 debug: bool = False
+                ):
         self.name = name
+        self.cluster_k = cluster_k
+        self.group_size = group_size
         self.debug = debug
 
         # 首次 append 后锁定的形状信息
@@ -45,16 +53,83 @@ class RemainKVCacheStorage:
         # 只累加 seq_len
         self.cache_length: int = 0
 
-    def _check_and_set_shapes(self, K: torch.Tensor, V: torch.Tensor) -> None:
-        assert K.dim() == 4 and V.dim() == 4, "K,V 需为 4-D: [B,H,S,D]"
-        assert K.shape[:3] == V.shape[:3], "K,V 的 B/H/S 必须一致"
-        B, H, S, Dk = K.shape
-        _, _, _, Dv = V.shape
-        if self._B is None:
-            self._B, self._H, self._Dk, self._Dv = B, H, Dk, Dv
-        else:
-            assert (B, H, Dk, Dv) == (self._B, self._H, self._Dk, self._Dv), \
-                f"后续 append 形状需与首次一致，期望(B={self._B},H={self._H},Dk={self._Dk},Dv={self._Dv})，实际(B={B},H={H},Dk={Dk},Dv={Dv})"
+    # def _check_and_set_shapes(self, K: torch.Tensor, V: torch.Tensor) -> None:
+    #     assert K.dim() == 4 and V.dim() == 4, "K,V 需为 4-D: [B,H,S,D]"
+    #     assert K.shape[:3] == V.shape[:3], "K,V 的 B/H/S 必须一致"
+    #     B, H, S, Dk = K.shape
+    #     _, _, _, Dv = V.shape
+    #     if self._B is None:
+    #         self._B, self._H, self._Dk, self._Dv = B, H, Dk, Dv
+    #     else:
+    #         assert (B, H, Dk, Dv) == (self._B, self._H, self._Dk, self._Dv), \
+    #             f"后续 append 形状需与首次一致，期望(B={self._B},H={self._H},Dk={self._Dk},Dv={self._Dv})，实际(B={B},H={H},Dk={Dk},Dv={Dv})"
+
+    def prefill_process(self, K: torch.Tensor, V: torch.Tensor) -> None:
+
+        if self.debug:
+            print(f"prefill_process_without_cluster: K.shape={K.shape}, V.shape={V.shape}")
+
+        num_heads, seq_len, head_dim = K.shape
+        self._prefill_len += seq_len
+        self._prefill_stats = preprocess_stats_bh(K, V)
+
+    def prefill_process_byfixgroup(self, K: torch.Tensor, V: torch.Tensor) -> None:
+        if self.debug:
+            print(f"prefill_process_byfixgroup: K.shape={K.shape}, V.shape={V.shape}")
+
+        assert self.group_size > 0, "group_size must > 0 in prefill_process_byfixgroup"
+
+        num_heads, seq_len, head_dim = K.shape
+        self._prefill_len += seq_len
+
+        remain_len = seq_len // self.group_size
+        if remain_len > 0:
+            self._decode_K = K[:, -remain_len:, :]
+            self._decode_V = V[:, -remain_len:, :]
+        
+        K = K[:, :-remain_len, :]
+        V = V[:, :-remain_len, :]
+        num_heads, seq_len, head_dim = K.shape
+
+        K = K.reshape(num_heads, seq_len // self.group_size, self.group_size, head_dim).transpose(0,1)
+        V = V.reshape(num_heads, seq_len // self.group_size, self.group_size, head_dim).transpose(0,1)
+
+        self._prefill_stats = preprocess_stats_bh(K, V)
+        
+
+    def prefill_process_bycluster(self, K: torch.Tensor, V: torch.Tensor) -> None:
+
+        if self.debug:
+            print(f"prefill_process_bycluster: K.shape={K.shape}, V.shape={V.shape}")
+
+        assert self.cluster_k > 0, "cluster_k must be > 0 in prefill_process_bycluster"
+
+        num_heads, seq_len, head_dim = K.shape
+        self._prefill_len += seq_len
+
+        from .cluster_utils import kmeans_seq, group_by_cluster_batched, tsne_plot_per_sample
+        K_labels, K_centers = kmeans_seq(K, self.cluster_k, iters=50)
+
+        K_grouped = group_by_cluster_batched(K, K_labels, k=self.cluster_k)
+        V_grouped = group_by_cluster_batched(V, K_labels, k=self.cluster_k)
+
+        for i in range(num_heads):
+            save_dir = os.path.join(os.path.dirname(__file__), "tsne_plots")
+            os.makedirs(save_dir, exist_ok=True)
+            tsne_plot_per_sample(K[i], K_labels[i], title="K", save_path=os.path.join(save_dir, f"K_{i}.png"))
+
+        group_stats = []
+        for group_idx in range(len(K_grouped)):
+            # 下面实际上是每个头的list
+            K_idx = K_grouped[group_idx]
+            V_idx = V_grouped[group_idx]
+
+            append_data = []
+            for cluster_idx in range(len(K_idx)):
+                append_data.append(preprocess_stats_bh(K_idx[cluster_idx], V_idx[cluster_idx]))
+
+
+        self._prefill_stats = group_stats
 
     @torch.no_grad()
     def append(self, K: torch.Tensor, V: torch.Tensor) -> None:
@@ -63,28 +138,27 @@ class RemainKVCacheStorage:
         - 首次调用：prefill → 仅保存二阶泰勒统计量（逐 (b,h) 计算）
         - 其后调用：decode → 原始 K/V 直接沿 seq_len 维拼接
         """
-        self._check_and_set_shapes(K, V)
-        B, H, S, _ = K.shape
+        # self._check_and_set_shapes(K, V)
+        bsz, num_heads, seq_len, head_dim = K.shape
+        assert bsz == 1, f"batch size must be 1, but got {bsz}"
+
+        K = K.squeeze(0)
+        V = V.squeeze(0)
 
         # 只累加 seq_len
-        self.cache_length += int(S)
+        self.cache_length += int(seq_len)
 
-        if self._prefill_stats is None:
-            self._prefill_stats = preprocess_stats_bh(K, V)
-            self._prefill_len = S
-            # if self.debug:
-            #     print(f"[{self.name}] prefill saved -> B={B}, H={H}, Prefill Length={S}")
+        if self._prefill_len == 0:
+            # self.prefill_process(K, V)
+            self.prefill_process_byfixgroup(K, V)
         else:
             # 作为 decode：沿 seq_len 维拼接
             if self._decode_K is None:
                 self._decode_K = K.contiguous()
                 self._decode_V = V.contiguous()
             else:
-                self._decode_K = torch.cat([self._decode_K, K], dim=2)
-                self._decode_V = torch.cat([self._decode_V, V], dim=2)
-            # if self.debug:
-            #     Sd = self._decode_K.shape[2]
-            #     print(f"[{self.name}] decode appended -> B={B}, H={H}, Decode length={Sd}")
+                self._decode_K = torch.cat([self._decode_K, K], dim=-2)
+                self._decode_V = torch.cat([self._decode_V, V], dim=-2)
 
     @torch.no_grad()
     def get_cache(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -107,4 +181,4 @@ class RemainKVCacheStorage:
         return self.cache_length
 
     def get_split_length(self) -> int:
-        return self.cache_length - self._decode_K.shape[-2], self._decode_K.shape[-2]
+        return self._prefill_len, self.cache_length - self._prefill_len

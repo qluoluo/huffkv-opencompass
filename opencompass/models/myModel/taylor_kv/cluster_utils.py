@@ -1,5 +1,5 @@
 # batched_kmeans_eval.py
-# pip install torch torch-kmeans
+# pip install torch torch-kmeans scikit-learn matplotlib
 import math
 import torch
 from torch_kmeans import KMeans
@@ -22,122 +22,118 @@ def kmeans_seq(x: torch.Tensor, k: int, iters: int = 50):
     centers = res.centers.reshape(*prefix, k, D)
     return labels, centers
 
+
+# ========= 新增：按“样本”把每个类的成员组合成 list =========
 @torch.no_grad()
-def cluster_tightness(
-    x: torch.Tensor,           # [..., L, D]
-    labels: torch.Tensor,      # [..., L]
-    centers: torch.Tensor,     # [..., K, D]
-    metric: str = "euclidean", # "euclidean" 或 "cosine"
-    tau: float | None = None   # 阈值；欧氏=距离阈值，余弦=1-cos 阈值
-):
+def group_by_cluster_per_sample(x_sample: torch.Tensor,
+                                labels_sample: torch.Tensor,
+                                k: int):
     """
-    评估每个样本的每个簇是否“够近”。返回列表（长度=展平后的 batch 数）：
-      item = {
-        'per_cluster': [{'count','mean','std','p90','p95','max',('tight')}...],
-        'inertia': ...,           # 欧氏=平方距离和；余弦= (1-cos) 之和
-        'mean_dist': ...,         # 所有点到各自中心的平均距离
-        'p95_dist': ...,          # 全局 P95
-        'davies_bouldin': ...     # 越小越好；<1 常被认为不错
-      }
+    x_sample: (L, D) —— 单个样本
+    labels_sample: (L,)
+    返回: list[torch.Tensor]，长度为 K，
+          第 i 个元素是该样本中属于簇 i 的所有向量，形状 (n_i, D)
     """
-    assert x.dim() >= 2
-    *prefix, L, D = x.shape
-    K = centers.shape[-2]
-    P = int(torch.tensor(prefix).prod()) if prefix else 1
+    assert x_sample.dim() == 2 and labels_sample.dim() == 1
+    groups = [x_sample[labels_sample == i] for i in range(k)]
+    return groups
 
-    x2 = x.reshape(P, L, D)
-    y2 = labels.reshape(P, L)
-    c2 = centers.reshape(P, K, D)
 
-    out = []
-    for i in range(P):
-        xi, yi, ci = x2[i], y2[i], c2[i]
+@torch.no_grad()
+def group_by_cluster_batched(x: torch.Tensor,
+                             labels: torch.Tensor,
+                             k: int):
+    """
+    仅支持三维输入：
+      x: (B, L, D)
+      labels: (B, L)
+    返回：
+      list[长度为 B]，其中每个元素是长度为 K 的 list[Tensor(n_i, D)]
+    """
+    assert x.dim() == 3, "x 必须是三维 (B, L, D)"
+    assert labels.dim() == 2, "labels 必须是二维 (B, L)"
+    B, L, D = x.shape
+    assert labels.shape == (B, L), "labels 形状应为 (B, L)"
 
-        if metric == "euclidean":
-            # di: 每个点到其所属簇心的欧氏距离
-            dist = torch.cdist(xi, ci, p=2)                   # [L, K]
-            di = dist.gather(1, yi.unsqueeze(1)).squeeze(1)   # [L]
-            inertia = float((di ** 2).sum())
-            centroid_d = torch.cdist(ci, ci, p=2)             # [K, K]
-        elif metric == "cosine":
-            xin = torch.nn.functional.normalize(xi, dim=-1)
-            cin = torch.nn.functional.normalize(ci, dim=-1)
-            cos = xin @ cin.T                                  # [L, K]
-            di = 1.0 - cos.gather(1, yi.unsqueeze(1)).squeeze(1)
-            inertia = float(di.sum())
-            centroid_d = 1.0 - (cin @ cin.T)                  # [K, K]
-        else:
-            raise ValueError("metric 需为 'euclidean' 或 'cosine'")
+    groups_per_batch = []
+    for b in range(B):
+        xb = x[b]           # (L, D)
+        lb = labels[b]      # (L,)
+        groups = [xb[lb == i] for i in range(k)]
+        groups_per_batch.append(groups)
+    return groups_per_batch
 
-        # 每簇统计
-        per_cluster = []
-        for j in range(K):
-            m = (yi == j)
-            if m.any():
-                d = di[m]
-                s = {
-                    "count": int(m.sum()),
-                    "mean": float(d.mean()),
-                    "std": float(d.std(unbiased=False)),
-                    "p90": float(d.quantile(0.90)),
-                    "p95": float(d.quantile(0.95)),
-                    "max": float(d.max()),
-                }
-                if tau is not None:
-                    s["tight"] = bool(s["p95"] <= tau)  # 用 P95 当半径判据
-            else:
-                s = {"count": 0, "mean": math.nan, "std": math.nan,
-                     "p90": math.nan, "p95": math.nan, "max": math.nan}
-                if tau is not None:
-                    s["tight"] = False
-            per_cluster.append(s)
 
-        # Davies–Bouldin 指数
-        Sj = []
-        for j in range(K):
-            m = (yi == j)
-            Sj.append(float(di[m].mean()) if m.any() else math.nan)
-        Sj = torch.tensor(Sj, device=xi.device, dtype=xi.dtype)
-        M = centroid_d.clone()
-        M.fill_diagonal_(float("inf"))
-        Sj_mat = Sj.unsqueeze(0) + Sj.unsqueeze(1)            # [K, K]
-        R = Sj_mat / M
-        R[torch.isnan(R)] = 0.0
-        dbi = float(R.max(dim=1).values.nanmean())
+# ========= 新增：t-SNE 到二维并可视化（逐样本） =========
+def tsne_plot_per_sample(x_sample: torch.Tensor,
+                         labels_sample: torch.Tensor,
+                         title: str = None,
+                         perplexity: int = 30,
+                         random_state: int = 0,
+                        #  show: bool = True,
+                         save_path: str = None):
+    """
+    对单个样本做 t-SNE 可视化。
+    x_sample: (L, D)
+    labels_sample: (L,)
+    """
+    import numpy as np
+    from sklearn.manifold import TSNE
+    import matplotlib.pyplot as plt
 
-        out.append({
-            "per_cluster": per_cluster,
-            "inertia": inertia,
-            "mean_dist": float(di.mean()),
-            "p95_dist": float(di.quantile(0.95)),
-            "davies_bouldin": dbi,
-        })
-    return out
+    x_np = x_sample.detach().cpu().numpy()
+    y_np = labels_sample.detach().cpu().numpy()
 
-def _pretty_print(report_item, prefix="sample"):
-    pcs = report_item["per_cluster"]
-    header = f"{prefix}: inertia={report_item['inertia']:.4f}, mean_dist={report_item['mean_dist']:.4f}, " \
-             f"p95_dist={report_item['p95_dist']:.4f}, DBI={report_item['davies_bouldin']:.4f}"
-    print(header)
-    print("  cluster | count |   mean   |    std   |   p90   |   p95   |   max   | tight")
-    for j, s in enumerate(pcs):
-        tight = s.get("tight", None)
-        tight_str = ("YES" if tight else "NO") if tight is not None else "-"
-        print(f"     {j:>3} | {s['count']:>5} | {s['mean']:>7.4f} | {s['std']:>7.4f} | "
-              f"{s['p90']:>7.4f} | {s['p95']:>7.4f} | {s['max']:>7.4f} | {tight_str}")
+    # t-SNE 到二维
+    tsne = TSNE(
+        n_components=2,
+        perplexity=perplexity,
+        init="random",
+        learning_rate="auto",
+        random_state=random_state,
+    )
+    xy = tsne.fit_transform(x_np)  # (L, 2)
 
+    # 画散点：用 cluster label 作为颜色
+    plt.figure(figsize=(6, 5), dpi=140)
+    plt.scatter(xy[:, 0], xy[:, 1], c=y_np, s=16, alpha=0.9)
+    plt.xlabel("t-SNE 1")
+    plt.ylabel("t-SNE 2")
+    if title:
+        plt.title(title)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, bbox_inches="tight")
+    # if show:
+    #     plt.show()
+    plt.close()
+
+
+# ========= 使用示例 =========
 if __name__ == "__main__":
-    # 最小演示
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    x = torch.randn(2, 3, 128, 64, device=device)   # [B=2, H=3, L=128, D=64]
-    k = 8
+    torch.manual_seed(0)
+    # 假设有一个 batch，形状 (B, L, D)
+    B, L, D, K = 4, 128, 32, 5
+    x = torch.randn(B, L, D)
 
-    labels, centers = kmeans_seq(x, k=k, iters=30)
-    print("labels:", tuple(labels.shape))    # -> (2, 3, 128)
-    print("centers:", tuple(centers.shape))  # -> (2, 3, 8, 64)
+    labels, centers = kmeans_seq(x, k=K, iters=50)
 
-    # 评估（欧氏距离）；比如要求 P95 距离 <= 0.8 视为“够近”
-    report = cluster_tightness(x, labels, centers, metric="euclidean")
+    # 1) 把每个样本的每个簇组合成 list
+    grouped = group_by_cluster_batched(x, labels, k=K)
+    # grouped 是长度为 B 的 list；其中 grouped[b] 是长度为 K 的 list，
+    # grouped[b][i] 就是第 b 个样本里簇 i 的所有向量 (n_i, D)
 
-    # 打印第一条样本（B=0,H=0）
-    _pretty_print(report[0], prefix="sample[0]")
+    # 2) 对第 0 个样本做 t-SNE 可视化
+    tsne_plot_per_sample(
+        x_sample=x[0],
+        labels_sample=labels[0],
+        title="Sample 0 - t-SNE of token embeddings (colored by cluster)",
+        perplexity=30,
+        random_state=42,
+        # show=True,
+        save_path="tsne_sample.png",  # 想保存就填路径，例如 "tsne_sample0.png"
+    )
+
+    # 如果你有更多前缀维度（例如 (B, H, L, D)），
+    # 先把其中一个样本切出来成 (L, D) 再调用 tsne_plot_per_sample 即可。

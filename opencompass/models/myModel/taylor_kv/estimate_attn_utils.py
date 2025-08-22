@@ -5,38 +5,92 @@ def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
         x = x.unsqueeze(-idx_from_end-1)
     return x
 
+# @torch.no_grad()
+# def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
+#     # print(f"preprocess_stats_bh input {K.shape=} {V.shape=}")
+#     assert K.dim() == 4 and V.dim() == 4, "K,V 应为 [B, H, N, d]"
+
+#     B, H, N, d_k = K.shape
+#     d_v = V.shape[-1]
+#     device, dtype = K.device, K.dtype
+
+#     kappa = K.mean(dim=2)          # [B,H,d_k]
+#     Vsum  = V.sum(dim=2)           # [B,H,d_v]
+
+#     A   = torch.einsum('bhnd,bhnk->bhdk', V, K)                # [B,H,d_v,d_k]
+#     B_t = torch.einsum('bhnd,bhnk,bhnl->bhdkl', V, K, K)       # [B,H,d_v,d_k,d_k]
+#     D   = torch.einsum('bhnk,bhnl->bhkl', K, K)                # [B,H,d_k,d_k]
+
+#     M = A - Vsum[..., None] * kappa[..., None, :]              # [B,H,d_v,d_k]
+
+#     KA_T = torch.einsum('bhk,bhdl->bhdkl', kappa, A)
+#     AK_T = torch.einsum('bhdk,bhl->bhdkl', A, kappa)
+#     KK_T = torch.einsum('bhk,bhl->bhkl', kappa, kappa)
+
+#     U = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(2)  # [B,H,d_v,d_k,d_k]
+#     Sigma = D - (N * KK_T)                                             # [B,H,d_k,d_k]
+
+#     return {
+#         "n": torch.tensor(float(N), device=device, dtype=dtype),
+#         "kappa": kappa,    # [B,H,d_k]
+#         "V": Vsum,         # [B,H,d_v]
+#         "M": M,            # [B,H,d_v,d_k]
+#         "U": U,            # [B,H,d_v,d_k,d_k]
+#         "Sigma": Sigma,    # [B,H,d_k,d_k]
+#     }
+
+import torch
+
 @torch.no_grad()
 def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
-    # print(f"preprocess_stats_bh input {K.shape=} {V.shape=}")
-    assert K.dim() == 4 and V.dim() == 4, "K,V 应为 [B, H, N, d]"
+    """
+    通用版：
+      K: [..., N, d_k]
+      V: [..., N, d_v]
+    要求：K 与 V 的前缀维度一致，且第 -2 维 N 相同
+    返回：
+      n:       标量(同 dtype/device)，值为 N
+      kappa:   [..., d_k]
+      V:       [..., d_v]
+      M:       [..., d_v, d_k]
+      U:       [..., d_v, d_k, d_k]
+      Sigma:   [..., d_k, d_k]
+    """
+    assert K.dim() >= 2 and V.dim() >= 2, "K,V 应为 [..., N, d]"
+    assert K.shape[:-2] == V.shape[:-2], "K,V 前缀维度必须一致"
+    assert K.shape[-2] == V.shape[-2], "K,V 的第 -2 维 N 必须相同"
 
-    B, H, N, d_k = K.shape
+    N   = K.shape[-2]
+    d_k = K.shape[-1]
     d_v = V.shape[-1]
     device, dtype = K.device, K.dtype
 
-    kappa = K.mean(dim=2)          # [B,H,d_k]
-    Vsum  = V.sum(dim=2)           # [B,H,d_v]
+    # 逐 N 维聚合
+    kappa = K.mean(dim=-2)          # [..., d_k]
+    Vsum  = V.sum(dim=-2)           # [..., d_v]
 
-    A   = torch.einsum('bhnd,bhnk->bhdk', V, K)                # [B,H,d_v,d_k]
-    B_t = torch.einsum('bhnd,bhnk,bhnl->bhdkl', V, K, K)       # [B,H,d_v,d_k,d_k]
-    D   = torch.einsum('bhnk,bhnl->bhkl', K, K)                # [B,H,d_k,d_k]
+    # 基本张量
+    A   = torch.einsum('...nd,...nk->...dk',   V, K)                 # [..., d_v, d_k]
+    B_t = torch.einsum('...nd,...nk,...nl->...dkl', V, K, K)         # [..., d_v, d_k, d_k]
+    D   = torch.einsum('...nk,...nl->...kl',  K, K)                  # [..., d_k, d_k]
 
-    M = A - Vsum[..., None] * kappa[..., None, :]              # [B,H,d_v,d_k]
+    M = A - Vsum[..., None] * kappa[..., None, :]                    # [..., d_v, d_k]
 
-    KA_T = torch.einsum('bhk,bhdl->bhdkl', kappa, A)
-    AK_T = torch.einsum('bhdk,bhl->bhdkl', A, kappa)
-    KK_T = torch.einsum('bhk,bhl->bhkl', kappa, kappa)
+    # 外积项（注意使用不同的爱因斯坦指标避免与 kappa 收缩）
+    KA_T = torch.einsum('...k,...dl->...dkl', kappa, A)              # [..., d_v, d_k, d_k]
+    AK_T = torch.einsum('...dk,...l->...dkl', A, kappa)              # [..., d_v, d_k, d_k]
+    KK_T = torch.einsum('...k,...l->...kl',   kappa, kappa)          # [..., d_k, d_k]
 
-    U = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(2)  # [B,H,d_v,d_k,d_k]
-    Sigma = D - (N * KK_T)                                             # [B,H,d_k,d_k]
+    U     = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(-3)  # [..., d_v, d_k, d_k]
+    Sigma = D - (N * KK_T)                                                  # [..., d_k, d_k]
 
     return {
         "n": torch.tensor(float(N), device=device, dtype=dtype),
-        "kappa": kappa,    # [B,H,d_k]
-        "V": Vsum,         # [B,H,d_v]
-        "M": M,            # [B,H,d_v,d_k]
-        "U": U,            # [B,H,d_v,d_k,d_k]
-        "Sigma": Sigma,    # [B,H,d_k,d_k]
+        "kappa": kappa,    # [..., d_k]
+        "V": Vsum,         # [..., d_v]
+        "M": M,            # [..., d_v, d_k]
+        "U": U,            # [..., d_v, d_k, d_k]
+        "Sigma": Sigma,    # [..., d_k, d_k]
     }
 
 

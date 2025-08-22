@@ -309,6 +309,8 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
+        bsz, qlen, num_heads, head_dim = query_states.shape
+
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
             query_states, key_states, cos, sin
@@ -372,25 +374,29 @@ class LlamaAttention(nn.Module):
                 # flash_output_up = flash_output_up.transpose(1,2)
                 # flash_output_down = flash_output_down.transpose(1,2)
 
-                taylor_up = taylor_num_estimate(
-                    query_states,
-                    taylor_prefill_stats,
-                )
+                taylor_up_total, taylor_down_total = None, None
 
-                taylor_down = taylor_den_estimate(
-                    query_states,
-                    taylor_prefill_stats,
-                )
+                for stats in taylor_prefill_stats:
+                    taylor_up = taylor_num_estimate(query_states, stats)
+                    taylor_down = taylor_den_estimate(query_states, stats)
+                    taylor_up_total = taylor_up_total + taylor_up if taylor_up_total is not None else taylor_up
+                    taylor_down_total = taylor_down_total + taylor_down if taylor_down_total is not None else taylor_down
 
-                taylor_up = taylor_up.transpose(1,2)
-                taylor_down = taylor_down.transpose(1,2)
+                # taylor_up = taylor_num_estimate(
+                #     query_states,
+                #     taylor_prefill_stats,
+                # )
 
-                # print(f"{flash_output_up.shape=}, {flash_output_down.shape=}")
-                # print(f"{taylor_up.shape=}, {taylor_down.shape=}")
+                # taylor_down = taylor_den_estimate(
+                #     query_states,
+                #     taylor_prefill_stats,
+                # )
 
+                taylor_up_total = taylor_up_total.transpose(1,2)
+                taylor_down_total = taylor_down_total.transpose(1,2)
 
                 # attn_output = flash_output_up / flash_output_down
-                attn_output = (flash_output_up + taylor_up) / (flash_output_down + taylor_down)
+                attn_output = (flash_output_up + taylor_up_total) / (flash_output_down + taylor_down_total)
                 
                 attn_output = attn_output.to(query_states.dtype)
                 # attn_output = attn_output.transpose(1,2)
