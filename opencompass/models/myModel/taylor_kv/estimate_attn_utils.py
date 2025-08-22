@@ -101,6 +101,9 @@ def taylor_num_estimate(q: torch.Tensor, stats: dict):
     q: [B, H, S, d_k]
     返回: [..., d_v]
     """
+    assert q.shape[0] == 1, f"{q.shape=}"
+    q = q.squeeze(0)
+
     # print(f"taylor_num_estimate input {q.shape=}")
     assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
@@ -131,6 +134,9 @@ def taylor_den_estimate(q: torch.Tensor, stats: dict):
     q: [B, H, S, d_k]
     返回: [..., 1]  （方便与分子 [..., d_v] 相除）
     """
+    assert q.shape[0] == 1, f"{q.shape=}"
+    q = q.squeeze(0)
+    
     assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
 

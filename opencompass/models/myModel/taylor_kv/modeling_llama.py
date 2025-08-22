@@ -376,7 +376,8 @@ class LlamaAttention(nn.Module):
 
                 taylor_up_total, taylor_down_total = None, None
 
-                for stats in taylor_prefill_stats:
+                for idx in taylor_prefill_stats.shape[0]:
+                    stats = taylor_prefill_stats[idx, ...]
                     taylor_up = taylor_num_estimate(query_states, stats)
                     taylor_down = taylor_den_estimate(query_states, stats)
                     taylor_up_total = taylor_up_total + taylor_up if taylor_up_total is not None else taylor_up
