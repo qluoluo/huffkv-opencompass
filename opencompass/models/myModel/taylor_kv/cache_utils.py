@@ -38,9 +38,17 @@ class TaylorKVCache(DynamicCache):
         # Cache configuration
         self.window_size = self.kvcache_settings["window_size"]
         self.sparse_num = self.kvcache_settings["sparse_num"]
+        # self.remain_cluster_k = self.kvcache_settings["remain_cluster_k"]
+        # self.remain_group_size = self.kvcache_settings["remain_group_size"]
+
+        remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order"]
+        self.remain_cache_kwargs = {
+            k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys
+        }
 
         self.debug = self.kvcache_settings.get("debug", False)
         if type(self.debug) is str:
+            print(f"pass {type(self.debug)=} {self.debug=}")
             self.debug = self.debug.lower() == "true"
         # self.debug = True
         # self.debug = False
@@ -64,7 +72,10 @@ class TaylorKVCache(DynamicCache):
                 }
             )
             self.remain_cache.append(
-                RemainKVCacheStorage(debug=self.debug if layer_idx==0 else False)
+                RemainKVCacheStorage(
+                    debug=self.debug if layer_idx==0 else False,
+                    **self.remain_cache_kwargs,
+                )
             )
 
     def _select_sparse_kv(
@@ -161,8 +172,6 @@ class TaylorKVCache(DynamicCache):
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
-        # current_key_cache: dict,
-        # current_value_cache: dict,
     ):
         """Update window cache with new tokens, maintaining window size."""
         window_size = self.window_size

@@ -29,6 +29,7 @@ class RemainKVCacheStorage:
                  name: str = "unnamed", 
                  cluster_k: int = 0,
                  group_size: int = 0,
+                 order: int = 1,
                  debug: bool = False
                 ):
         self.name = name
@@ -78,23 +79,50 @@ class RemainKVCacheStorage:
             print(f"prefill_process_byfixgroup: K.shape={K.shape}, V.shape={V.shape}")
 
         assert self.group_size > 0, "group_size must > 0 in prefill_process_byfixgroup"
+        assert K.dim() == 4 and V.dim() == 4, "K/V must be [bsz, num_heads, seq_len, head_dim]"
+        assert K.shape == V.shape, "K and V must have the same shape"
 
-        num_heads, seq_len, head_dim = K.shape
+        bsz, num_heads, seq_len, head_dim = K.shape
+        assert bsz == 1, "This prefill path assumes bsz == 1"
+
+        # 统计预填长度
         self._prefill_len += seq_len
 
-        remain_len = seq_len // self.group_size
+        # 处理末尾不足一组的残余 token，留给 decode 阶段
+        remain_len = seq_len % self.group_size
         if remain_len > 0:
-            self._decode_K = K[:, -remain_len:, :]
-            self._decode_V = V[:, -remain_len:, :]
-        
-        K = K[:, :-remain_len, :]
-        V = V[:, :-remain_len, :]
-        num_heads, seq_len, head_dim = K.shape
+            # 注意包含 heads 维度
+            self._decode_K = K[:, :, -remain_len:, :].contiguous()
+            self._decode_V = V[:, :, -remain_len:, :].contiguous()
+            K_work = K[:, :, :-remain_len, :]
+            V_work = V[:, :, :-remain_len, :]
+        else:
+            # 没有残余则清空 decode 暂存（避免陈旧值）
+            self._decode_K = None
+            self._decode_V = None
+            K_work, V_work = K, V
 
-        K = K.reshape(num_heads, seq_len // self.group_size, self.group_size, head_dim).transpose(0,1)
-        V = V.reshape(num_heads, seq_len // self.group_size, self.group_size, head_dim).transpose(0,1)
+        # 可能全部都是残余（seq_len < group_size），此时无需预填
+        if K_work.numel() == 0:
+            self._prefill_stats = None
+            return
 
-        self._prefill_stats = preprocess_stats_bh(K, V)
+        # 现在长度可被整除：seq_len_work = groups * group_size
+        seq_len_work = K_work.shape[2]
+        groups = seq_len_work // self.group_size
+        assert seq_len_work == groups * self.group_size
+
+        # 先 reshape 出组维度：[B, H, G, S, D]
+        K_work = K_work.view(bsz, num_heads, groups, self.group_size, head_dim)
+        V_work = V_work.view(bsz, num_heads, groups, self.group_size, head_dim)
+
+        # 将 组别(G) 和 batch 维 合并到 batch 上：
+        # [B, H, G, S, D] -> [B, G, H, S, D] -> [B*G, H, S, D]
+        K_work = K_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, self.group_size, head_dim).contiguous()
+        V_work = V_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, self.group_size, head_dim).contiguous()
+
+        # 下游仍按 [B', H, T, D]（这里 T=group_size）处理
+        self._prefill_stats = preprocess_stats_bh(K_work, V_work)
         
 
     def prefill_process_bycluster(self, K: torch.Tensor, V: torch.Tensor) -> None:
@@ -142,8 +170,8 @@ class RemainKVCacheStorage:
         bsz, num_heads, seq_len, head_dim = K.shape
         assert bsz == 1, f"batch size must be 1, but got {bsz}"
 
-        K = K.squeeze(0)
-        V = V.squeeze(0)
+        # K = K.squeeze(0)
+        # V = V.squeeze(0)
 
         # 只累加 seq_len
         self.cache_length += int(seq_len)

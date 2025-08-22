@@ -20,14 +20,16 @@ config = AutoConfig.from_pretrained(model_path)
 config_kvcache_settings = {
     "window_size": 128,
     "sparse_num": 128,
+    "remain_cluster_k": 64,
+    "remain_group_size": 64,
+    "remain_order": 1,
     "debug": True,
 }
 config.kvcache_settings = config_kvcache_settings
 
 model = LlamaForCausalLM.from_pretrained(
     model_path,
-    torch_dtype=torch.bfloat16, 
-    # torch_dtype=torch.float32,
+    torch_dtype=torch.bfloat16,
     attn_implementation="flash_attention_2",  # 强制使用flash attention
     # device_map="auto",
     device_map="cuda:0",
@@ -47,7 +49,8 @@ tokenizer = AutoTokenizer.from_pretrained(
 # text = "User: Please write a story about a robot and a fish.\nAssistant:"
 # text = "User: Please introduce yourself.\nAssistant:"
 text = "hello " * (4 * 1024)
-with open("needle_bench_0.txt", "r", encoding='utf-8') as f:
+text_fp = os.path.join(os.path.dirname(__file__), "needle_bench_0.txt")
+with open(text_fp, "r", encoding='utf-8') as f:
     text = f.read().strip().strip('\\n')
 
 # import ipdb; ipdb.set_trace()

@@ -44,6 +44,10 @@ class LlamaForCausalLM_TaylorKV_OC(HuggingFaceCausalLM):
             "window_size": 128,
             "sparse_num": 128,
             "pool_kernel_size": -1,
+
+            "remain_cluster_k": 0,
+            "remain_group_size": 0,
+
             "debug": True,
             # "debug": False,
         }

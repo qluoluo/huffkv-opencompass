@@ -1,60 +1,25 @@
 import torch
+from typing import Literal
 
 def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
     for _ in range(n):
         x = x.unsqueeze(-idx_from_end-1)
     return x
 
-# @torch.no_grad()
-# def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
-#     # print(f"preprocess_stats_bh input {K.shape=} {V.shape=}")
-#     assert K.dim() == 4 and V.dim() == 4, "K,V 应为 [B, H, N, d]"
-
-#     B, H, N, d_k = K.shape
-#     d_v = V.shape[-1]
-#     device, dtype = K.device, K.dtype
-
-#     kappa = K.mean(dim=2)          # [B,H,d_k]
-#     Vsum  = V.sum(dim=2)           # [B,H,d_v]
-
-#     A   = torch.einsum('bhnd,bhnk->bhdk', V, K)                # [B,H,d_v,d_k]
-#     B_t = torch.einsum('bhnd,bhnk,bhnl->bhdkl', V, K, K)       # [B,H,d_v,d_k,d_k]
-#     D   = torch.einsum('bhnk,bhnl->bhkl', K, K)                # [B,H,d_k,d_k]
-
-#     M = A - Vsum[..., None] * kappa[..., None, :]              # [B,H,d_v,d_k]
-
-#     KA_T = torch.einsum('bhk,bhdl->bhdkl', kappa, A)
-#     AK_T = torch.einsum('bhdk,bhl->bhdkl', A, kappa)
-#     KK_T = torch.einsum('bhk,bhl->bhkl', kappa, kappa)
-
-#     U = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(2)  # [B,H,d_v,d_k,d_k]
-#     Sigma = D - (N * KK_T)                                             # [B,H,d_k,d_k]
-
-#     return {
-#         "n": torch.tensor(float(N), device=device, dtype=dtype),
-#         "kappa": kappa,    # [B,H,d_k]
-#         "V": Vsum,         # [B,H,d_v]
-#         "M": M,            # [B,H,d_v,d_k]
-#         "U": U,            # [B,H,d_v,d_k,d_k]
-#         "Sigma": Sigma,    # [B,H,d_k,d_k]
-#     }
-
-import torch
-
 @torch.no_grad()
-def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
+def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor, order: Literal[1, 2] = 1):
     """
-    通用版：
+    通用版 & 可选阶数：
       K: [..., N, d_k]
       V: [..., N, d_v]
     要求：K 与 V 的前缀维度一致，且第 -2 维 N 相同
-    返回：
+    返回（按需计算）：
       n:       标量(同 dtype/device)，值为 N
-      kappa:   [..., d_k]
-      V:       [..., d_v]
-      M:       [..., d_v, d_k]
-      U:       [..., d_v, d_k, d_k]
-      Sigma:   [..., d_k, d_k]
+      kappa:   [..., d_k]                    —— 所有阶都需要
+      V:       [..., d_v]                    —— 所有阶都需要（∑V_i）
+      M:       [..., d_v, d_k]               —— 一阶/二阶都需要
+      U:       [..., d_v, d_k, d_k] 或 None  —— 仅二阶需要
+      Sigma:   [..., d_k, d_k] 或 None       —— 仅二阶需要
     """
     assert K.dim() >= 2 and V.dim() >= 2, "K,V 应为 [..., N, d]"
     assert K.shape[:-2] == V.shape[:-2], "K,V 前缀维度必须一致"
@@ -70,88 +35,121 @@ def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor):
     Vsum  = V.sum(dim=-2)           # [..., d_v]
 
     # 基本张量
+    # A = ∑ V_i k_i^T
     A   = torch.einsum('...nd,...nk->...dk',   V, K)                 # [..., d_v, d_k]
-    B_t = torch.einsum('...nd,...nk,...nl->...dkl', V, K, K)         # [..., d_v, d_k, d_k]
-    D   = torch.einsum('...nk,...nl->...kl',  K, K)                  # [..., d_k, d_k]
-
     M = A - Vsum[..., None] * kappa[..., None, :]                    # [..., d_v, d_k]
 
-    # 外积项（注意使用不同的爱因斯坦指标避免与 kappa 收缩）
-    KA_T = torch.einsum('...k,...dl->...dkl', kappa, A)              # [..., d_v, d_k, d_k]
-    AK_T = torch.einsum('...dk,...l->...dkl', A, kappa)              # [..., d_v, d_k, d_k]
-    KK_T = torch.einsum('...k,...l->...kl',   kappa, kappa)          # [..., d_k, d_k]
+    U = None
+    Sigma = None
+    if order == 2:
+        # B_t = ∑ V_i (k_i ⊗ k_i)
+        B_t = torch.einsum('...nd,...nk,...nl->...dkl', V, K, K)     # [..., d_v, d_k, d_k]
+        # D = ∑ k_i k_i^T
+        D   = torch.einsum('...nk,...nl->...kl',  K, K)              # [..., d_k, d_k]
 
-    U     = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(-3)  # [..., d_v, d_k, d_k]
-    Sigma = D - (N * KK_T)                                                  # [..., d_k, d_k]
+        # 外积项
+        KA_T = torch.einsum('...k,...dl->...dkl', kappa, A)          # [..., d_v, d_k, d_k]
+        AK_T = torch.einsum('...dk,...l->...dkl', A, kappa)          # [..., d_v, d_k, d_k]
+        KK_T = torch.einsum('...k,...l->...kl',   kappa, kappa)      # [..., d_k, d_k]
+
+        U     = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(-3)  # [..., d_v, d_k, d_k]
+        Sigma = D - (N * KK_T)                                                  # [..., d_k, d_k]
 
     return {
         "n": torch.tensor(float(N), device=device, dtype=dtype),
         "kappa": kappa,    # [..., d_k]
         "V": Vsum,         # [..., d_v]
         "M": M,            # [..., d_v, d_k]
-        "U": U,            # [..., d_v, d_k, d_k]
-        "Sigma": Sigma,    # [..., d_k, d_k]
+        "U": U,            # [..., d_v, d_k, d_k] 或 None
+        "Sigma": Sigma,    # [..., d_k, d_k] 或 None
+        "order": order,
     }
 
 
 @torch.no_grad()
 def taylor_num_estimate(q: torch.Tensor, stats: dict):
     """
-    N(q) ≈ e^{q·kappa} [ V + M q + 1/2 * (U : (q⊗q)) ]
-    q: [B, H, S, d_k]
+    分子 N(q) 估计：
+      一阶：N(q) ≈ e^{q·kappa} [ V + M q ]
+      二阶：N(q) ≈ e^{q·kappa} [ V + M q + 1/2 * (U : (q⊗q)) ]
+    q: [B, H, S, d_k]，当前实现要求 B=1, S=1
     返回: [..., d_v]
     """
-    assert q.shape[0] == 1, f"{q.shape=}"
-    q = q.squeeze(0)
-
-    # print(f"taylor_num_estimate input {q.shape=}")
+    # assert q.shape[0] == 1, f"{q.shape=}"
+    # q = q.squeeze(0)
     assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
 
-    # ✅ 修正：不减 1
+    # 维度对齐
     extra = q.ndim - stats["kappa"].ndim
     if extra < 0:
         raise ValueError("q 的维度应至少与 [B,H,d_k] 等长")
 
+    order = stats['order']
+
     kappa = _unsqueeze_before_last(stats["kappa"], extra, idx_from_end=1)      # [..., d_k]
     Vsum  = _unsqueeze_before_last(stats["V"],     extra, idx_from_end=1)      # [..., d_v]
     M     = _unsqueeze_before_last(stats["M"],     extra, idx_from_end=2)      # [..., d_v, d_k]
-    U     = _unsqueeze_before_last(stats["U"],     extra, idx_from_end=3)      # [..., d_v, d_k, d_k]
 
-    # 更稳妥的写法，避免省略号对不齐
     e = torch.exp((q * kappa).sum(dim=-1))                                     # [...]
 
     term0 = Vsum                                                               # [..., d_v]
     term1 = torch.einsum('...vk,...k->...v', M, q)                             # [..., d_v]
+
+    if order == 1:
+        return e[..., None] * (term0 + term1)
+
+    # 二阶
+    assert stats["U"] is not None, "需要在 preprocess_stats_bh(..., order=2) 下预计算 U"
+    U = _unsqueeze_before_last(stats["U"], extra, idx_from_end=3)              # [..., d_v, d_k, d_k]
     term2 = 0.5 * torch.einsum('...vkl,...k,...l->...v', U, q, q)             # [..., d_v]
-    return e[..., None] * (term0 + term1 + term2)                              # [..., d_v]
+    return e[..., None] * (term0 + term1 + term2)
 
 
 @torch.no_grad()
 def taylor_den_estimate(q: torch.Tensor, stats: dict):
     """
-    Z(q) ≈ e^{q·kappa} [ n + 1/2 * q^T Σ q ]
-    q: [B, H, S, d_k]
+    分母 Z(q) 估计：
+      一阶：Z(q) ≈ e^{q·kappa} [ n ]
+      二阶：Z(q) ≈ e^{q·kappa} [ n + 1/2 * q^T Σ q ]
+    q: [B, H, S, d_k]，当前实现要求 B=1, S=1
     返回: [..., 1]  （方便与分子 [..., d_v] 相除）
     """
-    assert q.shape[0] == 1, f"{q.shape=}"
-    q = q.squeeze(0)
-    
+    # assert q.shape[0] == 1, f"{q.shape=}"
+    # q = q.squeeze(0)
     assert q.shape[-2] == 1, f"{q.shape=}"
     assert q.shape[-1] == stats["kappa"].shape[-1], "q 的最后一维应等于 d_k"
 
-    # ✅ 修正：不减 1
     extra = q.ndim - stats["kappa"].ndim
     if extra < 0:
         raise ValueError("q 的维度应至少与 [B,H,d_k] 等长")
 
-    kappa = _unsqueeze_before_last(stats["kappa"], extra, idx_from_end=1)      # [..., d_k]
-    Sigma = _unsqueeze_before_last(stats["Sigma"], extra, idx_from_end=2)      # [..., d_k, d_k]
+    order = stats['order']
 
+    kappa = _unsqueeze_before_last(stats["kappa"], extra, idx_from_end=1)      # [..., d_k]
     e = torch.exp((q * kappa).sum(dim=-1))                                     # [...]
+
+    if order == 1:
+        den = e * stats["n"].to(q.dtype)                                       # [...]
+        return den[..., None]
+
+    # 二阶
+    assert stats["Sigma"] is not None, "需要在 preprocess_stats_bh(..., order=2) 下预计算 Sigma"
+    Sigma = _unsqueeze_before_last(stats["Sigma"], extra, idx_from_end=2)      # [..., d_k, d_k]
     quad = torch.einsum('...kl,...k,...l->...', Sigma, q, q)                   # [...]
     den = e * (stats["n"].to(q.dtype) + 0.5 * quad)                            # [...]
-    return den[..., None]      
+    return den[..., None]
+
+
+# @torch.no_grad()
+# def taylor_attn_estimate(q: torch.Tensor, stats: dict):
+#     """
+#     直接给出注意力输出的泰勒估计： N(q) / Z(q)
+#     """
+#     num = taylor_num_estimate(q, stats)
+#     den = taylor_den_estimate(q, stats)
+#     return num / den
+
 
 if __name__ == "__main__":
     torch.manual_seed(0)
@@ -159,25 +157,29 @@ if __name__ == "__main__":
     K = torch.randn(B, H, N, Dk)
     V = torch.randn(B, H, N, Dv)
 
-    stats = preprocess_stats_bh(K, V)
-    print("kappa:", stats["kappa"].shape)   # [B,H,Dk]
-    print("Vsum:", stats["V"].shape)        # [B,H,Dv]
-    print("M:", stats["M"].shape)           # [B,H,Dv,Dk]
-    print("U:", stats["U"].shape)           # [B,H,Dv,Dk,Dk]
-    print("Sigma:", stats["Sigma"].shape)   # [B,H,Dk,Dk]
+    # 选择展开阶数：1 或 2
+    order = 2 # 改成 1 即用一阶
+    stats = preprocess_stats_bh(K, V, order=order)
+
+    print("kappa:", stats["kappa"].shape)           # [B,H,Dk]
+    print("Vsum:", stats["V"].shape)                # [B,H,Dv]
+    print("M:", stats["M"].shape)                   # [B,H,Dv,Dk]
+    if order == 2:
+        print("U:", stats["U"].shape)               # [B,H,Dv,Dk,Dk]
+        print("Sigma:", stats["Sigma"].shape)       # [B,H,Dk,Dk]
 
     # 单个查询
     q = torch.randn(B, H, 1, Dk)
-    num1 = taylor_num_estimate(q, stats)
-    den1 = taylor_den_estimate(q, stats)
-    print(f"{num1.shape=}, {den1.shape=}")
+    num = taylor_num_estimate(q, stats)
+    den = taylor_den_estimate(q, stats)
+    print(f"{num.shape=}, {den.shape=}")
 
+    # 与精确（部分）注意力对比
     from attn_utils import matmul_part_attn
     up, down = matmul_part_attn(q, K, V)
-    print(f"{up.shape=}, {down.shape=}")
+    attn_output_taylor = num / den
+    attn_output_exact  = up / down
 
-    attn_output1 = num1 / den1
-    attn_output2 = up / down
-
-    print(f"{attn_output1.shape=}, {attn_output2.shape=}")
-    print(f"{attn_output1 - attn_output2=}")
+    print(f"{attn_output_taylor.shape=}, {attn_output_exact.shape=}")
+    print(f"误差范数: {(attn_output_taylor - attn_output_exact).norm()}")
+    print(f"{attn_output_taylor - attn_output_exact=}")
