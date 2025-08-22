@@ -327,8 +327,9 @@ class LlamaAttention(nn.Module):
 
         # 强制使用flash attention计算，并且分part计算
         if past_key_value is not None:
-            
+
             from .cache_utils import TaylorKVCache
+
             assert type(past_key_value) == TaylorKVCache
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -349,10 +350,11 @@ class LlamaAttention(nn.Module):
                 #     print("modeling_llama use origin flash attn")
 
                 from flash_attn import flash_attn_func
+
                 attn_output = flash_attn_func(
-                    query_states.transpose(1,2),
-                    key_states.transpose(1,2),
-                    value_states.transpose(1,2),
+                    query_states.transpose(1, 2),
+                    key_states.transpose(1, 2),
+                    value_states.transpose(1, 2),
                     causal=self.is_causal,
                 )
             else:
@@ -361,14 +363,15 @@ class LlamaAttention(nn.Module):
                 #     print("modeling_llama use mix taylor flash attn")
 
                 from .estimate_attn_utils import (
-                    taylor_num_estimate, taylor_den_estimate
+                    taylor_num_estimate,
+                    taylor_den_estimate,
                 )
                 from .attn_utils import flash_part_attn
 
                 flash_output_up, flash_output_down = flash_part_attn(
-                    query_states.transpose(1,2),
-                    key_states.transpose(1,2),
-                    value_states.transpose(1,2),
+                    query_states.transpose(1, 2),
+                    key_states.transpose(1, 2),
+                    value_states.transpose(1, 2),
                     causal=self.is_causal,
                 )
                 # flash_output_up = flash_output_up.transpose(1,2)
@@ -377,11 +380,19 @@ class LlamaAttention(nn.Module):
                 taylor_up_total, taylor_down_total = None, None
 
                 for idx in taylor_prefill_stats.shape[0]:
-                    stats = taylor_prefill_stats[idx, ...]
+                    stats = taylor_prefill_stats[idx : idx + 1, ...]
                     taylor_up = taylor_num_estimate(query_states, stats)
                     taylor_down = taylor_den_estimate(query_states, stats)
-                    taylor_up_total = taylor_up_total + taylor_up if taylor_up_total is not None else taylor_up
-                    taylor_down_total = taylor_down_total + taylor_down if taylor_down_total is not None else taylor_down
+                    taylor_up_total = (
+                        taylor_up_total + taylor_up
+                        if taylor_up_total is not None
+                        else taylor_up
+                    )
+                    taylor_down_total = (
+                        taylor_down_total + taylor_down
+                        if taylor_down_total is not None
+                        else taylor_down
+                    )
 
                 # taylor_up = taylor_num_estimate(
                 #     query_states,
@@ -393,12 +404,14 @@ class LlamaAttention(nn.Module):
                 #     taylor_prefill_stats,
                 # )
 
-                taylor_up_total = taylor_up_total.transpose(1,2)
-                taylor_down_total = taylor_down_total.transpose(1,2)
+                taylor_up_total = taylor_up_total.transpose(1, 2)
+                taylor_down_total = taylor_down_total.transpose(1, 2)
 
                 # attn_output = flash_output_up / flash_output_down
-                attn_output = (flash_output_up + taylor_up_total) / (flash_output_down + taylor_down_total)
-                
+                attn_output = (flash_output_up + taylor_up_total) / (
+                    flash_output_down + taylor_down_total
+                )
+
                 attn_output = attn_output.to(query_states.dtype)
                 # attn_output = attn_output.transpose(1,2)
 
