@@ -18,12 +18,18 @@ print(f"{os.path.basename(model_path)=}")
 config = AutoConfig.from_pretrained(model_path)
 
 config_kvcache_settings = {
-    "window_size": 128,
-    "sparse_num": 128,
+    "window_size": 16,
+    "sparse_num": 512,
+
+    # "use_remain": True,
+    "use_remain": False,
     "remain_cluster_k": 64,
-    "remain_group_size": 64,
+    "remain_group_size": 32,
     "remain_order": 1,
-    "debug": True,
+    "remain_u_mode": "full",
+    
+    # "debug": True,
+    "debug": False,
 }
 config.kvcache_settings = config_kvcache_settings
 
@@ -60,11 +66,11 @@ print(f"{text[-100:]=}")
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")
 outputs = model.generate(**inputs, max_new_tokens=100,
-    repetition_penalty=1.5,          # 重复惩罚系数 >1.0 表示惩罚
-    do_sample=False,                # 启用采样（用于更自然的结果）
-    top_k=50,                        # Top-k 采样
-    top_p=0.95,                      # Top-p (nucleus) 采样
-    temperature=0.7,
+    # repetition_penalty=1.5,          # 重复惩罚系数 >1.0 表示惩罚
+    do_sample=False,
+    # top_k=50,                        # Top-k 采样
+    # top_p=0.95,                      # Top-p (nucleus) 采样
+    # temperature=0.7,
 )
 print("### Generate Content:")
 print(tokenizer.decode(outputs[0][inputs.input_ids.shape[1]:]))

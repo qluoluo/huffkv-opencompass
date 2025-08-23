@@ -123,6 +123,8 @@ class RemainKVCacheStorage:
 
         # 下游仍按 [B', H, T, D]（这里 T=group_size）处理
         self._prefill_stats = preprocess_stats_bh(K_work, V_work)
+
+        # import ipdb; ipdb.set_trace()
         
 
     def prefill_process_bycluster(self, K: torch.Tensor, V: torch.Tensor) -> None:

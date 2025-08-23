@@ -25,26 +25,29 @@ class TaylorKVCache(DynamicCache):
             TaylorKVCache.TaylorKVCache_init = True
             print(f"-------------------- {self.__class__.__name__} init --------------------")
 
+        # Cache configuration
+        self.kvcache_settings = config.kvcache_settings
+        self.window_size = self.kvcache_settings["window_size"]
+        self.sparse_num = self.kvcache_settings["sparse_num"]
+        self.use_remain = self.kvcache_settings["use_remain"]
+
         self.key_cache = []
         self.value_cache = []
 
-        self.remain_cache: List[RemainKVCacheStorage] = []
+        if self.use_remain:
+            self.remain_cache: List[RemainKVCacheStorage] = []
+
+            remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order"]
+            self.remain_cache_kwargs = {
+                k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys
+            }
 
         self._seen_tokens = 0
         # self._prefill_computed = False
 
-        self.kvcache_settings = config.kvcache_settings
-
-        # Cache configuration
-        self.window_size = self.kvcache_settings["window_size"]
-        self.sparse_num = self.kvcache_settings["sparse_num"]
         # self.remain_cluster_k = self.kvcache_settings["remain_cluster_k"]
         # self.remain_group_size = self.kvcache_settings["remain_group_size"]
 
-        remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order"]
-        self.remain_cache_kwargs = {
-            k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys
-        }
 
         self.debug = self.kvcache_settings.get("debug", False)
         if type(self.debug) is str:
@@ -71,12 +74,13 @@ class TaylorKVCache(DynamicCache):
                     "window": None,
                 }
             )
-            self.remain_cache.append(
-                RemainKVCacheStorage(
-                    debug=self.debug if layer_idx==0 else False,
-                    **self.remain_cache_kwargs,
+            if self.use_remain:
+                self.remain_cache.append(
+                    RemainKVCacheStorage(
+                        debug=self.debug if layer_idx==0 else False,
+                        **self.remain_cache_kwargs,
+                    )
                 )
-            )
 
     def _select_sparse_kv(
         self,
@@ -165,7 +169,8 @@ class TaylorKVCache(DynamicCache):
         self.key_cache[layer_idx]['sparse'] = sparse_key
         self.value_cache[layer_idx]['sparse'] = sparse_value
 
-        self.remain_cache[layer_idx].append(remain_key, remain_value)
+        if self.use_remain:
+            self.remain_cache[layer_idx].append(remain_key, remain_value)
 
     def _update_window_cache(
         self,
@@ -192,7 +197,7 @@ class TaylorKVCache(DynamicCache):
         self.value_cache[layer_idx]["window"] = new_window_values[..., -window_size:, :]
 
         # Keep only the last window_size tokens
-        if new_window_keys.shape[-2] > self.window_size:
+        if self.use_remain and new_window_keys.shape[-2] > self.window_size:
             self.remain_cache[layer_idx].append(
                 new_window_keys[..., : -self.window_size, :],
                 new_window_values[..., : -self.window_size, :]
@@ -207,7 +212,7 @@ class TaylorKVCache(DynamicCache):
         value_cache = self._reconstruct_cache(layer_idx, is_key=False)
 
         store_states = None
-        if len(self.remain_cache) > layer_idx:
+        if self.use_remain and len(self.remain_cache) > layer_idx:
             store_states = self.remain_cache[layer_idx].get_states()
             # store_key, store_value = self.remain_cache[layer_idx].get_cache()
             # if store_key is not None:
@@ -228,8 +233,11 @@ class TaylorKVCache(DynamicCache):
         # Get cache components
         sparse_cache = cache_dict.get("sparse")
         window_cache = cache_dict.get("window")
-        remain_cache = self.remain_cache[layer_idx].get_cache()
-        remain_cache = remain_cache[0] if is_key else remain_cache[1]
+
+        remain_cache = None
+        if self.use_remain:
+            remain_cache = self.remain_cache[layer_idx].get_cache()
+            remain_cache = remain_cache[0] if is_key else remain_cache[1]
 
         # Concatenate cache parts in order: sparse -> remain -> window
         cache_parts = [x for x in [sparse_cache, remain_cache, window_cache] if x is not None]
@@ -248,7 +256,8 @@ class TaylorKVCache(DynamicCache):
             ret_len += self.key_cache[0]["sparse"].shape[-2]
 
         # ret_len += self.key_cache[0]["compressed"].get_length()
-        ret_len += self.remain_cache[0].get_length()
+        if use_remain:
+            ret_len += self.remain_cache[0].get_length()
 
         return ret_len
 
@@ -360,13 +369,15 @@ class TaylorKVCache(DynamicCache):
         )
 
         # Calculate remain length
-        remain_length = self.remain_cache[layer_idx].get_length()
+        remain_length = 0
+        if self.use_remain:
+            remain_length = self.remain_cache[layer_idx].get_length()
 
         return sparse_length + remain_length + window_length
 
     def print_cache_length(self, layer_idx):
         print(
                 f"sparse: {self.key_cache[layer_idx]['sparse'].shape[-2] if self.key_cache[layer_idx]['sparse'] is not None else 0} \
-                compressed: {self.remain_cache[layer_idx].get_length()} \
+                compressed: {self.remain_cache[layer_idx].get_length() if self.use_remain else 0} \
                 window: {self.key_cache[layer_idx]['window'].shape[-2] if self.key_cache[layer_idx]['window'] is not None else 0}"
             )

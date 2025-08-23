@@ -42,17 +42,17 @@ QUANT_CONFIGS = [
     # {"abbr": "GQ-kt2-vc2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -1},
     # {"abbr": "GQ-kt2-vt2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -2},
 
-    {"abbr": "TaylorKV", "window_size": 256, "sparse_num": 256, "debug": True},
+    {"abbr": "TaylorKV", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
+    {"abbr": "TaylorKV-not-remain", "use_remain": False, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
+
 ]
 
 # 通用量化参数
-COMMON_QUANT_KWARGS = dict(
-    # group_size=-1,
-    # group_size=32,
-    # global_residual_length=0,
-    # local_residual_length=128,
-    # local_residual_length=0,
-)
+COMMON_QUANT_KWARGS = {
+    "window_size": 16, 
+    "sparse_num": 512,
+    "debug": True,
+}
 
 # 构建模型列表
 models = []

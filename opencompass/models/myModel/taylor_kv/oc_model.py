@@ -37,16 +37,14 @@ class LlamaForCausalLM_TaylorKV_OC(HuggingFaceCausalLM):
 
         model_kwargs = kwargs
         config_kvcache_settings = {
-            # "k_bits": None,
-            # "v_bits": None,
-            # "k_quant_dim": None,  # [bsz, num_heads, seq_len, head_dim] KIVI: k->head_dim*numheads v: seq_len
-            # "v_quant_dim": None,
-            "window_size": 128,
-            "sparse_num": 128,
-            "pool_kernel_size": -1,
+            "window_size": 16,
+            "sparse_num": 512,
 
-            "remain_cluster_k": 0,
-            "remain_group_size": 0,
+            "use_remain": True,
+            # "use_remain": False,
+            "remain_cluster_k": 64,
+            "remain_group_size": 32,
+            "remain_order": 1,
 
             "debug": True,
             # "debug": False,

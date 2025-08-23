@@ -7,7 +7,12 @@ def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
     return x
 
 @torch.no_grad()
-def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor, order: Literal[1, 2] = 1):
+def preprocess_stats_bh(
+    K: torch.Tensor, 
+    V: torch.Tensor, 
+    order: Literal[1, 2] = 1,
+    u_mode: Literal["full","diag","none"]="diag",
+):
     """
     通用版 & 可选阶数：
       K: [..., N, d_k]
@@ -36,34 +41,32 @@ def preprocess_stats_bh(K: torch.Tensor, V: torch.Tensor, order: Literal[1, 2] =
 
     # 基本张量
     # A = ∑ V_i k_i^T
-    A   = torch.einsum('...nd,...nk->...dk',   V, K)                 # [..., d_v, d_k]
-    M = A - Vsum[..., None] * kappa[..., None, :]                    # [..., d_v, d_k]
+    A = torch.einsum('...nd,...nk->...dk', V, K)   # [..., d_v, d_k]
+    M = A - Vsum[..., None] * kappa[..., None, :]
+    U = Sigma = None
 
-    U = None
-    Sigma = None
     if order == 2:
-        # B_t = ∑ V_i (k_i ⊗ k_i)
-        B_t = torch.einsum('...nd,...nk,...nl->...dkl', V, K, K)     # [..., d_v, d_k, d_k]
-        # D = ∑ k_i k_i^T
-        D   = torch.einsum('...nk,...nl->...kl',  K, K)              # [..., d_k, d_k]
+        # 总是算 Sigma（分母用得到），它只有 d_k^2
+        D     = torch.einsum('...nk,...nl->...kl', K, K)
+        KK_T  = torch.einsum('...k,...l->...kl', kappa, kappa)
+        Sigma = D - (N * KK_T)
 
-        # 外积项
-        KA_T = torch.einsum('...k,...dl->...dkl', kappa, A)          # [..., d_v, d_k, d_k]
-        AK_T = torch.einsum('...dk,...l->...dkl', A, kappa)          # [..., d_v, d_k, d_k]
-        KK_T = torch.einsum('...k,...l->...kl',   kappa, kappa)      # [..., d_k, d_k]
+        if u_mode == "full":
+            B_t  = torch.einsum('...nd,...nk,...nl->...dkl', V, K, K)
+            KA_T = torch.einsum('...k,...dl->...dkl', kappa, A)
+            AK_T = torch.einsum('...dk,...l->...dkl', A, kappa)
+            U = B_t - KA_T - AK_T + Vsum[..., None, None]*KK_T.unsqueeze(-3)
 
-        U     = B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(-3)  # [..., d_v, d_k, d_k]
-        Sigma = D - (N * KK_T)                                                  # [..., d_k, d_k]
-
-    return {
-        "n": torch.tensor(float(N), device=device, dtype=dtype),
-        "kappa": kappa,    # [..., d_k]
-        "V": Vsum,         # [..., d_v]
-        "M": M,            # [..., d_v, d_k]
-        "U": U,            # [..., d_v, d_k, d_k] 或 None
-        "Sigma": Sigma,    # [..., d_k, d_k] 或 None
-        "order": order,
-    }
+        elif u_mode == "diag":
+            # 仅保留二阶的对角向量，极大省内存
+            Ssq = torch.einsum('...nd,...nk->...dk', V, K*K)  # [..., d_v, d_k]
+        # "none" 什么也不存（配合上面的“用KV精确”或“共享近似”）
+    out = {"n": torch.tensor(float(N), device=device, dtype=dtype),
+           "kappa": kappa, "V": Vsum, "M": M,
+           "U": U, "Sigma": Sigma, "order": order}
+    if order==2 and u_mode=="diag":
+        out["Ssq"] = Ssq
+    return out
 
 
 @torch.no_grad()

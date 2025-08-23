@@ -377,22 +377,25 @@ class LlamaAttention(nn.Module):
                 # flash_output_up = flash_output_up.transpose(1,2)
                 # flash_output_down = flash_output_down.transpose(1,2)
 
-                taylor_up_total, taylor_down_total = None, None
+                # taylor_up_total, taylor_down_total = None, None
 
-                for idx in taylor_prefill_stats.shape[0]:
-                    stats = taylor_prefill_stats[idx : idx + 1, ...]
-                    taylor_up = taylor_num_estimate(query_states, stats)
-                    taylor_down = taylor_den_estimate(query_states, stats)
-                    taylor_up_total = (
-                        taylor_up_total + taylor_up
-                        if taylor_up_total is not None
-                        else taylor_up
-                    )
-                    taylor_down_total = (
-                        taylor_down_total + taylor_down
-                        if taylor_down_total is not None
-                        else taylor_down
-                    )
+                taylor_up_total = taylor_num_estimate(query_states, taylor_prefill_stats).sum(dim=0, keepdim=True)
+                taylor_down_total = taylor_den_estimate(query_states, taylor_prefill_stats).sum(dim=0, keepdim=True)
+
+                # for idx in taylor_prefill_stats.shape[0]:
+                #     stats = taylor_prefill_stats[idx : idx + 1, ...]
+                #     taylor_up = taylor_num_estimate(query_states, stats)
+                #     taylor_down = taylor_den_estimate(query_states, stats)
+                #     taylor_up_total = (
+                #         taylor_up_total + taylor_up
+                #         if taylor_up_total is not None
+                #         else taylor_up
+                #     )
+                #     taylor_down_total = (
+                #         taylor_down_total + taylor_down
+                #         if taylor_down_total is not None
+                #         else taylor_down
+                #     )
 
                 # taylor_up = taylor_num_estimate(
                 #     query_states,
