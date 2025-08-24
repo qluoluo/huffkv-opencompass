@@ -1,6 +1,6 @@
 import os
 import torch
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, List, Dict, Literal
 
 from .estimate_attn_utils import (
     preprocess_stats_bh,
@@ -30,6 +30,7 @@ class RemainKVCacheStorage:
                  cluster_k: int = 0,
                  group_size: int = 0,
                  order: int = 1,
+                 u_mode: Literal["full","diag","none"]="full",
                  debug: bool = False
                 ):
         self.name = name

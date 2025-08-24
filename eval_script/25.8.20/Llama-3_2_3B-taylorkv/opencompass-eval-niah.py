@@ -42,8 +42,12 @@ QUANT_CONFIGS = [
     # {"abbr": "GQ-kt2-vc2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -1},
     # {"abbr": "GQ-kt2-vt2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -2},
 
-    {"abbr": "TaylorKV", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
-    {"abbr": "TaylorKV-not-remain", "use_remain": False, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
+    # {"abbr": "TaylorKV-g32", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
+    # {"abbr": "TaylorKV-g4", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 4, "remain_order": 1,},
+    {"abbr": "TaylorKV-g8", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 8, "remain_order": 1},
+    {"abbr": "TaylorKV-g16", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 16, "remain_order": 1},
+
+    # {"abbr": "TaylorKV-not-remain", "use_remain": False, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
 
 ]
 

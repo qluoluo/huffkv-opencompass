@@ -37,9 +37,10 @@ class TaylorKVCache(DynamicCache):
         if self.use_remain:
             self.remain_cache: List[RemainKVCacheStorage] = []
 
-            remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order"]
+            remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order", "remain_u_mode"]
             self.remain_cache_kwargs = {
-                k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys
+                k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys \
+                    if k in self.kvcache_settings.keys()
             }
 
         self._seen_tokens = 0
