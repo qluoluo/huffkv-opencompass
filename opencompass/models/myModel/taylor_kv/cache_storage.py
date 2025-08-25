@@ -2,11 +2,8 @@ import os
 import torch
 from typing import Optional, Tuple, List, Dict, Literal
 
-from .estimate_attn_utils import (
-    preprocess_stats_bh,
-    # taylor_den,  # 由上层负责具体 attn 计算，这里不再使用
-    # taylor_num
-)
+from .estimate_attn_utils import preprocess_stats_bh
+
 
 class RemainKVCacheStorage:
     """
@@ -21,18 +18,19 @@ class RemainKVCacheStorage:
       - 后续 append() 作为 decode：按 seq 维（dim=2）把原始 K/V 拼接保存
       - cache_length：每次 append 只累加 seq_len（S）
       - get_cache()：返回 (decode_K, decode_V)
-      - get_states()：返回 (prefill_stats, prefill_len)
+      - get_states()：返回 prefill_stats
                     由上层完成具体 attention 计算
     """
 
-    def __init__(self, 
-                 name: str = "unnamed", 
-                 cluster_k: int = 0,
-                 group_size: int = 0,
-                 order: int = 1,
-                 u_mode: Literal["full","diag","none"]="full",
-                 debug: bool = False
-                ):
+    def __init__(
+        self,
+        name: str = "unnamed",
+        cluster_k: int = 0,
+        group_size: int = 0,
+        order: int = 1,
+        u_mode: Literal["full", "diag", "none"] = "full",
+        debug: bool = False,
+    ):
         self.name = name
         self.cluster_k = cluster_k
         self.group_size = group_size
@@ -71,18 +69,24 @@ class RemainKVCacheStorage:
     def prefill_process(self, K: torch.Tensor, V: torch.Tensor) -> None:
 
         if self.debug:
-            print(f"prefill_process_without_cluster: K.shape={K.shape}, V.shape={V.shape}")
+            print(
+                f"prefill_process_without_cluster: K.shape={K.shape}, V.shape={V.shape}"
+            )
 
         num_heads, seq_len, head_dim = K.shape
         self._prefill_len += seq_len
-        self._prefill_stats = preprocess_stats_bh(K, V, order=self.order, u_mode=self.u_mode)
+        self._prefill_stats = preprocess_stats_bh(
+            K, V, order=self.order, u_mode=self.u_mode
+        )
 
     def prefill_process_byfixgroup(self, K: torch.Tensor, V: torch.Tensor) -> None:
         if self.debug:
             print(f"prefill_process_byfixgroup: K.shape={K.shape}, V.shape={V.shape}")
 
         # assert self.group_size > 0, "group_size must > 0 in prefill_process_byfixgroup"
-        assert K.dim() == 4 and V.dim() == 4, "K/V must be [bsz, num_heads, seq_len, head_dim]"
+        assert (
+            K.dim() == 4 and V.dim() == 4
+        ), "K/V must be [bsz, num_heads, seq_len, head_dim]"
         assert K.shape == V.shape, "K and V must have the same shape"
 
         bsz, num_heads, seq_len, head_dim = K.shape
@@ -123,14 +127,23 @@ class RemainKVCacheStorage:
 
         # 将 组别(G) 和 batch 维 合并到 batch 上：
         # [B, H, G, S, D] -> [B, G, H, S, D] -> [B*G, H, S, D]
-        K_work = K_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, group_size, head_dim).contiguous()
-        V_work = V_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, group_size, head_dim).contiguous()
+        K_work = (
+            K_work.permute(0, 2, 1, 3, 4)
+            .reshape(bsz * groups, num_heads, group_size, head_dim)
+            .contiguous()
+        )
+        V_work = (
+            V_work.permute(0, 2, 1, 3, 4)
+            .reshape(bsz * groups, num_heads, group_size, head_dim)
+            .contiguous()
+        )
 
         # 下游仍按 [B', H, T, D]（这里 T=group_size）处理
-        self._prefill_stats = preprocess_stats_bh(K_work, V_work, order=self.order, u_mode=self.u_mode)
+        self._prefill_stats = preprocess_stats_bh(
+            K_work, V_work, order=self.order, u_mode=self.u_mode
+        )
 
         # import ipdb; ipdb.set_trace()
-        
 
     def prefill_process_bycluster(self, K: torch.Tensor, V: torch.Tensor) -> None:
 
@@ -139,30 +152,65 @@ class RemainKVCacheStorage:
 
         assert self.cluster_k > 0, "cluster_k must be > 0 in prefill_process_bycluster"
 
-        num_heads, seq_len, head_dim = K.shape
+        bsz, num_heads, seq_len, head_dim = K.shape
+        assert bsz == 1, "assumes bsz == 1"
+
         self._prefill_len += seq_len
 
-        from .cluster_utils import kmeans_seq, group_by_cluster_batched, tsne_plot_per_sample
+        from .cluster_utils import (
+            kmeans_seq,
+            group_by_cluster_batched,
+            tsne_plot_per_sample,
+        )
+
         K_labels, K_centers = kmeans_seq(K, self.cluster_k, iters=50)
 
-        K_grouped = group_by_cluster_batched(K, K_labels, k=self.cluster_k)
-        V_grouped = group_by_cluster_batched(V, K_labels, k=self.cluster_k)
+        K_grouped = group_by_cluster_batched(
+            K, K_labels, k=self.cluster_k, keep_prefix_shape=True
+        )
+        V_grouped = group_by_cluster_batched(
+            V, K_labels, k=self.cluster_k, keep_prefix_shape=True
+        )
 
-        for i in range(num_heads):
-            save_dir = os.path.join(os.path.dirname(__file__), "tsne_plots")
-            os.makedirs(save_dir, exist_ok=True)
-            tsne_plot_per_sample(K[i], K_labels[i], title="K", save_path=os.path.join(save_dir, f"K_{i}.png"))
+        # 保存 t-SNE 可视化图
+        save_dir = os.path.join(os.path.dirname(__file__), "tsne_plots")
+        os.makedirs(save_dir, exist_ok=True)
+        for h in range(num_heads):
+            tsne_plot_per_sample(
+                K[0, h],
+                K_labels[0, h],
+                title=f"K (head={h})",
+                save_path=os.path.join(save_dir, f"K_{h}.png"),
+            )
 
+        # 构建每个头的簇统计量
         group_stats = []
-        for group_idx in range(len(K_grouped)):
-            # 下面实际上是每个头的list
-            K_idx = K_grouped[group_idx]
-            V_idx = V_grouped[group_idx]
+        for head_idx in range(num_heads):
+            # 每个头对应一个列表，包含该头所有簇的统计量
+            head_stats = []
+            for cluster_idx in range(self.cluster_k):
+                # 获取当前头当前簇的 K 和 V
+                K_cluster = K_grouped[head_idx][cluster_idx]  # (n_i, D)
+                V_cluster = V_grouped[head_idx][cluster_idx]  # (n_i, D)
 
-            append_data = []
-            for cluster_idx in range(len(K_idx)):
-                append_data.append(preprocess_stats_bh(K_idx[cluster_idx], V_idx[cluster_idx], order=self.order, u_mode=self.u_mode))
+                # 如果该簇为空，跳过
+                if K_cluster.numel() == 0:
+                    continue
 
+                # 为当前簇计算统计量
+                # 需要添加 batch 和 head 维度：[n_i, D] -> [1, 1, n_i, D]
+                K_cluster_expanded = K_cluster.unsqueeze(0).unsqueeze(0)
+                V_cluster_expanded = V_cluster.unsqueeze(0).unsqueeze(0)
+
+                cluster_stats = preprocess_stats_bh(
+                    K_cluster_expanded,
+                    V_cluster_expanded,
+                    order=self.order,
+                    u_mode=self.u_mode,
+                )
+                head_stats.append(cluster_stats)
+
+            group_stats.append(head_stats)
 
         self._prefill_stats = group_stats
 
@@ -185,7 +233,8 @@ class RemainKVCacheStorage:
 
         if self._prefill_len == 0:
             # self.prefill_process(K, V)
-            self.prefill_process_byfixgroup(K, V)
+            # self.prefill_process_byfixgroup(K, V)
+            self.prefill_process_bycluster(K, V)
             # pass
         else:
             # 作为 decode：沿 seq_len 维拼接
