@@ -34,6 +34,9 @@ datasets = needlebench_origin_en_datasets
 QUANT_CONFIGS = [
     {"abbr": "CrucialKV-w16-sn512", "use_remain": False, "window_size": 16, "sparse_num": 512,},
     {"abbr": "CrucialKV-w8-sn512", "use_remain": False, "window_size": 8, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w6-sn512", "use_remain": False, "window_size": 6, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w4-sn512", "use_remain": False, "window_size": 4, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w2-sn512", "use_remain": False, "window_size": 2, "sparse_num": 512,},
     {"abbr": "CrucialKV-w1-sn512", "use_remain": False, "window_size": 1, "sparse_num": 512,},
     {"abbr": "CrucialKV-w128-sn512", "use_remain": False, "window_size": 128, "sparse_num": 512,},
 

@@ -32,19 +32,24 @@ datasets = needlebench_origin_en_datasets
 
 # 模型量化配置
 QUANT_CONFIGS = [
+    {"abbr": "CrucialKV", "use_remain": False},
+    {"abbr": "TaylorKV-o0-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 0},
+    {"abbr": "TaylorKV-o0-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 0},
+    {"abbr": "TaylorKV-o0-g64", "use_remain": True, "remain_group_size": 64, "remain_order": 0},
+    {"abbr": "TaylorKV-o1-gall", "use_remain": True, "remain_group_size": -1, "remain_order": 1},
+
     {"abbr": "TaylorKV-o1-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 1},
-    # {"abbr": "TaylorKV-o1-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 1},
+    {"abbr": "TaylorKV-o1-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 1},
+    {"abbr": "TaylorKV-o1-g64", "use_remain": True, "remain_group_size": 64, "remain_order": 1},
+    {"abbr": "TaylorKV-o1-gall", "use_remain": True, "remain_group_size": -1, "remain_order": 1},
 
-    # {"abbr": "TaylorKV-o0-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 0},
-    # {"abbr": "TaylorKV-o0-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 0},
-    # {"abbr": "TaylorKV-o0-g4", "use_remain": True, "remain_group_size": 4, "remain_order": 0},
-    # {"abbr": "TaylorKV-o0-g1", "use_remain": True, "remain_group_size": 1, "remain_order": 0},
-
+    {"abbr": "TaylorKV-o2-g64", "use_remain": True, "remain_group_size": 64, "remain_order": 2, "remain_u_mode": "diag"},
+    {"abbr": "TaylorKV-o2-gall", "use_remain": True, "remain_group_size": -1, "remain_order": 2, "remain_u_mode": "diag"},
 ]
 
 # 通用量化参数
 COMMON_QUANT_KWARGS = {
-    "window_size": 16, 
+    "window_size": 8, 
     "sparse_num": 512,
     "debug": True,
 }

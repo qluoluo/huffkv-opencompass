@@ -11,5 +11,5 @@ echo "### start eval ###"
 conda activate zgliu-huffkv-opencompass
 cd ${root_path}/projects_zgliu/projects/huffkv/huffkv-opencompass
 sleep 3
-opencompass ${script_dir}/opencompass-eval-niah.py -w ${script_dir}/oc-eval-result/niah
+opencompass ${script_dir}/opencompass-eval-niah.py -w ${script_dir}/oc-eval-result/niah -r
 sleep 30

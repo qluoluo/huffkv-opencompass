@@ -81,7 +81,7 @@ class RemainKVCacheStorage:
         if self.debug:
             print(f"prefill_process_byfixgroup: K.shape={K.shape}, V.shape={V.shape}")
 
-        assert self.group_size > 0, "group_size must > 0 in prefill_process_byfixgroup"
+        # assert self.group_size > 0, "group_size must > 0 in prefill_process_byfixgroup"
         assert K.dim() == 4 and V.dim() == 4, "K/V must be [bsz, num_heads, seq_len, head_dim]"
         assert K.shape == V.shape, "K and V must have the same shape"
 
@@ -92,7 +92,9 @@ class RemainKVCacheStorage:
         self._prefill_len += seq_len
 
         # 处理末尾不足一组的残余 token，留给 decode 阶段
-        remain_len = seq_len % self.group_size
+        group_size = self.group_size if self.group_size > 0 else seq_len
+
+        remain_len = seq_len % group_size
         if remain_len > 0:
             # 注意包含 heads 维度
             self._decode_K = K[:, :, -remain_len:, :].contiguous()
@@ -112,17 +114,17 @@ class RemainKVCacheStorage:
 
         # 现在长度可被整除：seq_len_work = groups * group_size
         seq_len_work = K_work.shape[2]
-        groups = seq_len_work // self.group_size
-        assert seq_len_work == groups * self.group_size
+        groups = seq_len_work // group_size
+        assert seq_len_work == groups * group_size
 
         # 先 reshape 出组维度：[B, H, G, S, D]
-        K_work = K_work.view(bsz, num_heads, groups, self.group_size, head_dim)
-        V_work = V_work.view(bsz, num_heads, groups, self.group_size, head_dim)
+        K_work = K_work.view(bsz, num_heads, groups, group_size, head_dim)
+        V_work = V_work.view(bsz, num_heads, groups, group_size, head_dim)
 
         # 将 组别(G) 和 batch 维 合并到 batch 上：
         # [B, H, G, S, D] -> [B, G, H, S, D] -> [B*G, H, S, D]
-        K_work = K_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, self.group_size, head_dim).contiguous()
-        V_work = V_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, self.group_size, head_dim).contiguous()
+        K_work = K_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, group_size, head_dim).contiguous()
+        V_work = V_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, group_size, head_dim).contiguous()
 
         # 下游仍按 [B', H, T, D]（这里 T=group_size）处理
         self._prefill_stats = preprocess_stats_bh(K_work, V_work, order=self.order, u_mode=self.u_mode)
