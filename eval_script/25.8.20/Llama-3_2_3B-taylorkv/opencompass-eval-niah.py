@@ -44,9 +44,15 @@ QUANT_CONFIGS = [
 
     # {"abbr": "TaylorKV-g32", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
     # {"abbr": "TaylorKV-g4", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 4, "remain_order": 1,},
-    {"abbr": "TaylorKV-g8", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 8, "remain_order": 1},
-    {"abbr": "TaylorKV-g16", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 16, "remain_order": 1},
+    {"abbr": "TaylorKV-o1-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 1},
+    {"abbr": "TaylorKV-o1-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 1},
 
+    {"abbr": "TaylorKV-o0-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 0},
+    {"abbr": "TaylorKV-o0-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 0},
+    {"abbr": "TaylorKV-o0-g4", "use_remain": True, "remain_group_size": 4, "remain_order": 0},
+    {"abbr": "TaylorKV-o0-g1", "use_remain": True, "remain_group_size": 1, "remain_order": 0},
+
+    # {"abbr": "TaylorKV-g16", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 16, "remain_order": 1},
     # {"abbr": "TaylorKV-not-remain", "use_remain": False, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
 
 ]

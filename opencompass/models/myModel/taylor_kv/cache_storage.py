@@ -36,6 +36,8 @@ class RemainKVCacheStorage:
         self.name = name
         self.cluster_k = cluster_k
         self.group_size = group_size
+        self.order = order
+        self.u_mode = u_mode
         self.debug = debug
 
         # 首次 append 后锁定的形状信息
@@ -73,7 +75,7 @@ class RemainKVCacheStorage:
 
         num_heads, seq_len, head_dim = K.shape
         self._prefill_len += seq_len
-        self._prefill_stats = preprocess_stats_bh(K, V)
+        self._prefill_stats = preprocess_stats_bh(K, V, order=self.order, u_mode=self.u_mode)
 
     def prefill_process_byfixgroup(self, K: torch.Tensor, V: torch.Tensor) -> None:
         if self.debug:
@@ -123,7 +125,7 @@ class RemainKVCacheStorage:
         V_work = V_work.permute(0, 2, 1, 3, 4).reshape(bsz * groups, num_heads, self.group_size, head_dim).contiguous()
 
         # 下游仍按 [B', H, T, D]（这里 T=group_size）处理
-        self._prefill_stats = preprocess_stats_bh(K_work, V_work)
+        self._prefill_stats = preprocess_stats_bh(K_work, V_work, order=self.order, u_mode=self.u_mode)
 
         # import ipdb; ipdb.set_trace()
         
@@ -157,7 +159,7 @@ class RemainKVCacheStorage:
 
             append_data = []
             for cluster_idx in range(len(K_idx)):
-                append_data.append(preprocess_stats_bh(K_idx[cluster_idx], V_idx[cluster_idx]))
+                append_data.append(preprocess_stats_bh(K_idx[cluster_idx], V_idx[cluster_idx], order=self.order, u_mode=self.u_mode))
 
 
         self._prefill_stats = group_stats
