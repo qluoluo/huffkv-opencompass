@@ -183,8 +183,8 @@ class RemainKVCacheStorage:
 
         if self._prefill_len == 0:
             # self.prefill_process(K, V)
-            # self.prefill_process_byfixgroup(K, V)
-            pass
+            self.prefill_process_byfixgroup(K, V)
+            # pass
         else:
             # 作为 decode：沿 seq_len 维拼接
             if self._decode_K is None:

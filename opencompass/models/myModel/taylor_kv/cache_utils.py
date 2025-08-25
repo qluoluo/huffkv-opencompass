@@ -31,10 +31,20 @@ class TaylorKVCache(DynamicCache):
         self.sparse_num = self.kvcache_settings["sparse_num"]
         self.use_remain = self.kvcache_settings["use_remain"]
 
+        self.debug = self.kvcache_settings.get("debug", False)
+        if type(self.debug) is str:
+            print(f"pass {type(self.debug)=} {self.debug=}")
+            self.debug = self.debug.lower() == "true"
+        # self.debug = True
+        # self.debug = False
+
         self.key_cache = []
         self.value_cache = []
 
         if self.use_remain:
+            if self.debug:
+                print("Cache use Remain")
+
             self.remain_cache: List[RemainKVCacheStorage] = []
 
             remain_cache_keys = ["remain_cluster_k", "remain_group_size", "remain_order", "remain_u_mode"]
@@ -42,6 +52,9 @@ class TaylorKVCache(DynamicCache):
                 k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys \
                     if k in self.kvcache_settings.keys()
             }
+        else:
+            if self.debug:
+                print("Cache NOT use Remain")
 
         self._seen_tokens = 0
         # self._prefill_computed = False
@@ -49,13 +62,6 @@ class TaylorKVCache(DynamicCache):
         # self.remain_cluster_k = self.kvcache_settings["remain_cluster_k"]
         # self.remain_group_size = self.kvcache_settings["remain_group_size"]
 
-
-        self.debug = self.kvcache_settings.get("debug", False)
-        if type(self.debug) is str:
-            print(f"pass {type(self.debug)=} {self.debug=}")
-            self.debug = self.debug.lower() == "true"
-        # self.debug = True
-        # self.debug = False
 
         # Minimum sequence length required for meaningful importance selection
         self.min_seq_length = self.sparse_num + self.window_size

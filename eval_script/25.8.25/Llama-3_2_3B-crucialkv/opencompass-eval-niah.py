@@ -32,35 +32,20 @@ datasets = needlebench_origin_en_datasets
 
 # 模型量化配置
 QUANT_CONFIGS = [
-    # {"abbr": "GQ-kc4-vc4", "k_bits": 4, "k_quant_dim": -1, "v_bits": 4, "v_quant_dim": -1},
-    # {"abbr": "GQ-kc4-vt4", "k_bits": 4, "k_quant_dim": -1, "v_bits": 4, "v_quant_dim": -2},
-    # {"abbr": "GQ-kt4-vc4", "k_bits": 4, "k_quant_dim": -2, "v_bits": 4, "v_quant_dim": -1},
-    # {"abbr": "GQ-kt4-vt4", "k_bits": 4, "k_quant_dim": -2, "v_bits": 4, "v_quant_dim": -2},
-    
-    # {"abbr": "GQ-kc2-vc2", "k_bits": 2, "k_quant_dim": -1, "v_bits": 2, "v_quant_dim": -1},
-    # {"abbr": "GQ-kc2-vt2", "k_bits": 2, "k_quant_dim": -1, "v_bits": 2, "v_quant_dim": -2},
-    # {"abbr": "GQ-kt2-vc2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -1},
-    # {"abbr": "GQ-kt2-vt2", "k_bits": 2, "k_quant_dim": -2, "v_bits": 2, "v_quant_dim": -2},
+    {"abbr": "CrucialKV-w16-sn512", "use_remain": False, "window_size": 16, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w8-sn512", "use_remain": False, "window_size": 8, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w1-sn512", "use_remain": False, "window_size": 1, "sparse_num": 512,},
+    {"abbr": "CrucialKV-w128-sn512", "use_remain": False, "window_size": 128, "sparse_num": 512,},
 
-    # {"abbr": "TaylorKV-g32", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
-    # {"abbr": "TaylorKV-g4", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 4, "remain_order": 1,},
-    {"abbr": "TaylorKV-o1-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 1},
-    {"abbr": "TaylorKV-o1-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 1},
-
-    {"abbr": "TaylorKV-o0-g16", "use_remain": True, "remain_group_size": 16, "remain_order": 0},
-    {"abbr": "TaylorKV-o0-g8", "use_remain": True, "remain_group_size": 8, "remain_order": 0},
-    {"abbr": "TaylorKV-o0-g4", "use_remain": True, "remain_group_size": 4, "remain_order": 0},
-    {"abbr": "TaylorKV-o0-g1", "use_remain": True, "remain_group_size": 1, "remain_order": 0},
-
-    # {"abbr": "TaylorKV-g16", "use_remain": True, "remain_cluster_k": 64, "remain_group_size": 16, "remain_order": 1},
-    # {"abbr": "TaylorKV-not-remain", "use_remain": False, "remain_cluster_k": 64, "remain_group_size": 32, "remain_order": 1,},
+    {"abbr": "CrucialKV-w8-sn256", "use_remain": False, "window_size": 8, "sparse_num": 256,},
+    {"abbr": "CrucialKV-w256-sn256", "use_remain": False, "window_size": 256, "sparse_num": 256,},
+    {"abbr": "CrucialKV-w128-sn384", "use_remain": False, "window_size": 128, "sparse_num": 384,},
 
 ]
 
 # 通用量化参数
 COMMON_QUANT_KWARGS = {
-    "window_size": 16, 
-    "sparse_num": 512,
+    
     "debug": True,
 }
 
