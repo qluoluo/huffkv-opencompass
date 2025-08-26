@@ -44,7 +44,7 @@ class LlamaForCausalLM_TaylorKV_OC(HuggingFaceCausalLM):
 
             "remain_cluster_k": 64,
             "remain_group_size": 32,
-            
+            "remain_u_mode": 'diag',
             "remain_order": 1,
 
             "debug": True,
