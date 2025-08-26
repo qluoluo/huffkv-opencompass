@@ -18,15 +18,15 @@ print(f"{os.path.basename(model_path)=}")
 config = AutoConfig.from_pretrained(model_path)
 
 config_kvcache_settings = {
-    "window_size": 16,
+    "window_size": 8,
     "sparse_num": 512,
 
-    # "use_remain": True,
-    "use_remain": False,
+    "use_remain": True,
+    # "use_remain": False,
     "remain_cluster_k": 64,
-    "remain_group_size": 32,
+    "remain_group_size": -1,
     "remain_order": 1,
-    "remain_u_mode": "full",
+    "remain_u_mode": "diag",
     
     # "debug": True,
     "debug": False,
