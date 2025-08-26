@@ -310,8 +310,8 @@ class LlamaAttention(nn.Module):
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        bsz, qlen, num_heads, head_dim = query_states.shape
-        _, _, num_kv_heads, _ = key_states.shape
+        bsz, num_heads, q_len, head_dim = query_states.shape
+        _, num_kv_heads, _, _ = key_states.shape
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -348,7 +348,7 @@ class LlamaAttention(nn.Module):
             if taylor_prefill_stats is None:
                 # Prefill阶段
                 # 还未保存taylor的状态，此时直接使用flash attn计算即可
-                assert qlen > 1, "qlen should be > 1 in prefill stage"
+                # assert q_len > 1, f"q_len should be > 1 in decode stage, but get {q_len}"
                 # if self.layer_idx == 0:
                 #     print("modeling_llama use origin flash attn")
 
@@ -362,7 +362,7 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 # Decode阶段
-                assert qlen == 1, "qlen should be 1 in decode stage"
+                # assert q_len == 1, f"q_len should be 1 in decode stage, but get {q_len}"
                 # if self.layer_idx == 0:
                 #     print("modeling_llama use mix taylor flash attn")
 
@@ -389,19 +389,22 @@ class LlamaAttention(nn.Module):
                     ).sum(dim=0, keepdim=True)
                 elif type(taylor_prefill_stats) == list:
                     # 针对cluster聚类中每个簇的统计量，计算taylor的估计值
-                    taylor_up_total = torch.zeros_like(flash_output_up)
-                    taylor_down_total = torch.zeros_like(flash_output_down)
+                    taylor_up_total = torch.zeros_like(flash_output_up).transpose(1,2)
+                    taylor_down_total = torch.zeros_like(flash_output_down).transpose(1,2)
+
+                    # print(f"{taylor_up_total.shape=}, {taylor_down_total.shape=}")
 
                     for bsz_idx in range(bsz):
                         for head_idx in range(num_heads):
                             for cluster_idx in range(
                                 len(taylor_prefill_stats[bsz_idx][head_idx])
                             ):
-                                stats = taylor_prefill_stats[bsz_idx][head_idx][
-                                    cluster_idx
-                                ]
-                                taylor_up = taylor_num_estimate(query_states, stats)
-                                taylor_down = taylor_den_estimate(query_states, stats)
+                                stats = taylor_prefill_stats[bsz_idx][head_idx][cluster_idx]
+                                taylor_up = taylor_num_estimate(query_states[bsz_idx, head_idx], stats)
+                                taylor_down = taylor_den_estimate(query_states[bsz_idx, head_idx], stats)
+
+                                # print(f"{taylor_up.shape=}, {taylor_down.shape=}")
+                                # import ipdb; ipdb.set_trace()
 
                                 taylor_up_total[bsz_idx, head_idx, :, :] += taylor_up
                                 taylor_down_total[bsz_idx, head_idx, :, :] += taylor_down

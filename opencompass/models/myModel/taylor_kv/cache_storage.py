@@ -25,8 +25,8 @@ class RemainKVCacheStorage:
     def __init__(
         self,
         name: str = "unnamed",
-        cluster_k: int = 0,
-        group_size: int = 0,
+        cluster_k: int = -1,
+        group_size: int = -1,
         order: int = 1,
         u_mode: Literal["full", "diag", "none"] = "full",
         debug: bool = False,
@@ -223,10 +223,17 @@ class RemainKVCacheStorage:
         self.cache_length += int(seq_len)
 
         if self._prefill_len == 0:
+            assert not (self.group_size > 0 and self.cluster_k > 0)
             # self.prefill_process(K, V)
-            # self.prefill_process_byfixgroup(K, V)
-            self.prefill_process_bycluster(K, V)
-            # pass
+            if self.group_size > 0:
+                print("Fix Group Prefill Append")
+                self.prefill_process_byfixgroup(K, V)
+            elif self.cluster_k > 0:
+                print("Cluster Prefill Append")
+                self.prefill_process_bycluster(K, V)
+            else:
+                print("Normal Prefill Append")
+                self.prefill_process(K, V)
         else:
             # 作为 decode：沿 seq_len 维拼接
             if self._decode_K is None:
