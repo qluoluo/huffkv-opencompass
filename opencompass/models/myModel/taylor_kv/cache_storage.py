@@ -173,46 +173,37 @@ class RemainKVCacheStorage:
         )
 
         # 保存 t-SNE 可视化图
-        save_dir = os.path.join(os.path.dirname(__file__), "tsne_plots")
-        os.makedirs(save_dir, exist_ok=True)
-        for h in range(num_heads):
-            tsne_plot_per_sample(
-                K[0, h],
-                K_labels[0, h],
-                title=f"K (head={h})",
-                save_path=os.path.join(save_dir, f"K_{h}.png"),
-            )
+        # save_dir = os.path.join(os.path.dirname(__file__), "tsne_plots")
+        # os.makedirs(save_dir, exist_ok=True)
+        # for h in range(num_heads):
+        #     tsne_plot_per_sample(
+        #         K[0, h],
+        #         K_labels[0, h],
+        #         title=f"K (head={h})",
+        #         save_path=os.path.join(save_dir, f"K_{h}.png"),
+        #     )
 
         # 构建每个头的簇统计量
-        group_stats = []
-        for head_idx in range(num_heads):
-            # 每个头对应一个列表，包含该头所有簇的统计量
-            head_stats = []
-            for cluster_idx in range(self.cluster_k):
-                # 获取当前头当前簇的 K 和 V
-                K_cluster = K_grouped[head_idx][cluster_idx]  # (n_i, D)
-                V_cluster = V_grouped[head_idx][cluster_idx]  # (n_i, D)
+        cluster_stats = []
+        for bsz_idx in range(bsz):
+            bsz_stats = []
+            for head_idx in range(num_heads):
+                head_stats = []
+                for cluster_idx in range(self.cluster_k):
+                    K_cluster = K_grouped[bsz_idx][head_idx][cluster_idx]
+                    V_cluster = V_grouped[bsz_idx][head_idx][cluster_idx]
+                    head_stats.append(
+                        preprocess_stats_bh(
+                            K_cluster,
+                            V_cluster,
+                            order=self.order,
+                            u_mode=self.u_mode,
+                        )
+                    )
+                bsz_stats.append(head_stats)
+            cluster_stats.append(bsz_stats)
 
-                # 如果该簇为空，跳过
-                if K_cluster.numel() == 0:
-                    continue
-
-                # 为当前簇计算统计量
-                # 需要添加 batch 和 head 维度：[n_i, D] -> [1, 1, n_i, D]
-                K_cluster_expanded = K_cluster.unsqueeze(0).unsqueeze(0)
-                V_cluster_expanded = V_cluster.unsqueeze(0).unsqueeze(0)
-
-                cluster_stats = preprocess_stats_bh(
-                    K_cluster_expanded,
-                    V_cluster_expanded,
-                    order=self.order,
-                    u_mode=self.u_mode,
-                )
-                head_stats.append(cluster_stats)
-
-            group_stats.append(head_stats)
-
-        self._prefill_stats = group_stats
+        self._prefill_stats = cluster_stats
 
     @torch.no_grad()
     def append(self, K: torch.Tensor, V: torch.Tensor) -> None:

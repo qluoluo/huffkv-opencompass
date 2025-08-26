@@ -19,6 +19,7 @@
 # limitations under the License.
 from typing import Callable, List, Optional, Tuple, Union
 
+from mpmath import taylor
 import torch
 import torch.utils.checkpoint
 from torch import nn
@@ -310,6 +311,7 @@ class LlamaAttention(nn.Module):
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         bsz, qlen, num_heads, head_dim = query_states.shape
+        _, _, num_kv_heads, _ = key_states.shape
 
         cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(
@@ -346,6 +348,7 @@ class LlamaAttention(nn.Module):
             if taylor_prefill_stats is None:
                 # Prefill阶段
                 # 还未保存taylor的状态，此时直接使用flash attn计算即可
+                assert qlen > 1, "qlen should be > 1 in prefill stage"
                 # if self.layer_idx == 0:
                 #     print("modeling_llama use origin flash attn")
 
@@ -359,6 +362,7 @@ class LlamaAttention(nn.Module):
                 )
             else:
                 # Decode阶段
+                assert qlen == 1, "qlen should be 1 in decode stage"
                 # if self.layer_idx == 0:
                 #     print("modeling_llama use mix taylor flash attn")
 
@@ -374,38 +378,33 @@ class LlamaAttention(nn.Module):
                     value_states.transpose(1, 2),
                     causal=self.is_causal,
                 )
-                # flash_output_up = flash_output_up.transpose(1,2)
-                # flash_output_down = flash_output_down.transpose(1,2)
 
-                # taylor_up_total, taylor_down_total = None, None
+                if type(taylor_prefill_stats) == torch.Tensor:
+                    # 均匀分组的情况下，可以用tensor计算
+                    taylor_up_total = taylor_num_estimate(
+                        query_states, taylor_prefill_stats
+                    ).sum(dim=0, keepdim=True)
+                    taylor_down_total = taylor_den_estimate(
+                        query_states, taylor_prefill_stats
+                    ).sum(dim=0, keepdim=True)
+                elif type(taylor_prefill_stats) == list:
+                    # 针对cluster聚类中每个簇的统计量，计算taylor的估计值
+                    taylor_up_total = torch.zeros_like(flash_output_up)
+                    taylor_down_total = torch.zeros_like(flash_output_down)
 
-                taylor_up_total = taylor_num_estimate(query_states, taylor_prefill_stats).sum(dim=0, keepdim=True)
-                taylor_down_total = taylor_den_estimate(query_states, taylor_prefill_stats).sum(dim=0, keepdim=True)
+                    for bsz_idx in range(bsz):
+                        for head_idx in range(num_heads):
+                            for cluster_idx in range(
+                                len(taylor_prefill_stats[bsz_idx][head_idx])
+                            ):
+                                stats = taylor_prefill_stats[bsz_idx][head_idx][
+                                    cluster_idx
+                                ]
+                                taylor_up = taylor_num_estimate(query_states, stats)
+                                taylor_down = taylor_den_estimate(query_states, stats)
 
-                # for idx in taylor_prefill_stats.shape[0]:
-                #     stats = taylor_prefill_stats[idx : idx + 1, ...]
-                #     taylor_up = taylor_num_estimate(query_states, stats)
-                #     taylor_down = taylor_den_estimate(query_states, stats)
-                #     taylor_up_total = (
-                #         taylor_up_total + taylor_up
-                #         if taylor_up_total is not None
-                #         else taylor_up
-                #     )
-                #     taylor_down_total = (
-                #         taylor_down_total + taylor_down
-                #         if taylor_down_total is not None
-                #         else taylor_down
-                #     )
-
-                # taylor_up = taylor_num_estimate(
-                #     query_states,
-                #     taylor_prefill_stats,
-                # )
-
-                # taylor_down = taylor_den_estimate(
-                #     query_states,
-                #     taylor_prefill_stats,
-                # )
+                                taylor_up_total[bsz_idx, head_idx, :, :] += taylor_up
+                                taylor_down_total[bsz_idx, head_idx, :, :] += taylor_down
 
                 taylor_up_total = taylor_up_total.transpose(1, 2)
                 taylor_down_total = taylor_down_total.transpose(1, 2)
