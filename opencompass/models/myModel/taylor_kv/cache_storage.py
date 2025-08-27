@@ -1,6 +1,6 @@
 import os
 import torch
-from typing import Optional, Tuple, List, Dict, Literal
+from typing import Optional, Tuple, List, Dict, Literal, Any
 
 from .estimate_attn_utils import preprocess_stats_bh
 
@@ -31,6 +31,7 @@ class RemainKVCacheStorage:
         u_mode: Literal["full", "diag", "none"] = "full",
         debug: bool = False,
         save_full_prefill_cache: bool = False,
+        kmeans_args: Dict[str, Any] = {},
     ):
         self.name = name
         self.cluster_k = cluster_k
@@ -169,7 +170,7 @@ class RemainKVCacheStorage:
             tsne_plot_per_sample,
         )
 
-        K_labels, K_centers = kmeans_seq(K, self.cluster_k, iters=50)
+        K_labels, K_centers = kmeans_seq(K, self.cluster_k, **self.kmeans_args)
 
         K_grouped = group_by_cluster_batched(
             K, K_labels, k=self.cluster_k, keep_prefix_shape=True

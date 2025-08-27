@@ -29,6 +29,11 @@ config_kvcache_settings = {
     "remain_u_mode": "diag",
     "remain_save_full_prefill_cache": True,
     # "remain_save_full_prefill_cache": False,
+    "remain_kmeans_args": {
+        "iters": 50,
+        "init_method": "k-means++",
+        "random_state": 0,
+    },
     
     # "debug": True,
     "debug": False,

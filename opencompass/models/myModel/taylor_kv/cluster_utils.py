@@ -6,7 +6,13 @@ from torch_kmeans import KMeans
 
 
 @torch.no_grad()
-def kmeans_seq(x: torch.Tensor, k: int, iters: int = 50):
+def kmeans_seq(
+    x: torch.Tensor, 
+    k: int, 
+    iters: int = 50,
+    init_method: str = "rnd",
+    random_state: int = 0,
+):
     """
     用 torch-kmeans 按 L 维做 K-Means（逐样本批处理）。
     输入:  x: [..., L, D]                         
@@ -20,10 +26,10 @@ def kmeans_seq(x: torch.Tensor, k: int, iters: int = 50):
     x2 = x.reshape(-1, L, D)  # (BS_flat, L, D)
 
     km = KMeans(
+        init_method=init_method,
         n_clusters=k,
         max_iter=iters,
-        init="k-means++",
-        random_state=0,
+        random_state=random_state,
     )
 
     

@@ -52,7 +52,8 @@ class TaylorKVCache(DynamicCache):
                 "remain_group_size", 
                 "remain_order", 
                 "remain_u_mode", 
-                "remain_save_full_prefill_cache"
+                "remain_save_full_prefill_cache",
+                "remain_kmeans_args",
             ]
             self.remain_cache_kwargs = {
                 k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys \
