@@ -33,17 +33,17 @@ datasets = needlebench_origin_en_datasets
 # 模型量化配置
 QUANT_CONFIGS = [
     # {"abbr": "CrucialKV", "use_remain": False},
-    {"abbr": "TaylorKV-Cluster-o0-ck4", "use_remain": True, "remain_cluster_k": 4, "remain_order": 0},
-    {"abbr": "TaylorKV-Cluster-o0-ck8", "use_remain": True, "remain_cluster_k": 8, "remain_order": 0},
+    # {"abbr": "TaylorKV-Cluster-o0-ck4", "use_remain": True, "remain_cluster_k": 4, "remain_order": 0},
+    # {"abbr": "TaylorKV-Cluster-o0-ck8", "use_remain": True, "remain_cluster_k": 8, "remain_order": 0},
     # {"abbr": "TaylorKV-Cluster-o0-ck16", "use_remain": True, "remain_cluster_k": 16, "remain_order": 0},
     # {"abbr": "TaylorKV-Cluster-o0-ck32", "use_remain": True, "remain_cluster_k": 32, "remain_order": 0},
     # {"abbr": "TaylorKV-Cluster-o0-ck64", "use_remain": True, "remain_cluster_k": 64, "remain_order": 0},
 
-    # {"abbr": "TaylorKV-Cluster-o1-ck4", "use_remain": True, "remain_cluster_k": 4, "remain_order": 1},
-    # {"abbr": "TaylorKV-Cluster-o1-ck8", "use_remain": True, "remain_cluster_k": 8, "remain_order": 1},
+    {"abbr": "TaylorKV-Cluster-o1-ck4", "use_remain": True, "remain_cluster_k": 4, "remain_order": 1},
+    {"abbr": "TaylorKV-Cluster-o1-ck8", "use_remain": True, "remain_cluster_k": 8, "remain_order": 1},
     # {"abbr": "TaylorKV-Cluster-o1-ck16", "use_remain": True, "remain_cluster_k": 16, "remain_order": 1},
     # {"abbr": "TaylorKV-Cluster-o1-ck32", "use_remain": True, "remain_cluster_k": 32, "remain_order": 1},
-    # {"abbr": "TaylorKV-Cluster-o1-ck64", "use_remain": True, "remain_cluster_k": 64, "remain_order": 1},
+    {"abbr": "TaylorKV-Cluster-o1-ck64", "use_remain": True, "remain_cluster_k": 64, "remain_order": 1},
 ]
 
 # 通用量化参数
