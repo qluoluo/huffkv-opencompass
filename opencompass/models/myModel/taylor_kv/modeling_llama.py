@@ -331,7 +331,6 @@ class LlamaAttention(nn.Module):
         if past_key_value is not None:
 
             from .cache_utils import TaylorKVCache
-
             assert type(past_key_value) == TaylorKVCache
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -408,6 +407,8 @@ class LlamaAttention(nn.Module):
 
                                 taylor_up_total[bsz_idx, head_idx, :, :] += taylor_up
                                 taylor_down_total[bsz_idx, head_idx, :, :] += taylor_down
+                else:
+                    raise ValueError(f"Unknown type of taylor_prefill_stats: {type(taylor_prefill_stats)} {taylor_prefill_stats=}")
 
                 taylor_up_total = taylor_up_total.transpose(1, 2)
                 taylor_down_total = taylor_down_total.transpose(1, 2)
@@ -418,10 +419,25 @@ class LlamaAttention(nn.Module):
                 )
 
                 attn_output = attn_output.to(query_states.dtype)
-                # attn_output = attn_output.transpose(1,2)
 
-        # print(f'Fake attn output.shape = {attn_output.shape}')
+                # 下面计算原生的 flash attn 计算结果以比较差距
+                if past_key_value.remain_cache[self.layer_idx].save_full_prefill_cache:
+                    full_key_cache, full_value_cache = past_key_value.remain_cache[self.layer_idx].get_full_cache()
+                    if full_key_cache is not None:
+                        attn_output_fullflash = flash_attn_func(
+                            query_states.transpose(1, 2),
+                            full_key_cache.transpose(1, 2),
+                            full_value_cache.transpose(1, 2),
+                            causal=self.is_causal,
+                        )
 
+                        print(f"attn_output.shape = {attn_output.shape}, attn_output_fullflash.shape = {attn_output_fullflash.shape}")
+                        bias = attn_output - attn_output_fullflash
+
+                        # 计算bias的指标
+                        print(f"{self.layer_idx=} {bias.abs().max()=}")
+                        print(f"{self.layer_idx=} {bias.abs().mean()=}")
+                        print(f"{self.layer_idx=} {torch.norm(bias, p=2)}")
         #####################################################################################
 
         # attention_interface: Callable = eager_attention_forward

@@ -9,7 +9,7 @@ from torch_kmeans import KMeans
 def kmeans_seq(x: torch.Tensor, k: int, iters: int = 50):
     """
     用 torch-kmeans 按 L 维做 K-Means（逐样本批处理）。
-    输入:  x: [..., L, D]
+    输入:  x: [..., L, D]                         
     返回:  labels:  [..., L]
           centers: [..., K, D]
     """
@@ -19,7 +19,14 @@ def kmeans_seq(x: torch.Tensor, k: int, iters: int = 50):
 
     x2 = x.reshape(-1, L, D)  # (BS_flat, L, D)
 
-    km = KMeans(n_clusters=k, max_iter=iters)
+    km = KMeans(
+        n_clusters=k,
+        max_iter=iters,
+        init="k-means++",
+        random_state=0,
+    )
+
+    
     res = km(x2)  # ClusterResult: labels, centers, inertia 等
     labels = res.labels.reshape(*prefix, L)
     centers = res.centers.reshape(*prefix, k, D)

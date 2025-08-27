@@ -30,6 +30,7 @@ class RemainKVCacheStorage:
         order: int = 1,
         u_mode: Literal["full", "diag", "none"] = "full",
         debug: bool = False,
+        save_full_prefill_cache: bool = False,
     ):
         self.name = name
         self.cluster_k = cluster_k
@@ -37,6 +38,7 @@ class RemainKVCacheStorage:
         self.order = order
         self.u_mode = u_mode
         self.debug = debug
+        self.save_full_prefill_cache = save_full_prefill_cache
 
         # 首次 append 后锁定的形状信息
         self._B: Optional[int] = None
@@ -47,6 +49,8 @@ class RemainKVCacheStorage:
         # prefill：按 [B][H] 保存 stats，便于上层按 (b,h) 访问
         self._prefill_stats: Optional[List[List[Dict]]] = None
         self._prefill_len: int = 0  # prefill 的 seq_len（S）
+        self._prefill_full_key_cache: Optional[torch.Tensor] = None
+        self._prefill_full_value_cache: Optional[torch.Tensor] = None
 
         # decode：仅保存原始 K/V
         self._decode_K: Optional[torch.Tensor] = None  # [B, H, Sd, Dk]
@@ -73,7 +77,9 @@ class RemainKVCacheStorage:
                 f"prefill_process_without_cluster: K.shape={K.shape}, V.shape={V.shape}"
             )
 
-        num_heads, seq_len, head_dim = K.shape
+        bsz, num_heads, seq_len, head_dim = K.shape
+        assert bsz == 1, "This prefill path assumes bsz == 1"
+
         self._prefill_len += seq_len
         self._prefill_stats = preprocess_stats_bh(
             K, V, order=self.order, u_mode=self.u_mode
@@ -223,7 +229,14 @@ class RemainKVCacheStorage:
         self.cache_length += int(seq_len)
 
         if self._prefill_len == 0:
-            assert not (self.group_size > 0 and self.cluster_k > 0)
+            # 首次 append, prefill阶段
+            assert not (self.group_size > 0 and self.cluster_k > 0), f"group_size: {self.group_size}, cluster_k: {self.cluster_k}"
+
+            # 保存 prefill 的 full cache
+            if self.save_full_prefill_cache:
+                self._prefill_full_key_cache = K
+                self._prefill_full_value_cache = V
+
             # self.prefill_process(K, V)
             if self.group_size > 0:
                 print("Fix Group Prefill Append")
@@ -235,7 +248,7 @@ class RemainKVCacheStorage:
                 print("Normal Prefill Append")
                 self.prefill_process(K, V)
         else:
-            # 作为 decode：沿 seq_len 维拼接
+            # 作为 decode 阶段：沿 seq_len 维拼接
             if self._decode_K is None:
                 self._decode_K = K.contiguous()
                 self._decode_V = V.contiguous()
@@ -251,6 +264,25 @@ class RemainKVCacheStorage:
           - 形状：decode_K ∈ [B, H, Sd, Dk], decode_V ∈ [B, H, Sd, Dv]
         """
         return self._decode_K, self._decode_V
+
+    @torch.no_grad()
+    def get_full_cache(self) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """
+        返回 prefill 的 full cache
+        """
+        if not self.save_full_prefill_cache:
+            raise ValueError("save_full_prefill_cache is False")
+        
+        full_key_cache_list = [x for x in [self._prefill_full_key_cache, self._decode_K] if x is not None]
+        full_value_cache_list = [x for x in [self._prefill_full_value_cache, self._decode_V] if x is not None]
+        
+        if len(full_key_cache_list) == 0:
+            return None, None
+
+        full_key_cache = torch.cat(full_key_cache_list, dim=-2)
+        full_value_cache = torch.cat(full_value_cache_list, dim=-2)
+
+        return full_key_cache, full_value_cache
 
     @torch.no_grad()
     def get_states(self) -> Tuple[Optional[List[List[Dict]]], int]:

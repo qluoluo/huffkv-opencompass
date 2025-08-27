@@ -27,6 +27,8 @@ config_kvcache_settings = {
     "remain_group_size": -1,
     "remain_order": 1,
     "remain_u_mode": "diag",
+    "remain_save_full_prefill_cache": True,
+    # "remain_save_full_prefill_cache": False,
     
     # "debug": True,
     "debug": False,
