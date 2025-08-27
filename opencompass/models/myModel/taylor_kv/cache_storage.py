@@ -73,7 +73,9 @@ class RemainKVCacheStorage:
                 f"prefill_process_without_cluster: K.shape={K.shape}, V.shape={V.shape}"
             )
 
-        num_heads, seq_len, head_dim = K.shape
+        bsz, num_heads, seq_len, head_dim = K.shape
+        assert bsz == 1, "This prefill path assumes bsz == 1"
+        
         self._prefill_len += seq_len
         self._prefill_stats = preprocess_stats_bh(
             K, V, order=self.order, u_mode=self.u_mode
