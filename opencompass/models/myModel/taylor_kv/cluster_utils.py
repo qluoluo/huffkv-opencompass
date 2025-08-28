@@ -23,6 +23,11 @@ def kmeans_seq(
     *prefix, L, D = x.shape
     assert L > 0 and D > 0, "L 和 D 必须 > 0"
 
+    init_method = 'rnd'
+    # init_method = 'k-means++'
+
+    print(f"{init_method=} {k=} {iters=} {random_state=} {x.shape=}")
+
     x2 = x.reshape(-1, L, D)  # (BS_flat, L, D)
 
     km = KMeans(

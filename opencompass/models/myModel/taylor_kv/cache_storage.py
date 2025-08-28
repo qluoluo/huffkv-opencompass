@@ -40,6 +40,7 @@ class RemainKVCacheStorage:
         self.u_mode = u_mode
         self.debug = debug
         self.save_full_prefill_cache = save_full_prefill_cache
+        self.kmeans_args = kmeans_args
 
         # 首次 append 后锁定的形状信息
         self._B: Optional[int] = None

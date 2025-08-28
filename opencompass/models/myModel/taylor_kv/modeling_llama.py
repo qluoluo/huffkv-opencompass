@@ -424,6 +424,7 @@ class LlamaAttention(nn.Module):
                 if past_key_value.remain_cache[self.layer_idx].save_full_prefill_cache:
                     full_key_cache, full_value_cache = past_key_value.remain_cache[self.layer_idx].get_full_cache()
                     if full_key_cache is not None:
+                        from flash_attn import flash_attn_func
                         attn_output_fullflash = flash_attn_func(
                             query_states.transpose(1, 2),
                             full_key_cache.transpose(1, 2),
