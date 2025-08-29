@@ -432,13 +432,16 @@ class LlamaAttention(nn.Module):
                             causal=self.is_causal,
                         )
 
-                        print(f"attn_output.shape = {attn_output.shape}, attn_output_fullflash.shape = {attn_output_fullflash.shape}")
+                        # print(f"{attn_output.shape=}, {attn_output_fullflash.shape=}")
                         bias = attn_output - attn_output_fullflash
 
                         # 计算bias的指标
-                        print(f"{self.layer_idx=} {bias.abs().max()=}")
-                        print(f"{self.layer_idx=} {bias.abs().mean()=}")
-                        print(f"{self.layer_idx=} {torch.norm(bias, p=2)}")
+                        print(f"layer{self.layer_idx} order{self.config.kvcache_settings['remain_order']} max{bias.abs().max().item()} mean{bias.abs().mean().item()} ")
+                        # print(f"{self.layer_idx=} {bias.abs().mean()=}")
+                        # print(f"{self.layer_idx=} {torch.norm(bias, p=2)=}")
+
+                        if self.layer_idx == self.config.num_hidden_layers - 1:
+                            exit()
         #####################################################################################
 
         # attention_interface: Callable = eager_attention_forward
