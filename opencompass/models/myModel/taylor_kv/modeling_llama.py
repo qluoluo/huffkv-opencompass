@@ -425,20 +425,31 @@ class LlamaAttention(nn.Module):
                     full_key_cache, full_value_cache = past_key_value.remain_cache[self.layer_idx].get_full_cache()
                     if full_key_cache is not None:
                         from flash_attn import flash_attn_func
-                        attn_output_fullflash = flash_attn_func(
+                        # attn_output_fullflash = flash_attn_func(
+                        #     query_states.transpose(1, 2),
+                        #     full_key_cache.transpose(1, 2),
+                        #     full_value_cache.transpose(1, 2),
+                        #     causal=self.is_causal,
+                        # )
+
+                        fullflash_output_up, fullflash_output_down = flash_part_attn(
                             query_states.transpose(1, 2),
                             full_key_cache.transpose(1, 2),
                             full_value_cache.transpose(1, 2),
                             causal=self.is_causal,
                         )
+                        fullflash_output = fullflash_output_up / fullflash_output_down
 
                         # print(f"{attn_output.shape=}, {attn_output_fullflash.shape=}")
-                        bias = attn_output - attn_output_fullflash
+                        bias = attn_output - fullflash_output
+                        up_bias = (flash_output_up + taylor_up_total) - fullflash_output_up
+                        down_bias = (flash_output_down + taylor_down_total) - fullflash_output_down
 
                         # 计算bias的指标
                         print(f"layer{self.layer_idx} order{self.config.kvcache_settings['remain_order']} max{bias.abs().max().item()} mean{bias.abs().mean().item()} ")
                         # print(f"{self.layer_idx=} {bias.abs().mean()=}")
                         # print(f"{self.layer_idx=} {torch.norm(bias, p=2)=}")
+                        print(f"up bias max{}")
 
                         if self.layer_idx == self.config.num_hidden_layers - 1:
                             exit()

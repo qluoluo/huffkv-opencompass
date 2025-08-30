@@ -7,41 +7,6 @@ def _unsqueeze_before_last(x: torch.Tensor, n: int, idx_from_end: int = 1):
         x = x.unsqueeze(-idx_from_end - 1)
     return x
 
-def whiten_data_torch(X):
-    """
-    对数据 X 进行白化处理，适用于形状为 [..., n, dim] 的数据。
-    
-    参数:
-    - X (torch.Tensor): 输入数据矩阵，形状为 [..., n, dim]，其中 n 是样本数，dim 是特征数。
-    
-    返回:
-    - X_whitened (torch.Tensor): 白化后的数据，形状为 [..., n, dim]。
-    """
-    # 获取输入数据的形状
-    *batch_shape, n, dim = X.shape
-
-    # 步骤 1: 数据中心化
-    # 对最后两个维度进行中心化，计算每个特征的均值，并将每个样本减去相应特征的均值
-    X_centered = X - X.mean(dim=-2, keepdim=True)  # 形状 [..., n, dim]
-    
-    # 步骤 2: 计算协方差矩阵
-    # 对每个样本（最后两个维度）计算协方差矩阵
-    # 计算协方差矩阵时，我们转置最后两个维度，得到形状 (dim, n)，然后计算协方差
-    Sigma = torch.cov(X_centered.view(-1, dim).T)  # 形状 (dim, dim)
-    
-    # 步骤 3: 特征值分解
-    eigvals, eigvecs = torch.linalg.eigh(Sigma)  # eigvals 形状 (dim,), eigvecs 形状 (dim, dim)
-    
-    # 步骤 4: 生成白化矩阵 L
-    # 通过特征值的逆平方根构建白化矩阵 L
-    L = eigvecs @ torch.diag(1.0 / torch.sqrt(eigvals)) @ eigvecs.T  # 形状 (dim, dim)
-    
-    # 步骤 5: 应用白化矩阵
-    # 对每个样本应用白化矩阵
-    X_whitened = X_centered @ L  # 形状 [..., n, dim]
-    
-    return X_whitened
-
 
 @torch.no_grad()
 def preprocess_stats_bh(
