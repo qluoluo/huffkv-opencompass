@@ -16,7 +16,7 @@ print(f"{os.path.basename(model_path)=}")
 
 config = AutoConfig.from_pretrained(model_path)
 
-config_kvcache_settings = dict(
+config_attn_settings = dict(
     use_bucket = False,
     accurate_kv_num = 128,
     accurate_bound = -3.0,
@@ -24,7 +24,7 @@ config_kvcache_settings = dict(
     bucket_step = 0.1,
 )
 
-config.kvcache_settings = config_kvcache_settings
+config.attn_settings = config_attn_settings
 
 model = LlamaForCausalLM.from_pretrained(
     model_path,
