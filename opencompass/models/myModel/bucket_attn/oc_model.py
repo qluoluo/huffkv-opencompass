@@ -37,6 +37,7 @@ class LlamaForCausalLM_BucketAttn_OC(HuggingFaceCausalLM):
 
         model_kwargs = kwargs
         config_kvcache_settings = dict(
+            use_bucket = False,
             accurate_kv_num = 128,
             accurate_bound = -3.0,
             lost_bound = -10.0,

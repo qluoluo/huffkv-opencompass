@@ -97,3 +97,8 @@ try:
     from .myModel.simple_taylorkv.oc_model import LlamaForCausalLM_Simple_TaylorKV_OC
 except:
     pass
+
+try:
+    from .myModel.bucket_attn.oc_model import LlamaForCausalLM_BucketAttn_OC
+except:
+    pass
