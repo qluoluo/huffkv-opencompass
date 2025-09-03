@@ -216,23 +216,24 @@ if __name__ == "__main__":
     K = torch.randn(B, H, N, Dk)
     V = torch.randn(B, H, N, Dv)
 
-    group_size = 1
-    assert N % group_size == 0, f"{N=}, {group_size=}, {N % group_size=}"
-    group_num = N // group_size
-    K_group = (
-        K.reshape(B, H, group_num, group_size, Dk)
-        .permute(0, 2, 1, 3, 4)
-        .reshape(B * group_num, H, group_size, Dk)
-    )
-    V_group = (
-        V.reshape(B, H, group_num, group_size, Dv)
-        .permute(0, 2, 1, 3, 4)
-        .reshape(B * group_num, H, group_size, Dv)
-    )
+    group_size = -1
+    if group_size > 0:
+        assert N % group_size == 0, f"{N=}, {group_size=}, {N % group_size=}"
+        group_num = N // group_size
+        K = (
+            K.reshape(B, H, group_num, group_size, Dk)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B * group_num, H, group_size, Dk)
+        )
+        V = (
+            V.reshape(B, H, group_num, group_size, Dv)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B * group_num, H, group_size, Dv)
+        )
 
     # 选择展开阶数：0 / 1 / 2
     order = 0  # 改成 1 或 2 分别测试一阶/二阶
-    stats = preprocess_stats_bh(K_group, V_group, order=order, u_mode="full")
+    stats = preprocess_stats_bh(K, V, order=order, u_mode="full")
 
     print("order:", stats["order"])
     print("kappa:", stats["kappa"].shape)  # [B,H,Dk]
@@ -256,6 +257,8 @@ if __name__ == "__main__":
     up, down = matmul_part_attn(q, K, V)
     attn_output_taylor = num / den
     attn_output_exact = up / down
+
+    import ipdb; ipdb.set_trace()
 
     print(f"{attn_output_taylor.shape=}, {attn_output_exact.shape=}")
     print(f"误差范数: {(attn_output_taylor - attn_output_exact).norm()}")
