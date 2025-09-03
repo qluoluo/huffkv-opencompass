@@ -4,10 +4,10 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from utils import load_qkvh
+from .utils import load_qkvh
 from transformers.models.llama.modeling_llama import repeat_kv
 from flash_attn import flash_attn_func
-from attn_utils import flash_part_attn, matmul_part_attn
+# from attn_utils import flash_part_attn, matmul_part_attn
 
 @torch.no_grad()
 def bucket_attn(

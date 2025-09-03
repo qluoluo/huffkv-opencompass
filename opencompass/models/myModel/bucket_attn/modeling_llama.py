@@ -295,12 +295,15 @@ class LlamaAttention(nn.Module):
         else:
             print("Decoding Stage")
             attn_settings = self.config.attn_settings
-            attn_output = bucket_attn(
-                query_states, key_states, value_states, **attn_settings
-            )
 
-            if False:
-                attn_output_flash = flash_attn_func(
+            use_bucket_attn = attn_settings.pop("use_bucket_attn", False)
+
+            if use_bucket_attn:
+                attn_output = bucket_attn(
+                    query_states, key_states, value_states, **attn_settings
+                )
+            else:
+                attn_output = flash_attn_func(
                     query_states.transpose(1, 2),
                     key_states.transpose(1, 2),
                     value_states.transpose(1, 2),
