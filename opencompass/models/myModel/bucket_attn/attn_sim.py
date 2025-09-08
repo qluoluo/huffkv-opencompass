@@ -4,7 +4,6 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
-from .utils import load_qkvh
 from transformers.models.llama.modeling_llama import repeat_kv
 from flash_attn import flash_attn_func
 # from attn_utils import flash_part_attn, matmul_part_attn
@@ -18,6 +17,7 @@ def bucket_attn(
     lost_bound: float = -10.0,
     bucket_step: float = 0.1,
     split_output: bool = False,
+    **kwargs,
 ):
     """
     近似注意力：对 logits ∈ [accurate_bound, 0] 做精确；(lost_bound, accurate_bound) 做分桶近似；
@@ -110,6 +110,8 @@ def bucket_attn(
 
 
 if __name__ == "__main__":
+    from utils import load_qkvh
+
     # exp_root = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result/Llama-3_2-3B/longbench_narrativeqa_42'
     exp_root = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result/Llama-3_2-3B/longbench_gov_report_46'
     layer_data_root = os.path.join(exp_root, 'layer_data')
@@ -139,10 +141,42 @@ if __name__ == "__main__":
         # Calculate attention weights
         # attn_weights = torch.matmul(q_rope, k_rope.transpose(-1, -2)) / math.sqrt(head_dim)
         # attn_weights -= torch.max(attn_weights, dim=-1, keepdim=True)[0]
-
-        attn_output_flash = flash_attn_func(q_rope.transpose(1,2), k_rope.transpose(1,2), v.transpose(1,2), causal=True).transpose(1,2)
-        attn_output_torch = torch.nn.functional.scaled_dot_product_attention(q_rope, k_rope, v, is_causal=True)
-        attn_output_bucket = bucket_attn(q_rope, k_rope, v)
+        save_dir = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass/opencompass/models/myModel/bucket_attn/prof'
+        with torch.profiler.profile(
+            record_shapes=True,  # 记录操作的输入形状
+            profile_memory=True,  # 记录内存分配
+            activities=[  # 指定分析 CPU 和 GPU（若可用）
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
+            ],
+            with_stack=True,
+        ) as prof:
+            attn_output_flash = flash_attn_func(q_rope.transpose(1,2), k_rope.transpose(1,2), v.transpose(1,2), causal=True).transpose(1,2)
+        prof.export_chrome_trace(os.path.join(save_dir, 'flash_attn.json'))  
+        
+        with torch.profiler.profile(
+            record_shapes=True,  # 记录操作的输入形状
+            profile_memory=True,  # 记录内存分配
+            activities=[  # 指定分析 CPU 和 GPU（若可用）
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
+            ],
+            with_stack=True,
+        ) as prof:
+            attn_output_torch = torch.nn.functional.scaled_dot_product_attention(q_rope, k_rope, v, is_causal=True)
+        prof.export_chrome_trace(os.path.join(save_dir, 'torch_attn.json'))
+        
+        with torch.profiler.profile(
+            record_shapes=True,  # 记录操作的输入形状
+            profile_memory=True,  # 记录内存分配
+            activities=[  # 指定分析 CPU 和 GPU（若可用）
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA
+            ],
+            with_stack=True,
+        ) as prof:
+            attn_output_bucket = bucket_attn(q_rope, k_rope, v)
+        prof.export_chrome_trace(os.path.join(save_dir, 'bucket_attn.json'))
 
         print(f'{attn_output_flash.shape=}, {attn_output_bucket.shape=}\n')
 

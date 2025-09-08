@@ -21,19 +21,24 @@ def whiten_data_torch(X):
     *batch_shape, n, dim = X.shape
 
     # 步骤 1: 数据中心化
+    # 对最后两个维度进行中心化，计算每个特征的均值，并将每个样本减去相应特征的均值
     X_mean = X.mean(dim=-2, keepdim=True)
     X_centered = X - X_mean  # 形状 [..., n, dim]
     
     # 步骤 2: 计算协方差矩阵
+    # 对每个样本（最后两个维度）计算协方差矩阵
+    # 计算协方差矩阵时，我们转置最后两个维度，得到形状 (dim, n)，然后计算协方差
     Sigma = torch.cov(X_centered.view(-1, dim).T)  # 形状 (dim, dim)
     
     # 步骤 3: 特征值分解
     eigvals, eigvecs = torch.linalg.eigh(Sigma)  # eigvals 形状 (dim,), eigvecs 形状 (dim, dim)
     
     # 步骤 4: 生成白化矩阵 L
+    # 通过特征值的逆平方根构建白化矩阵 L
     L = eigvecs @ torch.diag(1.0 / torch.sqrt(eigvals)) @ eigvecs.T  # 形状 (dim, dim)
     
     # 步骤 5: 应用白化矩阵
+    # 对每个样本应用白化矩阵
     X_whitened = X_centered @ L  # 形状 [..., n, dim]
     
     return X_whitened, X_mean, L
@@ -43,13 +48,13 @@ def whiten_data_torch(X):
 def preprocess_stats_bh(
     K: torch.Tensor,
     V: torch.Tensor,
-    order: Literal[0, 1] = 1,
+    order: Literal[0, 1, 2] = 1,
     u_mode: Literal["full", "diag", "none"] = "full",
     k_minus_mean: bool = False,
     whiten_k: bool = False,
 ):
     """
-    通用版 & 可选阶数（0/1）：
+    通用版 & 可选阶数（0/1/2）：
       K: [..., N, d_k]
       V: [..., N, d_v]
     要求：K 与 V 的前缀维度一致，且第 -2 维 N 相同
@@ -57,13 +62,16 @@ def preprocess_stats_bh(
       n:       标量(同 dtype/device)，值为 N
       kappa:   [..., d_k]                    —— 所有阶都需要
       V:       [..., d_v]                    —— 所有阶都需要（∑V_i）
-      M:       [..., d_v, d_k] 或 None       —— 一阶需要；零阶为 None
+      M:       [..., d_v, d_k] 或 None       —— 一阶/二阶需要；零阶为 None
+      U:       [..., d_v, d_k, d_k] 或 None  —— 仅二阶需要（u_mode="full"）
+      Ssq:     [..., d_v, d_k] 或 None       —— 仅二阶需要（u_mode="diag"）
+      Sigma:   [..., d_k, d_k] 或 None       —— 仅二阶需要
       order:   记录使用的阶数
     """
     assert K.dim() >= 2 and V.dim() >= 2, "K,V 应为 [..., N, d]"
     assert K.shape[:-2] == V.shape[:-2], "K,V 前缀维度必须一致"
     assert K.shape[-2] == V.shape[-2], "K,V 的第 -2 维 N 必须相同"
-    assert order in (0, 1), "order 仅支持 0/1"
+    assert order in (0, 1, 2), "order 仅支持 0/1/2"
 
     N = K.shape[-2]
     d_k = K.shape[-1]
@@ -83,23 +91,51 @@ def preprocess_stats_bh(
     kappa = K.mean(dim=-2)  # [..., d_k]
     Vsum = V.sum(dim=-2)  # [..., d_v]
 
-    M = None
+    M = U = Sigma = Ssq = None
 
     if order >= 1:
         # 基本张量
+        # A = ∑ V_i k_i^T
         A = torch.einsum("...nd,...nk->...dk", V, K)  # [..., d_v, d_k]
         M = A - Vsum[..., None] * kappa[..., None, :]
+
+    if order == 2:
+        # 总是算 Sigma（分母用得到）
+        D = torch.einsum("...nk,...nl->...kl", K, K)  # [..., d_k, d_k]
+        KK_T = torch.einsum("...k,...l->...kl", kappa, kappa)
+        Sigma = D - (N * KK_T)
+
+        if u_mode == "full":
+            # U = ∑ V_i (k_i k_i^T) - (kappa A^T + A kappa^T) + (∑V_i) (kappa kappa^T)
+            B_t = torch.einsum(
+                "...nd,...nk,...nl->...dkl", V, K, K
+            )  # [..., d_v, d_k, d_k]
+            KA_T = torch.einsum("...k,...dl->...dkl", kappa, A)  # [..., d_v, d_k, d_k]
+            AK_T = torch.einsum("...dk,...l->...dkl", A, kappa)  # [..., d_v, d_k, d_k]
+            U  = (
+                B_t - KA_T - AK_T + Vsum[..., None, None] * KK_T.unsqueeze(-3)
+            )  # [..., d_v, d_k, d_k]
+
+        elif u_mode == "diag":
+            # 仅保留二阶的对角向量，省内存
+            Ssq = torch.einsum("...nd,...nk->...dk", V, K * K)  # [..., d_v, d_k]
+        else:
+            # "none"：不存 U 相关
+            pass
 
     out = {
         "n": torch.tensor(float(N), device=device, dtype=dtype),
         "kappa": kappa,
         "V": Vsum,
         "M": M,
+        "U": U,
+        "Sigma": Sigma,
         "order": order,
         "K_mean": K_mean,
         "K_projection": K_projection,
     }
-
+    if order == 2 and u_mode == "diag":
+        out["Ssq"] = Ssq
     return out
 
 
@@ -113,6 +149,7 @@ def taylor_num_estimate(
     分子 N(q) 估计（默认缩放 √d_k）：
       零阶：N(q) ≈ e^{(q·kappa)/scale} [ V ]
       一阶：N(q) ≈ e^{(q·kappa)/scale} [ V + M (q/scale) ]
+      二阶：N(q) ≈ e^{(q·kappa)/scale} [ V + M (q/scale) + 1/2 * (U : ((q/scale)⊗(q/scale))) ]
     说明：若 scale=None，自动取 scale = √(q.shape[-1])。
     参数：
       q: [B, H, S, d_k]，当前实现要求 S=1
@@ -150,12 +187,23 @@ def taylor_num_estimate(
     if order == 0:
         return e[..., None] * Vsum
 
-    # 一阶
+    # 一阶及以上
     M = _unsqueeze_before_last(stats["M"], extra, idx_from_end=2)  # [..., d_v, d_k]
     term0 = Vsum
     term1 = torch.einsum("...vk,...k->...v", M, q_scaled)  # [..., d_v]
 
-    return e[..., None] * (term0 + term1)
+    if order == 1:
+        return e[..., None] * (term0 + term1)
+
+    # 二阶
+    assert (
+        stats.get("U", None) is not None
+    ), "需要在 preprocess_stats_bh(..., order=2, u_mode='full') 下预计算 U"
+    U = _unsqueeze_before_last(
+        stats["U"], extra, idx_from_end=3
+    )  # [..., d_v, d_k, d_k]
+    term2 = 0.5 * torch.einsum("...vkl,...k,...l->...v", U, q_scaled, q_scaled)
+    return e[..., None] * (term0 + term1 + term2)
 
 
 @torch.no_grad()
@@ -167,6 +215,7 @@ def taylor_den_estimate(
     """
     分母 Z(q) 估计（默认缩放 √d_k）：
       零/一阶：Z(q) ≈ e^{(q·kappa)/scale} [ n ]
+      二阶：  Z(q) ≈ e^{(q·kappa)/scale} [ n + 1/2 * (q/scale)^T Σ (q/scale) ]
     说明：若 scale=None，自动取 scale = √(q.shape[-1])。
     返回: [..., 1]
     """
@@ -196,7 +245,26 @@ def taylor_den_estimate(
         den = e * stats["n"].to(q.dtype)
         return den[..., None]
 
-    return e[..., None] * stats["n"].to(q.dtype)
+    # 二阶
+    assert (
+        stats.get("Sigma", None) is not None
+    ), "需要在 preprocess_stats_bh(..., order=2) 下预计算 Sigma"
+    Sigma = _unsqueeze_before_last(
+        stats["Sigma"], extra, idx_from_end=2
+    )  # [..., d_k, d_k]
+    quad = torch.einsum("...kl,...k,...l->...", Sigma, q_scaled, q_scaled)
+    den = e * (stats["n"].to(q.dtype) + 0.5 * quad)
+    return den[..., None]
+
+
+# @torch.no_grad()
+# def taylor_attn_estimate(q: torch.Tensor, stats: dict):
+#     """
+#     直接给出注意力输出的泰勒估计： N(q) / Z(q)
+#     """
+#     num = taylor_num_estimate(q, stats)
+#     den = taylor_den_estimate(q, stats)
+#     return num / den
 
 
 if __name__ == "__main__":
@@ -205,7 +273,23 @@ if __name__ == "__main__":
     K = torch.randn(B, H, N, Dk)
     V = torch.randn(B, H, N, Dv)
 
-    order = 1  # 选择展开阶数：0 / 1
+    group_size = -1
+    if group_size > 0:
+        assert N % group_size == 0, f"{N=}, {group_size=}, {N % group_size=}"
+        group_num = N // group_size
+        K = (
+            K.reshape(B, H, group_num, group_size, Dk)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B * group_num, H, group_size, Dk)
+        )
+        V = (
+            V.reshape(B, H, group_num, group_size, Dv)
+            .permute(0, 2, 1, 3, 4)
+            .reshape(B * group_num, H, group_size, Dv)
+        )
+
+    # 选择展开阶数：0 / 1 / 2
+    order = 2  # 改成 1 或 2 分别测试一阶/二阶
     stats = preprocess_stats_bh(K, V, 
         order=order, u_mode="full",
         k_minus_mean=False,

@@ -285,7 +285,7 @@ class LlamaAttention(nn.Module):
         attn_weights = None
 
         if q_len > 1:
-            print("Prefilling Stage")
+            # print("Prefilling Stage")
             attn_output = flash_attn_func(
                 query_states.transpose(1, 2),
                 key_states.transpose(1, 2),
@@ -293,15 +293,30 @@ class LlamaAttention(nn.Module):
                 causal=self.is_causal,
             )
         else:
-            print("Decoding Stage")
+            # print("Decoding Stage")
             attn_settings = self.config.attn_settings
 
             use_bucket_attn = attn_settings.pop("use_bucket_attn", False)
+            compare_bucket_flash = attn_settings.pop("compare_bucket_flash", False)
 
             if use_bucket_attn:
                 attn_output = bucket_attn(
                     query_states, key_states, value_states, **attn_settings
                 )
+
+                if compare_bucket_flash:
+                    pass
+                    # attn_output = bucket_attn(
+                    #     query_states, key_states, value_states, **attn_settings
+                    # )
+
+                    # attn_output_flash = flash_attn_func(
+                    #     query_states.transpose(1, 2),
+                    #     key_states.transpose(1, 2),
+                    #     value_states.transpose(1, 2),
+                    #     causal=self.is_causal,
+                    # )
+
             else:
                 attn_output = flash_attn_func(
                     query_states.transpose(1, 2),
