@@ -36,8 +36,8 @@ class LlamaForCausalLM_BucketAttn_OC(HuggingFaceCausalLM):
     ):
 
         model_kwargs = kwargs
-        config_kvcache_settings = dict(
-            use_bucket = False,
+        config_attn_settings = dict(
+            use_bucket_attn = False,
             accurate_kv_num = 128,
             accurate_bound = -3.0,
             lost_bound = -10.0,
@@ -45,9 +45,9 @@ class LlamaForCausalLM_BucketAttn_OC(HuggingFaceCausalLM):
         )
 
         # 使用字典推导式提取值并设置默认值
-        config_kvcache_settings = {
+        config_attn_settings = {
             key: model_kwargs.pop(key, default)
-            for key, default in config_kvcache_settings.items()
+            for key, default in config_attn_settings.items()
         }
 
         # 设置模型参数的数据类型
@@ -56,7 +56,7 @@ class LlamaForCausalLM_BucketAttn_OC(HuggingFaceCausalLM):
         # 从预训练路径加载配置
         config = LlamaConfig.from_pretrained(path)
 
-        config.kvcache_settings = config_kvcache_settings
+        config.attn_settings = config_attn_settings
 
         self.model = LlamaForCausalLM.from_pretrained(
             pretrained_model_name_or_path=path, config=config, **model_kwargs

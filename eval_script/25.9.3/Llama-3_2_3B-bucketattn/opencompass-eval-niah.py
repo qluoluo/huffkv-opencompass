@@ -4,7 +4,7 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 from mmengine.config import read_base
 
-from opencompass.models import LlamaForCausalLM_TaylorKV_OC as LlamaForCausalLM_OC
+from opencompass.models import LlamaForCausalLM_BucketAttn_OC as LlamaForCausalLM_OC
 
 # 导入数据集和汇总器配置
 with read_base():
@@ -32,10 +32,10 @@ datasets = needlebench_origin_en_datasets
 
 # 模型量化配置
 QUANT_CONFIGS = [
-    {"abbr": "BucketAttn-notuse", "use_bucket": False},
-    {"abbr": "BucketAttn-3-10-0.1", "use_bucket": True, "accurate_bound": -3.0, "lost_bound": -10.0, "bucket_step": 0.1},
-    {"abbr": "BucketAttn-3-10-0.2", "use_bucket": True, "accurate_bound": -3.0, "lost_bound": -10.0, "bucket_step": 0.1},
-    {"abbr": "BucketAttn-5-15-0.1", "use_bucket": True, "accurate_bound": -5.0, "lost_bound": -15.0, "bucket_step": 0.1},
+    {"abbr": "BucketAttn-notuse", "use_bucket_attn": False},
+    {"abbr": "BucketAttn-3-10-0.1", "use_bucket_attn": True, "accurate_bound": -3.0, "lost_bound": -10.0, "bucket_step": 0.1},
+    {"abbr": "BucketAttn-3-10-0.2", "use_bucket_attn": True, "accurate_bound": -3.0, "lost_bound": -10.0, "bucket_step": 0.1},
+    {"abbr": "BucketAttn-5-15-0.1", "use_bucket_attn": True, "accurate_bound": -5.0, "lost_bound": -15.0, "bucket_step": 0.1},
 ]
 
 # 通用量化参数

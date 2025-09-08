@@ -92,8 +92,8 @@ if __name__ == "__main__":
         # sample_seq_len = -1
         sample_seq_len = 8 * 1024
         if sample_seq_len > 0:
-            q_rope = q_rope[:, :, :sample_seq_len, :]
-            k_rope = k_rope[:, :, :sample_seq_len, :]
+            q_rope = q_rope[..., :sample_seq_len, :]
+            k_rope = k_rope[..., :sample_seq_len, :]
 
         q_rope = q_rope[..., -1:, :]  # Focusing on the last position (query part)
 

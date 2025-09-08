@@ -17,7 +17,7 @@ def load_qkvh(load_dir: str, device='cpu'):
         f"layer_{i}" for i in range(layer_num)
     ], "Layer directories must be named layer_0, layer_1, ..."
 
-    for i in range(layer_num):
+    for i in tqdm(range(layer_num)):
         layer_dir = os.path.join(load_dir, f"layer_{i}")
 
         load_data_list = ["q_rope", "k_rope", "q_unrope", "k_unrope", "v", "h"]
@@ -77,30 +77,3 @@ def load_from_babilong_json(json_path, line_idx=0):
         raw_text,
         f"babilong_{os.path.splitext(os.path.basename(dataset_path))[0]}_{line_idx}",
     )
-
-if __name__ == "__main__":
-    exp_root = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result/Llama-3_2-3B/longbench_narrativeqa_42'
-    layer_data_root = os.path.join(exp_root, 'layer_data')
-    from transformers.models.llama.modeling_llama import repeat_kv
-    
-    # Iterate through the layers and plot the attention weights and their distribution
-    for layer_idx, layer_qkvh_data in enumerate(load_qkvh(layer_data_root)):
-        q_rope = layer_qkvh_data["q_rope"].to('cuda')
-        k_rope = layer_qkvh_data["k_rope"].to('cuda')
-        v = layer_qkvh_data["v"].to('cuda')
-        
-        # sample_seq_len = -1
-        sample_seq_len = 8 * 1024
-        if sample_seq_len > 0:
-            q_rope = q_rope[:, :, :sample_seq_len, :]
-            k_rope = k_rope[:, :, :sample_seq_len, :]
-
-        q_rope = q_rope[..., -1:, :]  # Focusing on the last position (query part)
-
-        bsz, num_heads, seq_len, head_dim = q_rope.shape
-        _, num_kv_heads, _, _ = k_rope.shape
-        head_group = num_heads // num_kv_heads
-        k_rope = repeat_kv(k_rope, head_group)
-        v = repeat_kv(v, head_group)
-
-        assert bsz == 1, f"Batch size must be 1, but got {bsz}"

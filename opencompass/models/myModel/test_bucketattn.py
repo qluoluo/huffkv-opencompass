@@ -17,7 +17,7 @@ print(f"{os.path.basename(model_path)=}")
 config = AutoConfig.from_pretrained(model_path)
 
 config_attn_settings = dict(
-    use_bucket = False,
+    use_bucket_attn = False,
     accurate_kv_num = 128,
     accurate_bound = -3.0,
     lost_bound = -10.0,

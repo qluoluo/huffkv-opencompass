@@ -111,6 +111,8 @@ def bucket_attn(
 
 
 if __name__ == "__main__":
+    from utils import load_qkvh
+
     # exp_root = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result/Llama-3_2-3B/longbench_narrativeqa_42'
     exp_root = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result/Llama-3_2-3B/longbench_gov_report_46'
     layer_data_root = os.path.join(exp_root, 'layer_data')
