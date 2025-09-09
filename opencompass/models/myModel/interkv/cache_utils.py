@@ -150,9 +150,9 @@ class InterKVCache(DynamicCache):
 
     def _setup_sparse_based_cache(
         self,
+        query_states: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
-        query_states: torch.Tensor,
         layer_idx: int,
     ):
         """
@@ -174,10 +174,11 @@ class InterKVCache(DynamicCache):
         self.value_cache[layer_idx]['sparse'] = sparse_value
 
         if self.use_remain:
-            self.remain_cache[layer_idx].append(remain_key, remain_value)
+            self.remain_cache[layer_idx].append(query_states, remain_key, remain_value)
 
     def _update_window_cache(
         self,
+        query_states: torch.Tensor,
         key_states: torch.Tensor,
         value_states: torch.Tensor,
         layer_idx: int,
@@ -203,6 +204,7 @@ class InterKVCache(DynamicCache):
         # Keep only the last window_size tokens
         if self.use_remain and new_window_keys.shape[-2] > self.window_size:
             self.remain_cache[layer_idx].append(
+                query_states,
                 new_window_keys[..., : -self.window_size, :],
                 new_window_values[..., : -self.window_size, :]
             )
@@ -292,7 +294,7 @@ class InterKVCache(DynamicCache):
             self._seen_tokens += key_states.shape[-2]
 
         if self.debug and layer_idx == 0:
-            print(f"{self.__class__.__name__} update {layer_idx=}, {query_states.shape[-2]=}")
+            print(f"{self.__class__.__name__} update input {layer_idx=}, {query_states.shape[-2]=}")
 
         bsz, num_kv_heads, seq_len, head_dim = key_states.shape
         _, num_heads, _, _ = query_states.shape
@@ -308,7 +310,7 @@ class InterKVCache(DynamicCache):
 
         if self.debug and layer_idx == 0:
             print(
-                f"Cache get store len {store_key_cache.shape[-2] if store_value_cache is not None else 0}"
+                f"{self.__class__.__name__} get store len {store_key_cache.shape[-2] if store_value_cache is not None else 0}"
             )
 
         ret_key_cache, ret_value_cache = None, None
@@ -333,9 +335,9 @@ class InterKVCache(DynamicCache):
             )
 
             self._setup_sparse_based_cache(
+                query_states,
                 key_states,
                 value_states,
-                query_states,
                 layer_idx,
             )
 
@@ -346,6 +348,7 @@ class InterKVCache(DynamicCache):
             # Decoding stage
             # Subsequent updates: only update window cache
             self._update_window_cache(
+                query_states,
                 key_states, 
                 value_states,
                 layer_idx,

@@ -10,7 +10,7 @@ from interkv.modeling_llama import LlamaForCausalLM
 
 # os.environ['CUDA_VISIBLE_DEVICES'] = "7"
 
-model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+model_path = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
 
 print(f"{os.path.basename(model_path)=}")
 
@@ -24,7 +24,7 @@ config_kvcache_settings = {
     "remain_settings":{
         "inter_q_len": 8,
         "inter_method": "avg",
-        "save_full_prefill_cache": False,
+        "save_full_prefill_cache": True,
     },
 
     "debug": True,
@@ -54,6 +54,10 @@ tokenizer = AutoTokenizer.from_pretrained(
 # text = "User: Please write a story about a robot and a fish.\nAssistant:"
 # text = "User: Please introduce yourself.\nAssistant:"
 text = "hello " * (4 * 1024)
+
+text_fp = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass/opencompass/models/myModel/needle_bench_0.txt'
+with open(text_fp, 'r') as f:
+    text = f.read()
 
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")

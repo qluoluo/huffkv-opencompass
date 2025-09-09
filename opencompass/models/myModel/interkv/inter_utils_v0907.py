@@ -42,7 +42,7 @@ def approximate_qkv(q, co_dict):
     q0, qkv_base, qkv_jacobian = co_dict['q0'], co_dict['qkv_base'], co_dict['qkv_jacobian']
     delta = q - q0  # 形状: [..., 1, d]
     # 使用 einsum 处理任意维度
-    return qkv_base + torch.einsum('...i d, ...d d -> ...i d', delta, qkv_jacobian).squeeze(-2)  # 形状: [..., d]
+    return (qkv_base + torch.einsum('...i d, ...d d -> ...i d', delta, qkv_jacobian).squeeze(-2)).unsqueeze(-2)  # 形状: [..., 1, d]
 
 def approximate_qk(q, co_dict):
     """
@@ -53,11 +53,11 @@ def approximate_qk(q, co_dict):
     co_dict: 系数字典, 包含 q0, qk_base, qk_gradient
     
     返回:
-    近似值, 形状为 [...]
+    近似值, 形状为 [..., 1, 1]
     """
     q0, qk_base, qk_gradient = co_dict['q0'], co_dict['qk_base'], co_dict['qk_gradient']
     delta = (q - q0).squeeze(-2)  # 形状: [..., d]
-    return qk_base + torch.sum(qk_gradient * delta, dim=-1)  # 形状: [...]
+    return (qk_base + torch.sum(qk_gradient * delta, dim=-1)).unsqueeze(-1).unsqueeze(-1)  # 形状: [..., 1, 1]
 
 def exact_computation_qkv(q, k, v):
     """
@@ -70,10 +70,10 @@ def exact_computation_qkv(q, k, v):
     v: 值向量, 形状为 [..., l, d]
     
     返回:
-    精确值, 形状为 [..., d]
+    精确值, 形状为 [..., 1, d]
     """
     weights = torch.exp(torch.matmul(q, k.transpose(-1, -2))).squeeze(-2)  # 形状: [..., l]
-    return torch.sum(weights.unsqueeze(-1) * v, dim=-2)  # 形状: [..., d]
+    return torch.sum(weights.unsqueeze(-1) * v, dim=-2).unsqueeze(-2)  # 形状: [..., 1, d]
 
 def exact_computation_qk(q, k):
     """
@@ -85,10 +85,10 @@ def exact_computation_qk(q, k):
     k: 键向量, 形状为 [..., l, d]
     
     返回:
-    精确值, 形状为 [...]
+    精确值, 形状为 [..., 1, 1]
     """
     weights = torch.exp(torch.matmul(q, k.transpose(-1, -2))).squeeze(-2)  # 形状: [..., l]
-    return torch.sum(weights, dim=-1)  # 形状: [...]
+    return torch.sum(weights, dim=-1).unsqueeze(-1).unsqueeze(-1)  # 形状: [..., 1, 1]
 
 def rand_test():
     # 设置随机种子以确保可重复性
@@ -197,14 +197,17 @@ def real_test():
             now_q = q_val[..., i:i+1, :]
             exact_qkv = exact_computation_qkv(now_q, k_rope, v)
             exact_qk = exact_computation_qk(now_q, k_rope)
-            exact_attn = exact_qkv / exact_qk.unsqueeze(-1)
+            exact_attn = exact_qkv / exact_qk
 
             approx_qk_list = []
             approx_qkv_list = []
             for i in range(inter_len):
                 approx_qkv = approximate_qkv(now_q, co_dict_list[i])
                 approx_qk = approximate_qk(now_q, co_dict_list[i])
-                approx_attn = approx_qkv / approx_qk.unsqueeze(-1)
+
+                print(f"{approx_qk.shape=}, {approx_qkv.shape=}")
+
+                approx_attn = approx_qkv / approx_qk
                 # print(f'{i=}, mean={(exact_attn - approx_attn).abs().mean()} max={(exact_attn - approx_attn).abs().max()}')
 
                 approx_qk_list.append(approx_qk)
@@ -212,14 +215,16 @@ def real_test():
             
             approx_qk_mean = torch.stack(approx_qk_list).mean(dim=0)
             approx_qkv_mean = torch.stack(approx_qkv_list).mean(dim=0)
-            approx_attn = approx_qkv_mean / approx_qk_mean.unsqueeze(-1)
+            approx_attn = approx_qkv_mean / approx_qk_mean
+
+            print(f"{exact_attn.shape=}, {approx_attn.shape=}")
             print(f'avg mean={(exact_attn - approx_attn).abs().mean()} max={(exact_attn - approx_attn).abs().max()}')
             print()
 
-            # exit()
+            exit()
         exit()
 
 
 if __name__ == "__main__":
-    rand_test()
-    # real_test()
+    # rand_test()
+    real_test()

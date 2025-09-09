@@ -334,12 +334,12 @@ class LlamaAttention(nn.Module):
             assert type(past_key_value) == InterKVCache
 
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            (key_states, value_states), prefill_stats = past_key_value.update(
+            key_states, value_states = past_key_value.update(
                 query_states, key_states, value_states, self.layer_idx, cache_kwargs
             )
 
             attn_weights = None
-            if prefill_stats is None:
+            if q_len > 1:
                 # Prefill阶段
 
                 from flash_attn import flash_attn_func
@@ -351,6 +351,7 @@ class LlamaAttention(nn.Module):
                     causal=self.is_causal,
                 )
             else:
+                # Decode 阶段
                 from .attn_utils import flash_part_attn
 
                 flash_output_up, flash_output_down = flash_part_attn(
@@ -360,32 +361,30 @@ class LlamaAttention(nn.Module):
                     causal=self.is_causal,
                 )
 
-                inter_qkv_list, inter_qk_list = [], []
-                if type(prefill_stats) == list:
-                    inter_qkv, inter_qk = past_key_value.get_remain_attn_result(self.layer_idx, query_states)
-                    inter_qkv_list.append(inter_qkv)
-                    inter_qk_list.append(inter_qk)
-                inter_output_up = torch.stack(inter_qkv_list, dim=0).mean(dim=0)
-                inter_output_down = torch.stack(inter_qk_list, dim=0).mean(dim=0)
+                total_output_up = flash_output_up
+                total_output_down = flash_output_down
 
-                # attn_output = flash_output_up / flash_output_down
-                attn_output = (flash_output_up + inter_output_up) / (
-                    flash_output_down + inter_output_down
-                )
+                if past_key_value.use_remain:
+                    inter_output_up, inter_output_down = past_key_value.get_remain_attn_result(self.layer_idx, query_states)
+                    # print(f"{flash_output_up.shape=} {flash_output_down.shape=}")
+                    # print(f"{inter_output_up.shape=} {inter_output_down.shape=}")
 
+                    inter_output_up = inter_output_up.transpose(1, 2)
+                    inter_output_down = inter_output_down.transpose(1, 2)
+
+                    # attn_output = flash_output_up / flash_output_down
+
+                    total_output_up += inter_output_up
+                    total_output_down += inter_output_down
+
+                attn_output = total_output_up / total_output_down
                 attn_output = attn_output.to(query_states.dtype)
 
                 # 下面计算原生的 flash attn 计算结果以比较差距
-                if past_key_value.remain_cache[self.layer_idx].save_full_prefill_cache:
+                if past_key_value.use_remain and past_key_value.remain_cache[self.layer_idx].save_full_prefill_cache:
                     full_key_cache, full_value_cache = past_key_value.remain_cache[self.layer_idx].get_full_cache()
                     if full_key_cache is not None:
                         from flash_attn import flash_attn_func
-                        # attn_output_fullflash = flash_attn_func(
-                        #     query_states.transpose(1, 2),
-                        #     full_key_cache.transpose(1, 2),
-                        #     full_value_cache.transpose(1, 2),
-                        #     causal=self.is_causal,
-                        # )
 
                         fullflash_output_up, fullflash_output_down = flash_part_attn(
                             query_states.transpose(1, 2),
@@ -397,11 +396,11 @@ class LlamaAttention(nn.Module):
 
                         # print(f"{attn_output.shape=}, {attn_output_fullflash.shape=}")
                         bias = attn_output - fullflash_output
-                        up_bias = (flash_output_up + taylor_up_total) - fullflash_output_up
-                        down_bias = (flash_output_down + taylor_down_total) - fullflash_output_down
+                        up_bias = total_output_up - fullflash_output_up
+                        down_bias = total_output_down - fullflash_output_down
 
                         # 计算bias的指标
-                        print(f"layer{self.layer_idx} order{self.config.kvcache_settings['remain_order']} max{bias.abs().max().item()} mean{bias.abs().mean().item()} ")
+                        print(f"layer{self.layer_idx} max{bias.abs().max().item()} mean{bias.abs().mean().item()} ")
                         # print(f"{self.layer_idx=} {bias.abs().mean()=}")
                         # print(f"{self.layer_idx=} {torch.norm(bias, p=2)=}")
 
