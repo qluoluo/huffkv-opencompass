@@ -115,8 +115,8 @@ def rand_test():
     test_q = q + 0.01 * torch.randn(batch_size, num_heads, 1, d)
     print(f'{q.flatten()[:10]=}\n{test_q.flatten()[:10]=}')
     
-    exact_qkv = exact_computation_qkv(test_q, k, v)
-    exact_qk = exact_computation_qk(test_q, k)
+    exact_qkv = exact_computation_qkv(q, k, v)
+    exact_qk = exact_computation_qk(q, k)
     exact_attn = exact_qkv / exact_qk.unsqueeze(-1)  # 形状: [batch_size, num_heads, d]
     
     # 近似计算
@@ -221,5 +221,5 @@ def real_test():
 
 
 if __name__ == "__main__":
-    # rand_test()
-    real_test()
+    rand_test()
+    # real_test()

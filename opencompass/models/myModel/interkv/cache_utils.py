@@ -6,8 +6,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 from transformers.models.llama.modeling_llama import repeat_kv
 
-from .cache_storage import RemainKVCacheStorage
-
+from .cache_storage import InterKVCacheStorage
 
 class InterKVCache(DynamicCache):
     """
@@ -17,13 +16,11 @@ class InterKVCache(DynamicCache):
     - Window: Recent KV pairs in full precision
     """
 
-    TaylorKVCache_init = False
+    InterKVCache_init = False
 
     def __init__(self, config) -> None:
         super().__init__()
-        if not TaylorKVCache.TaylorKVCache_init:
-            TaylorKVCache.TaylorKVCache_init = True
-            print(f"-------------------- {self.__class__.__name__} init --------------------")
+        
 
         # Cache configuration
         self.kvcache_settings = config.kvcache_settings
@@ -44,21 +41,8 @@ class InterKVCache(DynamicCache):
         if self.use_remain:
             if self.debug:
                 print("Cache use Remain")
-
-            self.remain_cache: List[RemainKVCacheStorage] = []
-
-            remain_cache_keys = [
-                "remain_cluster_k", 
-                "remain_group_size", 
-                "remain_order", 
-                "remain_u_mode", 
-                "remain_save_full_prefill_cache",
-                "remain_kmeans_args",
-            ]
-            self.remain_cache_kwargs = {
-                k.removeprefix("remain_"): self.kvcache_settings[k] for k in remain_cache_keys \
-                    if k in self.kvcache_settings.keys()
-            }
+            self.remain_cache: List[InterKVCacheStorage] = []
+            self.remain_cache_kwargs = self.kvcache_settings['remain_settings']
         else:
             if self.debug:
                 print("Cache NOT use Remain")
@@ -72,6 +56,11 @@ class InterKVCache(DynamicCache):
 
         # Minimum sequence length required for meaningful importance selection
         self.min_seq_length = self.sparse_num + self.window_size
+
+        if not InterKVCache.InterKVCache_init:
+            InterKVCache.InterKVCache_init = True
+            print(f"-------------------- {self.__class__.__name__} init --------------------")
+            print(f"{self.debug=}")
 
     def _initialize_layer_cache(self, layer_idx: int):
         """Initialize cache dictionaries for a new layer if not present."""
@@ -90,7 +79,8 @@ class InterKVCache(DynamicCache):
             )
             if self.use_remain:
                 self.remain_cache.append(
-                    RemainKVCacheStorage(
+                    InterKVCacheStorage(
+                        name=f"remain_cache_{layer_idx}",
                         debug=self.debug if layer_idx==0 else False,
                         **self.remain_cache_kwargs,
                     )
@@ -225,15 +215,15 @@ class InterKVCache(DynamicCache):
         key_cache = self._reconstruct_cache(layer_idx, is_key=True)
         value_cache = self._reconstruct_cache(layer_idx, is_key=False)
 
-        store_states = None
-        if self.use_remain and len(self.remain_cache) > layer_idx:
-            store_states = self.remain_cache[layer_idx].get_states()
-            # store_key, store_value = self.remain_cache[layer_idx].get_cache()
-            # if store_key is not None:
-            #     key_cache = torch.cat([key_cache, store_key], dim=-2)
-            #     value_cache = torch.cat([value_cache, store_value], dim=-2)
+        # remain_states = None
+        # if self.use_remain and len(self.remain_cache) > layer_idx:
+        #     remain_states = self.remain_cache[layer_idx].get_states()
 
-        return (key_cache, value_cache), store_states
+        return key_cache, value_cache
+
+    def get_remain_attn_result(self, layer_idx: int, query_states: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+
+        return self.remain_cache[layer_idx].get_attn_result(query_states)
 
     def _reconstruct_cache(self, layer_idx: int, is_key: bool) -> torch.Tensor:
         """Reconstruct full cache tensor from sparse and window parts."""
@@ -250,7 +240,7 @@ class InterKVCache(DynamicCache):
 
         remain_cache = None
         if self.use_remain:
-            remain_cache = self.remain_cache[layer_idx].get_cache()
+            remain_cache = self.remain_cache[layer_idx].get_decode_cache()
             remain_cache = remain_cache[0] if is_key else remain_cache[1]
 
         # Concatenate cache parts in order: sparse -> remain -> window
@@ -270,7 +260,7 @@ class InterKVCache(DynamicCache):
             ret_len += self.key_cache[0]["sparse"].shape[-2]
 
         # ret_len += self.key_cache[0]["compressed"].get_length()
-        if use_remain:
+        if self.use_remain:
             ret_len += self.remain_cache[0].get_length()
 
         return ret_len
@@ -314,7 +304,7 @@ class InterKVCache(DynamicCache):
             key_states = repeat_kv(key_states, num_groups)
             value_states = repeat_kv(value_states, num_groups)
 
-        (store_key_cache, store_value_cache), store_taylor_states = self[layer_idx]
+        store_key_cache, store_value_cache = self[layer_idx]
 
         if self.debug and layer_idx == 0:
             print(
@@ -356,15 +346,16 @@ class InterKVCache(DynamicCache):
             # Decoding stage
             # Subsequent updates: only update window cache
             self._update_window_cache(
-                key_states, value_states,
-                layer_idx
+                key_states, 
+                value_states,
+                layer_idx,
             )
 
             if self.debug and layer_idx == 0:
                 print("decode_stage fill")
                 self.print_cache_length(layer_idx)
 
-        return (ret_key_cache, ret_value_cache), store_taylor_states
+        return ret_key_cache, ret_value_cache
 
     def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         """Return the sequence length of the cached states for a given layer."""
