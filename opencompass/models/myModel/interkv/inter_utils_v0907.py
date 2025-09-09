@@ -221,5 +221,5 @@ def real_test():
 
 
 if __name__ == "__main__":
-    # rand_test()
-    real_test()
+    rand_test()
+    # real_test()

@@ -102,3 +102,8 @@ try:
     from .myModel.bucket_attn.oc_model import LlamaForCausalLM_BucketAttn_OC
 except:
     pass
+
+try:
+    from .myModel.interkv.oc_model import LlamaForCausalLM_InterKV_OC
+except:
+    pass
