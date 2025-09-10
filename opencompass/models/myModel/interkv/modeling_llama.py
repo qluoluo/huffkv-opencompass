@@ -393,19 +393,25 @@ class LlamaAttention(nn.Module):
                             causal=self.is_causal,
                         )
                         fullflash_output = fullflash_output_up / fullflash_output_down
+                        crucial_flash_output = flash_output_up / flash_output_down
 
-                        # print(f"{attn_output.shape=}, {attn_output_fullflash.shape=}")
-                        bias = attn_output - fullflash_output
-                        up_bias = total_output_up - fullflash_output_up
-                        down_bias = total_output_down - fullflash_output_down
+                        full_inter_bias = attn_output - fullflash_output
+                        full_crucial_bias = fullflash_output - crucial_flash_output
+
+                        crucial_inter_bias = crucial_flash_output - attn_output
+                        # up_bias = total_output_up - fullflash_output_up
+                        # down_bias = total_output_down - fullflash_output_down
 
                         # 计算bias的指标
-                        print(f"layer{self.layer_idx} max{bias.abs().max().item()} mean{bias.abs().mean().item()} ")
+                        print(f"layer{self.layer_idx} full-inter bias max{full_inter_bias.abs().max().item()} mean{full_inter_bias.abs().mean().item()}")
+                        print(f"layer{self.layer_idx} crucial-inter bias max{crucial_inter_bias.abs().max().item()} mean{crucial_inter_bias.abs().mean().item()}")
+                        print(f"layer{self.layer_idx} full-crucial bias max{full_crucial_bias.abs().max().item()} mean{full_crucial_bias.abs().mean().item()}")
+                        
                         # print(f"{self.layer_idx=} {bias.abs().mean()=}")
                         # print(f"{self.layer_idx=} {torch.norm(bias, p=2)=}")
 
-                        if self.layer_idx == self.config.num_hidden_layers - 1:
-                            exit()
+                        # if self.layer_idx == self.config.num_hidden_layers - 1:
+                        #     exit()
         #####################################################################################
 
         # attention_interface: Callable = eager_attention_forward

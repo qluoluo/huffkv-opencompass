@@ -53,11 +53,11 @@ tokenizer = AutoTokenizer.from_pretrained(
 # 测试生成
 # text = "User: Please write a story about a robot and a fish.\nAssistant:"
 # text = "User: Please introduce yourself.\nAssistant:"
-text = "hello " * (4 * 1024)
+# text = "hello " * (4 * 1024)
 
 text_fp = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass/opencompass/models/myModel/needle_bench_0.txt'
 with open(text_fp, 'r') as f:
-    text = f.read()
+    text = f.read().strip()
 
 inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")

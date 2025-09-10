@@ -328,6 +328,10 @@ class InterKVCache(DynamicCache):
         if self.key_cache[layer_idx]["window"] is None:
             # Prefill stage
             # Assert that input sequence is long enough for meaningful partitioning
+            if self.debug and layer_idx == 0:
+                print("prefill_stage fill")
+                self.print_cache_length(layer_idx)
+
             assert seq_len >= self.min_seq_length, (
                 f"Input sequence length ({seq_len}) must be at least {self.min_seq_length} "
                 f"(sparse_num: {self.sparse_num} + window_size: {self.window_size}) "
@@ -340,10 +344,7 @@ class InterKVCache(DynamicCache):
                 value_states,
                 layer_idx,
             )
-
-            if self.debug and layer_idx == 0:
-                print("prefill_stage fill")
-                self.print_cache_length(layer_idx)
+            
         else:
             # Decoding stage
             # Subsequent updates: only update window cache

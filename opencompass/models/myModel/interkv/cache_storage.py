@@ -132,8 +132,6 @@ class InterKVCacheStorage:
             qkv = approximate_qkv(Q, self._prefill_stats[i])
             qk = approximate_qk(Q, self._prefill_stats[i])
 
-            print(f"{qkv.shape=} {qk.shape=}")
-
             qkv_list.append(qkv)
             qk_list.append(qk)
 

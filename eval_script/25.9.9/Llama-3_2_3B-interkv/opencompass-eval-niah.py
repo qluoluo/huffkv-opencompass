@@ -32,13 +32,12 @@ datasets = needlebench_origin_en_datasets
 
 # 模型量化配置
 QUANT_CONFIGS = [
-    {"abbr": "interKV-noRemain", "use_remain": False},
+    # {"abbr": "interKV-noRemain", "use_remain": False},
     {"abbr": "interKV-iq8-avg", "use_remain": True, 
-        "remain_settings":
-        {
+        "remain_settings":{
             "inter_q_len": 8,
             "inter_method": "avg",
-            "save_full_prefill_cache": False,
+            "save_full_prefill_cache": True,
         },
     },
 ]
