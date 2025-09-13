@@ -1,216 +1,306 @@
-import os
 import math
-from typing import Tuple
-
-import triton
-import triton.language as tl
-import torch
-import torch.nn.functional as F
-# from torch.backends.cuda import sdp_kernel
-from torch.nn.attention import sdpa_kernel
+import os
 from tqdm import tqdm
 
-try:
-    from fla_op import exp2, log2
-except:
-    from .fla_op import exp2, log2
+import torch
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
+    # q: [HQ, K]
+    # k: [HKV, T, K]
+    HQ, K = q.shape
+    HKV, T, _ = k.shape
+    G = HQ // HKV
+    k0 = k[:, :4, :]              # 前4个 key
+    k1 = k[:, -32:, :]            # 后32个 key
+    k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
+    
+    # 扩展为 [HQ, 36, K]
+    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
+
+    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
+    dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
+    max_val = dot.max(dim=-1).values               # [HQ]
+    threshold = max_val - 5.0
+    threshold = threshold * scale
+    return threshold.contiguous()  # [HQ]
+
 
 @triton.jit
-def qlen1_attn_fwd_kernel(
-    q, k, v, out, lse,
-    scale, seq_len,
-    n_kv_heads: tl.constexpr,
-    n_q_heads: tl.constexpr,
-    group_size: tl.constexpr,
-    d_k: tl.constexpr,
-    d_v: tl.constexpr,
-    seq_block: tl.constexpr,
-    k_block: tl.constexpr,
-    v_block: tl.constexpr,
+def attn_fwd_q1_b1_stage1(
+    q,           # [HQ, K]
+    k,           # [HKV, T, K]
+    v,           # [T, HKV, V]
+    m_buf,       # [HQ, NTB]
+    l_buf,       # [HQ, NTB]
+    o_buf,       # [HQ, NTB, V]
+    scale,       # float
+    T,           # int
+    NTB,         # int = ceil(T / BS)
+    qk_thresholds,  # [HQ], 每个head一个阈值（已 scaled）
+    HKV: tl.constexpr,
+    HQ: tl.constexpr,
+    K: tl.constexpr,
+    V: tl.constexpr,
+    G: tl.constexpr,
+    BS: tl.constexpr,
+    BK: tl.constexpr,
+    BV: tl.constexpr,
 ):
-    v_idx = tl.program_id(0)
-    q_head_idx = tl.program_id(1)
-    kv_head_idx = q_head_idx // group_size
+    pid_v = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+    pid_tb = tl.program_id(2)
 
-    INV_LN2: tl.constexpr = 1.4426950408889634
+    i_hq = pid_hq
+    i_h = i_hq // G
 
-    # Q指针访问
-    q_ptr = tl.make_block_ptr(
-        base=q + q_head_idx * d_k,
-        shape=(1, d_k),
-        strides=(d_k, 1),
-        offsets=(0, 0),
-        block_shape=(1, k_block),
-        order=(1, 0)
+    v_offs = pid_v * BV + tl.arange(0, BV)
+    v_mask = v_offs < V
+
+    s0 = pid_tb * BS
+    offs_t = s0 + tl.arange(0, BS)
+    t_mask = offs_t < T
+
+    RCP_LN2 = 1.4426950408889634
+
+    # 加载对应 threshold（已 scaled）
+    th_ptr = qk_thresholds + i_hq
+    threshold = tl.load(th_ptr)  # scalar
+
+    b_s = tl.zeros([BS], tl.float32)
+    for kk in range(0, K, BK):
+        offs_k = kk + tl.arange(0, BK)
+        k_mask = offs_k < K
+
+        q_ptrs = q + i_hq * K + offs_k
+        q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+
+        k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
+        k_chunk = tl.load(k_ptrs, mask=(k_mask[:, None] & t_mask[None, :]), other=0.0).to(tl.float32)
+
+        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
+
+    # 转 base-2 并 mask for out-of-bound
+    b_s = b_s * scale
+    b_s_masked = tl.where(t_mask, b_s, float('-inf'))
+
+    # 局部最大值
+    m_b = tl.max(b_s_masked, axis=0)
+
+    # 判断是否低于阈值 → 屏蔽那些 softmax 权重
+    skip = b_s < threshold  # [BS], bool mask
+    b_p = tl.exp2(b_s - m_b)
+    b_p = tl.where((~skip) & t_mask, b_p, 0.0)  # only retain valid positions
+    l_b = tl.sum(b_p, axis=0)
+
+    # 加载 v
+    v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
+    b_v = tl.load(v_ptrs, mask=(t_mask[:, None] & v_mask[None, :]), other=0.0).to(tl.float32)
+    o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
+
+    # 写出
+    o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
+    tl.store(o_ptrs, o_b, mask=v_mask)
+
+    if pid_v == 0:
+        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
+        tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
+
+@triton.jit
+def attn_fwd_q1_b1_stage2(
+    m_buf,       # [HQ, NTB]
+    l_buf,       # [HQ, NTB]
+    o_buf,       # [HQ, NTB, V], fp32
+    o,           # [HQ, V], out dtype = q.dtype
+    lse,         # [HQ], fp32
+    NTB,         # int
+    HQ: tl.constexpr,
+    V: tl.constexpr,
+    BV: tl.constexpr,
+):
+    # 网格: (pid_v, pid_hq)
+    pid_v = tl.program_id(0)
+    pid_hq = tl.program_id(1)
+
+    v_offs = pid_v * BV + tl.arange(0, BV)
+    v_mask = v_offs < V
+
+    # 在线合并 across tb（base-2 域）
+    b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
+    b_acc = tl.zeros((), tl.float32)              # 当前全局分母
+    b_o = tl.zeros([BV], tl.float32)              # 当前全局分子向量
+
+    # 沿 tb 做稳定合并
+    for tb in range(0, NTB):
+        # 读取该块的统计量与分子
+        m_b = tl.load(m_buf + pid_hq * NTB + tb)
+        l_b = tl.load(l_buf + pid_hq * NTB + tb)
+        o_b = tl.load(o_buf + pid_hq * (NTB * V) + tb * V + v_offs, mask=v_mask, other=0.0)
+
+        # 合并到全局（base-2 在线公式）
+        new_m = tl.maximum(b_m, m_b)
+        r_prev = tl.exp2(b_m - new_m)
+        r_blk = tl.exp2(m_b - new_m)
+
+        b_acc = b_acc * r_prev + l_b * r_blk
+        b_o = b_o * r_prev + o_b * r_blk
+        b_m = new_m
+
+    # 归一化与 lse
+    out_tile = b_o / b_acc
+    # lse 只写一次（pid_v == 0）
+    if pid_v == 0:
+        lse_val = b_m + tl.log2(b_acc)
+        tl.store(lse + pid_hq, lse_val)
+
+    # 写回输出
+    o_ptrs = o + pid_hq * V + v_offs
+    tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
+
+
+def attn_fwd_q1_b1_splitT(
+    q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
+    k: torch.Tensor,  # [HKV, T, K], same dtype as q
+    v: torch.Tensor,  # [T, HKV, V], same dtype as q
+    scale: float = None,
+    BS: int = 128,    # 时间分块大小（可调，影响 NTB）
+    BK: int = 64,
+    BV: int = 64,
+):
+    assert q.is_cuda and k.is_cuda and v.is_cuda
+    assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
+    HQ, K = q.shape
+    HKV, T, Kk = k.shape
+    Tv, HKV2, V = v.shape
+    assert Kk == K and Tv == T and HKV2 == HKV
+    assert HQ % HKV == 0, "GQA 需要 HQ 是 HKV 的整数倍"
+    G = HQ // HKV
+
+    if scale is None:
+        scale = 1.0 / math.sqrt(K)
+
+    NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
+
+    # 输出
+    o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
+    lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+
+    # 中间缓冲（stage1 -> stage2）
+    # m_buf/l_buf 不依赖 V；o_buf 需要存每个 v-tile 的分子向量
+    m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
+    l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
+    # 用 fp32 存分子更稳（也可用 q.dtype 视精度需求）
+    o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
+
+    # Stage 1: 并行计算各时间分块的局部统计与分子
+    qk_thresholds = calc_qk_threshold(q, k, scale).to(q.device)
+
+    attn_fwd_q1_b1_stage1[grid1](
+        q, k, v,
+        m_buf, l_buf, o_buf,
+        scale, T, NTB,
+        qk_thresholds,  # 新增参数
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
+        BS=BS, BK=BK, BV=BV,
     )
 
-    # 输出指针
-    out_ptr = tl.make_block_ptr(
-        base=out + q_head_idx * d_v,
-        shape=(1, d_v),
-        strides=(d_v, 1),
-        offsets=(0, v_idx * v_block),
-        block_shape=(1, v_block),
-        order=(1, 0)
+    grid1 = (triton.cdiv(V, BV), HQ, NTB)
+    attn_fwd_q1_b1_stage1[grid1](
+        q, k, v,
+        m_buf, l_buf, o_buf,
+        scale, T, NTB,
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
+        BS=BS, BK=BK, BV=BV,
     )
 
-    # LSE指针
-    lse_ptr = lse + q_head_idx
-
-    # 加载查询（建议显式零填充以防越界）
-    q_block = tl.load(q_ptr, boundary_check=(0, 1), padding_option='zero')
-
-    # 初始化累加器
-    out_acc = tl.zeros([1, v_block], dtype=tl.float32)
-    max_val = tl.full([1], float('-inf'), dtype=tl.float32)
-    exp_sum = tl.zeros([1], dtype=tl.float32)
-
-    # 主循环
-    for seq_start in range(0, seq_len, seq_block):
-        # K指针
-        k_ptr = tl.make_block_ptr(
-            base=k + kv_head_idx * d_k,
-            shape=(seq_len, d_k),
-            strides=(n_kv_heads * d_k, 1),
-            offsets=(seq_start, 0),
-            block_shape=(seq_block, k_block),
-            order=(1, 0)
-        )
-
-        # V指针
-        v_ptr = tl.make_block_ptr(
-            base=v + kv_head_idx * d_v,
-            shape=(seq_len, d_v),
-            strides=(n_kv_heads * d_v, 1),
-            offsets=(seq_start, v_idx * v_block),
-            block_shape=(seq_block, v_block),
-            order=(1, 0)
-        )
-
-        # 加载数据（显式零填充）
-        k_block_data = tl.load(k_ptr, boundary_check=(0, 1), padding_option='zero')  # [seq_block, k_block]
-        v_block_data = tl.load(v_ptr, boundary_check=(0, 1), padding_option='zero')  # [seq_block, v_block]
-
-        # ----- 用逐元素乘+求和替代 tl.dot -----
-        # attn_scores: [1, seq_block] = sum_k (q[1, k] * K[seq_block, k])
-        q_f32 = q_block.to(tl.float32)               # [1, k_block]
-        k_f32 = k_block_data.to(tl.float32)          # [seq_block, k_block]
-        attn_scores = tl.sum(k_f32 * q_f32, axis=1)[None, :]  # [1, seq_block]
-        attn_scores = attn_scores * (scale * INV_LN2)
-
-        # 在线 softmax
-        new_max = tl.maximum(max_val, tl.max(attn_scores, 1))          # [1]
-        scale_factor = tl.exp2(max_val - new_max)                      # [1]
-        exp_weights = tl.exp2(attn_scores - new_max[:, None])          # [1, seq_block]
-
-        exp_sum = exp_sum * scale_factor + tl.sum(exp_weights, 1)      # [1]
-
-        # out_acc += exp_weights @ V
-        # [1, seq_block] x [seq_block, v_block] -> [1, v_block]
-        vw = v_block_data.to(tl.float32)                               # [seq_block, v_block]
-        ew = exp_weights.to(tl.float32)                                # [1, seq_block]
-        o_update = tl.sum(vw * tl.trans(ew), axis=0)[None, :]          # [1, v_block]
-        out_acc = out_acc * scale_factor[:, None] + o_update
-
-        max_val = new_max
-
-    # 归一化和写回
-    out_acc = out_acc / exp_sum[:, None]
-    final_lse = max_val + tl.log2(exp_sum)
-
-    tl.store(out_ptr, out_acc.to(out_ptr.dtype.element_ty), boundary_check=(0, 1))
-    # tl.store(lse_ptr, final_lse[0].to(tl.float32))
-    tl.store(lse_ptr, final_lse.to(tl.float32))
-
-def launch_attention_q1(q, k, v, scale, group_size, seq_block=128, k_block=64, v_block=64):
-    assert q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-    
-    n_q_heads, d_k = q.shape
-    seq_len, n_kv_heads, d_k2 = k.shape
-    seq_len2, n_kv_heads2, d_v = v.shape
-    
-    assert seq_len == seq_len2 and n_kv_heads == n_kv_heads2 and d_k == d_k2
-    assert n_q_heads % group_size == 0 and (n_q_heads // group_size) == n_kv_heads
-    
-    out = torch.empty((n_q_heads, d_v), dtype=q.dtype, device=q.device)
-    lse = torch.empty((n_q_heads,), dtype=torch.float32, device=q.device)
-    
-    grid = (triton.cdiv(d_v, v_block), n_q_heads)
-    
-    qlen1_attn_fwd_kernel[grid](
-        q, k, v, out, lse,
-        scale, seq_len,
-        n_kv_heads=n_kv_heads,
-        n_q_heads=n_q_heads,
-        group_size=group_size,
-        d_k=d_k, d_v=d_v,
-        seq_block=seq_block,
-        k_block=k_block,
-        v_block=v_block,
-        num_warps=4,
-        num_stages=2,
+    # Stage 2: 跨时间分块做稳定合并 + 归一化
+    grid2 = (triton.cdiv(V, BV), HQ)
+    attn_fwd_q1_b1_stage2[grid2](
+        m_buf, l_buf, o_buf,
+        o, lse, NTB,
+        HQ=HQ, V=V, BV=BV,
     )
-    
-    return out, lse
+    return o, lse
 
 
-# ======================
-# 基准与对比工具函数
-# ======================
+def to_triton_layout(q_rope_1, k_rope, v):
+    # q_rope_1: [B, Hq, 1, D], k_rope: [B, Hkv, T, D], v: [B, Hkv, T, Dv]
+    # 返回 q:[HQ,K], k:[HKV,T,K], v:[T,HKV,V]
+    assert q_rope_1.ndim == 4 and k_rope.ndim == 4 and v.ndim == 4
+    B, Hq, qlen, Dq = q_rope_1.shape
+    Bk, Hkv, T, Dk = k_rope.shape
+    Bv, Hvv, Tv, Dv = v.shape
+    assert B == Bk == Bv
+    assert T == Tv
+    assert Dq == Dk, "q/k head_dim 不一致"
+    assert Hkv == Hvv, "k/v 的 head 数必须一致"
+    assert B == 1, "该 kernel 仅支持 batch=1"
+    assert qlen == 1, "该 kernel 仅支持 qlen=1"
+    assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
 
-def expand_kv_for_gqa(k: torch.Tensor, v: torch.Tensor, G: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    # 输入: [B, H_kv, T, D]; 返回: [B, H_q (=H_kv*G), T, D]
-    if G == 1:
-        return k, v
-    k_exp = k.repeat_interleave(G, dim=1).contiguous()
-    v_exp = v.repeat_interleave(G, dim=1).contiguous()
-    return k_exp, v_exp
+    # 取 batch=0
+    q_triton = q_rope_1[0, :, 0, :].contiguous()            # [HQ, D]
+    k_triton = k_rope[0, :, :, :].contiguous()              # [HKV, T, D]
+    v_triton = v[0, :, :, :].permute(1, 0, 2).contiguous()  # [T, HKV, Dv]
+    return q_triton, k_triton, v_triton
 
 
-@torch.inference_mode()
-def run_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, backend: str) -> torch.Tensor:
-    # q/k/v: [B, Hq, Tq/Tk, D], 同 dtype/device
-    assert backend in ("math", "flash")
-    if backend == "flash":
-        # ctx = sdp_kernel(enable_math=False, enable_flash=True, enable_mem_efficient=False)
-        ctx = sdpa_kernel(enable_math=False, enable_flash=True, enable_mem_efficient=False)
+def flash_compute(q_rope_1, k_rope, v):
+    from flash_attn import flash_attn_func
+    # q_rope_1: [B=1, H, 1, D], k_rope: [1, H, T, D], v: [1, H, T, Dv]
+    out = flash_attn_func(
+        q_rope_1.transpose(1, 2),
+        k_rope.transpose(1, 2),
+        v.transpose(1, 2),
+        causal=False,
+    )
+    # out = out.transpose(1, 2)
+    out = out.squeeze(0).squeeze(0)
+    return out
+
+
+def lse_reference_base2_gqa(q_triton, k_triton, scale):
+    # 计算 lse 的 reference（以 2 为底），用于与 triton kernel 的 lse 对比（支持 GQA）
+    # q_triton: [HQ,K], k_triton: [HKV,T,K]
+    qf = q_triton.float()
+    kf = k_triton.float()
+    HQ, K = qf.shape
+    HKV, T, Kk = kf.shape
+    assert Kk == K
+    assert HQ % HKV == 0
+    G = HQ // HKV
+    # 扩展 k 到 HQ 个 head（仅用于参考数值）
+    if G != 1:
+        kf_rep = kf.repeat_interleave(G, dim=0)  # [HQ, T, K]
     else:
-        # ctx = sdp_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
-        ctx = sdpa_kernel(enable_math=True, enable_flash=False, enable_mem_efficient=False)
-    with ctx:
-        o = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
-    return o
+        kf_rep = kf
+    # scores[hq, t] = (q[hq] · kf_rep[hq, t]) * scale
+    scores = torch.einsum('hk, htk -> ht', qf, kf_rep) * scale
+    # 以 e 为底的 logsumexp -> 转成以 2 为底
+    RCP_LN2 = 1.4426950408889634
+    lse_e = torch.logsumexp(scores, dim=-1)         # [HQ]
+    lse_base2 = lse_e * RCP_LN2                     # [HQ]
+    return lse_base2
 
 
-def time_cuda(fn, warmup=10, iters=50):
+def bench_op(fn, iters=50, warmup=10):
+    torch.cuda.synchronize()
     for _ in range(warmup):
         _ = fn()
     torch.cuda.synchronize()
+
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    times = []
+    start.record()
     for _ in range(iters):
-        start.record()
         _ = fn()
-        end.record()
-        torch.cuda.synchronize()
-        times.append(start.elapsed_time(end))
-    return sum(times) / len(times)
+    end.record()
+    torch.cuda.synchronize()
+    ms = start.elapsed_time(end) / iters
+    return ms
 
-
-def compare_outputs(o_ref: torch.Tensor, o_test: torch.Tensor, name_ref="ref", name_test="test"):
-    a = o_ref.float()
-    b = o_test.float()
-    diff = (a - b).abs()
-    rel = diff / (a.abs() + 1e-6)
-    print(f"[Compare] {name_test} vs {name_ref}:")
-    print(f"  max_abs: {diff.max().item():.6e}, mean_abs: {diff.mean().item():.6e}")
-    print(f"  max_rel: {rel.max().item():.6e}, mean_rel: {rel.mean().item():.6e}")
-
-
-# ======================
-# 主逻辑：仅 qlen=1
-# ======================
 
 if __name__ == "__main__":
     from utils import load_qkvh
@@ -222,7 +312,11 @@ if __name__ == "__main__":
     layer_data_root = os.path.join(exp_root, 'layer_data')
 
     dtype = torch.float16  # 建议 fp16/bf16 才能触发 Flash
-    BS, BK, BV = 128, 64, 64  # Triton tile，可按需调参
+    BS, BK, BV = 256, 64, 64  # Triton tile，可按需调参
+
+    # 计时参数
+    iters = 50
+    warmup = 10
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         print(f"\n========== Layer {layer_idx} ==========")
@@ -233,66 +327,54 @@ if __name__ == "__main__":
         # 只取最后一个查询位置 -> qlen=1
         q_rope_1 = q_rope[:, :, -1:, :]  # [B, Hq, 1, D]
 
-        B, Hq, Tq, D  = q_rope_1.shape
-        _, Hkv, Tk, Dk = k_rope.shape
-        _, Hkv2, Tv, Dv = v.shape
-        assert B == 1, "当前 Triton 实现 batch 固定为 1"
-        assert Tq == 1, "qlen 必须为 1"
-        assert Tk == Tv, "K/V 的时间维需一致"
-        assert Dk == D and Dv == D, "默认假设 K/V 维度与 Q 相同"
-        assert Hq % Hkv == 0, "GQA: Hq 必须是 Hkv 的整数倍"
-        G = Hq // Hkv
+        B, Hq, qlen, D = q_rope_1.shape
+        Bk, Hkv, T, Dk = k_rope.shape
+        Bv, Hv, Tv, Dv = v.shape
+        assert B == 1, "该 demo 仅支持 batch=1"
+        assert qlen == 1, "该 demo 仅支持 qlen=1"
+        assert Hkv == Hv, "k/v heads 必须一致"
+        assert D == Dk, "q/k head_dim 不一致"
+        assert T == Tv
+        assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
+
+        # 准备给 Triton 内核的布局（支持 GQA）
+        q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
+
+        # 运行 Triton 实现
         scale = 1.0 / math.sqrt(D)
+        # o_triton, lse_triton = attn_fwd_q1_b1(
+        o_triton, lse_triton = attn_fwd_q1_b1_splitT(
+            q_triton, k_triton, v_triton,
+            scale=scale, BS=BS, BK=BK, BV=BV
+        )  # o:[HQ,V], lse:[HQ] (以 2 为底)
 
-        # PyTorch SDPA 路径（需要扩展 KV 到 Hq）
-        k_sdpa, v_sdpa = expand_kv_for_gqa(k_rope, v, G)  # [B, Hq, T, D]
-        # 1) torch-math
-        o_torch = run_sdpa(q_rope_1, k_sdpa, v_sdpa, backend="math")  # [B, Hq, 1, D]
-        # 2) torch-flash（若不可用将抛错，按需 try/except）
-        try:
-            o_flash = run_sdpa(q_rope_1, k_sdpa, v_sdpa, backend="flash")
-        except Exception as e:
-            print(f"Flash SDP 不可用，降级到 Math。原因: {e}")
-            o_flash = o_torch
+        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
-        # Triton 路径（GQA 原生）
-        # q1: [HQ, D]
-        q1 = q_rope_1[0, :, 0, :].contiguous()
-        # k: [T, Hkv, D]；v: [T, Hkv, D]
-        k_tri = k_rope[0].permute(2, 0, 1).contiguous()  # [T, Hkv, D] (等价写法，确保最后一维为 D)
-        k_tri = k_rope[0].permute(2, 0, 1)  # 纠正：上一行错误，多余变换，下面统一采用正确顺序
-        k_tri = k_rope[0].permute(2, 0, 1)  # 实际上应为 [T, Hkv, D] -> 但 k_rope[0] 是 [Hkv, T, D]
-        # 更清晰的写法如下：
-        k_tri = k_rope[0].permute(1, 0, 2).contiguous()  # [T, Hkv, D]
-        v_tri = v[0].permute(1, 0, 2).contiguous()       # [T, Hkv, D]
+        # print(f"{o_triton.shape=}, {o_flash.shape=}")
 
-        o_tri, lse = launch_attention_q1(q1, k_tri, v_tri, scale, G, BS, BK, BV)  # [Hq, D]
-        o_tri_bhtd = o_tri.unsqueeze(0).unsqueeze(2).contiguous()  # [B=1, Hq, 1, D]
+        # 数值对比（与 Flash 输出）
+        max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
+        rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
+        rel = rel.item()
 
-        # 数值对比
-        compare_outputs(o_torch, o_flash, name_ref="torch-math", name_test="torch-flash")
-        compare_outputs(o_torch, o_tri_bhtd, name_ref="torch-math", name_test="triton(q=1)")
+        # LSE 参考（高精度，用于 sanity check）
+        lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
+        lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
+        lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
+        lse_rel = lse_rel.item()
 
-        # 计时
-        warmup, iters = 10, 50
+        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
+        print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
-        def fn_torch_math():
-            return run_sdpa(q_rope_1, k_sdpa, v_sdpa, backend="math")
+        # 性能对比
+        def run_triton():
+            # o, _ = attn_fwd_q1_b1(q_triton, k_triton, v_triton, scale=scale, BS=BS, BK=BK, BV=BV)
+            o, _ = attn_fwd_q1_b1_splitT(q_triton, k_triton, v_triton, scale=scale, BS=BS, BK=BK, BV=BV)
+            return o
 
-        def fn_torch_flash():
-            return run_sdpa(q_rope_1, k_sdpa, v_sdpa, backend="flash")
+        def run_flash():
+            return flash_compute(q_rope_1, k_rope, v)
 
-        def fn_triton():
-            return launch_attention_q1(q1, k_tri, v_tri, scale, G, BS, BK, BV)[0]
-
-        t_math  = time_cuda(fn_torch_math, warmup=warmup, iters=iters)
-        try:
-            t_flash = time_cuda(fn_torch_flash, warmup=warmup, iters=iters)
-        except Exception:
-            t_flash = float('nan')
-        t_triton = time_cuda(fn_triton, warmup=warmup, iters=iters)
-
-        print(f"[Latency ms @ qlen=1] torch-math: {t_math:.3f} | torch-flash: {t_flash:.3f} | triton: {t_triton:.3f}")
-
-        # 为防止 OOM，可按需仅测前若干层
-        # if layer_idx >= 2: break
+        ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
+        ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
+        print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
