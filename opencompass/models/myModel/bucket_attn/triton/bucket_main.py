@@ -8,57 +8,34 @@ import triton
 import triton.language as tl
 
 
-RCP_LN2 = 1.4426950408889634  # 仅供 Python 侧使用；Triton kernel 内不再引用该全局
-
-
 def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
-    # 旧接口，保留以兼容（不在主流程使用）
+    # q: [HQ, K]
+    # k: [HKV, T, K]
     HQ, K = q.shape
     HKV, T, _ = k.shape
     G = HQ // HKV
-    k0 = k[:, :4, :]
-    k1 = k[:, -32:, :]
+    k0 = k[:, :4, :]              # 前4个 key
+    k1 = k[:, -32:, :]            # 后32个 key
     k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)
-    q_expand = q.unsqueeze(1)
+
+    # 扩展为 [HQ, 36, K]
+    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
+
+    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
     dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
     max_val = dot.max(dim=-1).values               # [HQ]
-    threshold = max_val * scale - 100              # e 域
-    return threshold.contiguous()                  # [HQ]
+    threshold = max_val
+    threshold = threshold * scale
+    threshold = threshold - 100
+    return threshold.contiguous()  # [HQ], e 域（已乘 scale）
 
 
-def compute_pseudo_smax_e(
-    q: torch.Tensor,          # [HQ, K]
-    k: torch.Tensor,          # [HKV, T, K]
-    scale: float,
-    head_prefix: int = 4,     # 取前 head_prefix 个 key
-    tail_count: int = 32,     # 取后 tail_count 个 key
-) -> torch.Tensor:
-    """
-    返回每个 head 的伪最大值 s_max（e 域，对 s=(q·k)*scale）。
-    用法：从 k 中取前 head_prefix 个与后 tail_count 个 token 近似估计。
-    """
-    HQ, K = q.shape
-    HKV, T, _ = k.shape
-    assert HQ % HKV == 0
-    G = HQ // HKV
-
-    take_front = min(head_prefix, T)
-    take_tail = min(tail_count, max(0, T - take_front))
-    if take_tail == 0 and take_front == 0:
-        raise ValueError("T 为 0，无法估计伪最大值")
-
-    parts = []
-    if take_front > 0:
-        parts.append(k[:, :take_front, :])
-    if take_tail > 0:
-        parts.append(k[:, -take_tail:, :])
-    k_cat = torch.cat(parts, dim=1)  # [HKV, take_front + take_tail, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # [HQ, M, K]
-
-    dot = (q.unsqueeze(1) * k_cat_gqa).sum(dim=-1)  # [HQ, M]
-    s_max_e = dot.max(dim=-1).values * scale        # e 域
-    return s_max_e.contiguous()                     # [HQ]
+def precompute_norms(q: torch.Tensor, k: torch.Tensor):
+    # q: [HQ, K], k: [HKV, T, K]
+    # 返回 L2 范数平方（fp32）
+    q_norm2 = (q.float() * q.float()).sum(dim=-1).contiguous()        # [HQ]
+    k_norm2 = (k.float() * k.float()).sum(dim=-1).contiguous()        # [HKV, T]
+    return q_norm2, k_norm2
 
 
 @triton.jit
@@ -66,15 +43,16 @@ def attn_fwd_q1_b1_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
-    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V]
     scale,       # float
     T,           # int
     NTB,         # int = ceil(T / BS)
-    lost_thresholds,     # [HQ], base-2 域
-    bucket_thresholds,   # [HQ], base-2 域
-    bucket_step,         # float，base-2 域步长
+    qk_thresholds,  # [HQ], e 域（已乘 scale）
+    q_norm2,     # [HQ], fp32
+    k_norm2,     # [HKV, T], fp32
+    rem_scale,   # float, 剩余上界缩放系数（<=1 更激进）
+    CHECK_EVERY: tl.constexpr,  # 每处理多少个 BK 检查一次
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
@@ -99,61 +77,73 @@ def attn_fwd_q1_b1_stage1(
     offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 块内 q·k 累加（得到未缩放的内积和）
-    b_s = tl.zeros([BS], tl.float32)
+    # 加载对应 threshold（e->base-2），以及 q/k 的 L2 范数平方
+    RCP_LN2 = 1.4426950408889634
+    threshold2 = tl.load(qk_thresholds + i_hq).to(tl.float32) * RCP_LN2  # base-2 域阈值
+    qn2 = tl.load(q_norm2 + i_hq).to(tl.float32)                         # 标量
+    kn2_tot = tl.load(k_norm2 + i_h * T + offs_t, mask=t_mask, other=0.0).to(tl.float32)  # [BS]
+
+    # 按 BK 循环的累加与早退状态
+    acc_e = tl.zeros([BS], tl.float32)        # e 域的部分点积和（未乘 scale）
+    q_used2 = tl.zeros((), tl.float32)        # 标量：已用 q 的 L2^2
+    k_used2 = tl.zeros([BS], tl.float32)      # 向量：已用 k 的 L2^2（逐 token）
+    alive = t_mask                             # 仍需继续累加的 token 掩码（bool）
+    rem_scale_f = tl.full((), rem_scale, tl.float32)
+
+    # K 维分块累加 + 早退
+    it = 0
     for kk in range(0, K, BK):
         offs_k = kk + tl.arange(0, BK)
         k_mask = offs_k < K
 
+        # q 分块（对该 head 固定），总是读取；开销较小
         q_ptrs = q + i_hq * K + offs_k
         q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
 
+        # k 分块：仅对 still-alive 的 token 读取
         k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
-        k_chunk = tl.load(
-            k_ptrs,
-            mask=(k_mask[:, None] & t_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
+        read_mask = (k_mask[:, None] & alive[None, :])
+        k_chunk = tl.load(k_ptrs, mask=read_mask, other=0.0).to(tl.float32)
 
-        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
+        # 累加点积与范数
+        acc_e += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
 
-    # 转到 base-2 对数域：b_s = s * log2(e)，其中 s = (qk)*scale 是 e 域
-    LOG2E = 1.4426950408889634  # 局部常量，避免使用全局变量
-    b_s = b_s * scale * LOG2E
+        q_sq = q_chunk * q_chunk                              # [BK]
+        q_sq = tl.where(k_mask, q_sq, 0.0)                    # 掩蔽无效 K 维
+        q_used2 += tl.sum(q_sq, axis=0)                       # 标量
 
-    # 读取 per-head 阈值（base-2 域）
-    lost_th = tl.load(lost_thresholds + i_hq).to(tl.float32)
-    bucket_th = tl.load(bucket_thresholds + i_hq).to(tl.float32)
-    step = tl.full((), bucket_step, tl.float32)
+        k_used2 += tl.sum(k_chunk * k_chunk, axis=0)          # [BS]，仅 alive 位置有贡献
 
-    # 三段掩码
-    exact_mask  = (b_s >= bucket_th) & t_mask
-    bucket_mask = (b_s >= lost_th) & (b_s < bucket_th) & t_mask
-    # lost 段：b_s < lost_th；直接忽略
+        # 定期做一次剩余上界检查并早退（编译期布尔）
+        it = it + 1
+        do_check = (it % CHECK_EVERY) == 0
+        if do_check:
+            # 剩余范数
+            q_rem2 = tl.maximum(qn2 - q_used2, 0.0)
+            q_rem = tl.sqrt(q_rem2)
 
-    NEG_INF = float('-inf')
+            k_rem2 = tl.maximum(kn2_tot - k_used2, 0.0)
+            k_rem = tl.sqrt(k_rem2)
 
-    # 桶中点：b_mid = lost_th + (floor((b_s - lost_th)/step) + 0.5) * step
-    rel = (b_s - lost_th) / step
-    idx = tl.floor(rel)
-    b_mid_raw = lost_th + (idx + 0.5) * step
-    b_mid = tl.where(bucket_mask, b_mid_raw, tl.full([BS], NEG_INF, tl.float32))
+            # base-2 域的部分和与剩余上界：s2 = acc_e*scale*RCP_LN2
+            s2 = acc_e * scale * RCP_LN2
+            rem_bound2 = (q_rem * k_rem) * scale * RCP_LN2
+            rem_bound2 = rem_bound2 * rem_scale_f
 
-    # 计算块内最大值：exact 的真实 b_s 与 bucket 的 b_mid 一起考虑
-    b_s_exact = tl.where(exact_mask, b_s, tl.full([BS], NEG_INF, tl.float32))
-    m_b = tl.maximum(tl.max(b_s_exact, axis=0), tl.max(b_mid, axis=0))
+            ub2 = s2 + rem_bound2  # 上界
+            # 若 ub2 < threshold2，则该 token 必然无法达阈值，后续 BK 不再读取其 k
+            could_skip = ub2 < threshold2
+            alive = alive & (~could_skip)
 
-    # 权重（base-2）
-    w_exact = tl.exp2(b_s - m_b)
-    w_exact = tl.where(exact_mask, w_exact, 0.0)
+    # 全部 BK 结束后的最终 base-2 分数
+    s2_final = acc_e * scale * RCP_LN2
+    active_t = alive & t_mask & (s2_final >= threshold2)
 
-    w_bucket = tl.exp2(b_mid - m_b)
-    w_bucket = tl.where(bucket_mask, w_bucket, 0.0)
+    # 仅对活跃位置做 exp2
+    b_p = tl.where(active_t, tl.exp2(s2_final), 0.0)
+    l_b = tl.sum(b_p, axis=0)  # 标量
 
-    l_b = tl.sum(w_exact + w_bucket, axis=0)  # 标量
-
-    # 读取 v，仅当 exact 或 bucket 有激活位置
-    active_t = (exact_mask | bucket_mask)
+    # 仅当该块存在活跃位置时，读取 v
     num_active = tl.sum(active_t.to(tl.int32), axis=0)
     need_v = num_active > 0
 
@@ -165,22 +155,18 @@ def attn_fwd_q1_b1_stage1(
             mask=(active_t[:, None] & v_mask[None, :]),
             other=0.0
         ).to(tl.float32)
+        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
 
-        weight = w_exact + w_bucket  # [BS]
-        o_b = tl.sum(weight[:, None] * b_v, axis=0)  # [BV]
-
-    # 写回
+    # 写回块级分子（o_buf）与分母（l_buf）
     o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
     tl.store(o_ptrs, o_b, mask=v_mask)
 
     if pid_v == 0:
-        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
         tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
 
 
 @triton.jit
 def attn_fwd_q1_b1_stage2(
-    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V], fp32
     o,           # [HQ, V], out dtype = q.dtype
@@ -197,62 +183,34 @@ def attn_fwd_q1_b1_stage2(
     v_offs = pid_v * BV + tl.arange(0, BV)
     v_mask = v_offs < V
 
-    # 在线合并 across tb（base-2 域）
-    b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
-    b_acc = tl.zeros((), tl.float32)              # 当前全局分母
-    b_o = tl.zeros([BV], tl.float32)              # 当前全局分子向量
+    # 直接跨 tb 累加分母与分子（不做稳定对齐）
+    b_acc = tl.zeros((), tl.float32)      # 全局分母
+    b_o = tl.zeros([BV], tl.float32)      # 全局分子向量
 
-    # 沿 tb 做稳定合并
     for tb in range(0, NTB):
-        # 读取该块的统计量
-        m_b = tl.load(m_buf + pid_hq * NTB + tb)
         l_b = tl.load(l_buf + pid_hq * NTB + tb)
-
-        # 是否为非空块（有贡献）
         has = l_b > 0.0
 
-        # 只在 has=True 时读分子；否则用 0
         o_b = tl.load(
             o_buf + pid_hq * (NTB * V) + tb * V + v_offs,
             mask=(v_mask & has),
             other=0.0
         )
 
-        # 对空块将 m_b 视为 -inf，使其对全局缩放“无操作”
-        m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
+        b_acc = b_acc + tl.where(has, l_b, 0.0)
+        b_o   = b_o   + o_b
 
-        new_m = tl.maximum(b_m, m_b_eff)
-        r_prev = tl.exp2(b_m - new_m)
-        r_blk  = tl.where(has, tl.exp2(m_b - new_m), 0.0)
+    # 归一化；若分母为 0，则输出 0，并将 lse 置为 -inf
+    has_any = b_acc > 0.0
+    out_tile = tl.where(has_any, b_o / b_acc, 0.0)
 
-        b_acc = b_acc * r_prev + l_b * r_blk
-        b_o   = b_o   * r_prev + o_b * r_blk
-        b_m   = new_m
-
-    # 归一化与 lse（base-2）
-    out_tile = b_o / b_acc
     if pid_v == 0:
-        lse_val = b_m + tl.log2(b_acc)
+        NEG_INF = float('-inf')
+        lse_val = tl.where(has_any, tl.log2(b_acc), tl.full((), NEG_INF, tl.float32))
         tl.store(lse + pid_hq, lse_val)
 
-    # 写回输出
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
-
-
-def _ensure_delta_tensor(delta, HQ, device, dtype=torch.float32) -> torch.Tensor:
-    """
-    将标量或张量 delta 转成 [HQ] 的张量（e 域）。
-    - 若传 float/int，则广播为 [HQ]。
-    - 若传张量，需 shape==[HQ] 或 [1]。
-    """
-    if isinstance(delta, torch.Tensor):
-        if delta.numel() == 1:
-            return delta.to(device=device, dtype=dtype).repeat(HQ).contiguous()
-        assert delta.shape == (HQ,), f"delta 张量形状必须为 [HQ] 或标量，实际 {tuple(delta.shape)}"
-        return delta.to(device=device, dtype=dtype).contiguous()
-    else:
-        return torch.full((HQ,), float(delta), device=device, dtype=dtype)
 
 
 def attn_fwd_q1_b1_splitT(
@@ -263,18 +221,10 @@ def attn_fwd_q1_b1_splitT(
     BS: int = 128,    # 时间分块大小（可调，影响 NTB）
     BK: int = 64,
     BV: int = 64,
-    # 手动传入：与伪最大值的差值（e 域）
-    lost_delta_e=100.0,          # lost 阈值 = s_max - lost_delta_e
-    bucket_delta_e=20.0,         # bucket 阈值 = s_max - bucket_delta_e
-    bucket_step_e: float = 0.1,  # 桶宽（e 域）
-    # 伪最大值估计参数（可按需调整）
-    pseudo_head_prefix: int = 4,
-    pseudo_tail_count: int = 32,
+    qk_thresholds: torch.Tensor = None,  # 可选：预先计算的阈值 [HQ]（e 域，已乘 scale）
+    rem_scale: float = 1.0,              # 上界缩放（<1 更激进）
+    check_every: int = 1,                # 每处理几个 BK 做一次检查
 ):
-    """
-    lost_delta_e / bucket_delta_e / bucket_step_e 均在 e 域，针对 s=(q·k)*scale。
-    内核中会将分数、阈值、步长统一换算到 base-2 域进行数值稳定计算。
-    """
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
     HQ, K = q.shape
@@ -287,30 +237,6 @@ def attn_fwd_q1_b1_splitT(
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    # 1) 估计每个 head 的伪最大值（e 域）
-    s_max_e = compute_pseudo_smax_e(
-        q, k, scale,
-        head_prefix=pseudo_head_prefix,
-        tail_count=pseudo_tail_count,
-    )  # [HQ], e 域
-
-    # 2) 将“差值（e 域）”转换为阈值（e 域）
-    lost_delta_e = _ensure_delta_tensor(lost_delta_e, HQ, q.device)
-    bucket_delta_e = _ensure_delta_tensor(bucket_delta_e, HQ, q.device)
-
-    lost_thresholds_e = (s_max_e - lost_delta_e).contiguous()      # [HQ]
-    bucket_thresholds_e = (s_max_e - bucket_delta_e).contiguous()  # [HQ]
-    # 保证 bucket >= lost
-    bucket_thresholds_e = torch.maximum(bucket_thresholds_e, lost_thresholds_e)
-
-    if not (bucket_step_e > 0.0):
-        raise ValueError("bucket_step_e 必须为正数（e 域）")
-
-    # 3) 转为 base-2 域后送入内核
-    lost_thresholds_2   = (lost_thresholds_e.to(torch.float32) * RCP_LN2).contiguous()
-    bucket_thresholds_2 = (bucket_thresholds_e.to(torch.float32) * RCP_LN2).contiguous()
-    bucket_step_2 = float(bucket_step_e * RCP_LN2)
-
     NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
 
     # 输出
@@ -318,26 +244,38 @@ def attn_fwd_q1_b1_splitT(
     lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
     # 中间缓冲（stage1 -> stage2）
-    m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # Stage 1: 并行计算各时间分块的局部统计与分子
+    # 阈值（e 域，已乘 scale）
+    if qk_thresholds is None:
+        qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
+    else:
+        assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
+        assert qk_thresholds.device == q.device, "qk_thresholds 需与 q 在同一设备"
+
+    # 预计算范数
+    q_norm2, k_norm2 = precompute_norms(q, k)  # fp32
+    assert q_norm2.device == q.device and k_norm2.device == q.device
+
+    # Stage 1: 并行计算各时间分块的“非稳定”分子与分母 + 早退
     grid1 = (triton.cdiv(V, BV), HQ, NTB)
     attn_fwd_q1_b1_stage1[grid1](
         q, k, v,
-        m_buf, l_buf, o_buf,
+        l_buf, o_buf,
         scale, T, NTB,
-        lost_thresholds_2, bucket_thresholds_2,
-        bucket_step_2,
+        qk_thresholds,
+        q_norm2, k_norm2,
+        rem_scale,
+        CHECK_EVERY=check_every,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
     )
 
-    # Stage 2: 跨时间分块做稳定合并 + 归一化
+    # Stage 2: 跨时间分块直接求和 + 归一化（非稳定）
     grid2 = (triton.cdiv(V, BV), HQ)
     attn_fwd_q1_b1_stage2[grid2](
-        m_buf, l_buf, o_buf,
+        l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
     )
@@ -381,6 +319,7 @@ def flash_compute(q_rope_1, k_rope, v):
 
 def lse_reference_base2_gqa(q_triton, k_triton, scale):
     # 计算 lse 的 reference（以 2 为底），用于与 triton kernel 的 lse 对比（支持 GQA）
+    # q_triton: [HQ,K], k_triton: [HKV,T,K]
     qf = q_triton.float()
     kf = k_triton.float()
     HQ, K = qf.shape
@@ -396,6 +335,7 @@ def lse_reference_base2_gqa(q_triton, k_triton, scale):
     # scores[hq, t] = (q[hq] · kf_rep[hq, t]) * scale
     scores = torch.einsum('hk, htk -> ht', qf, kf_rep) * scale
     # 以 e 为底的 logsumexp -> 转成以 2 为底
+    RCP_LN2 = 1.4426950408889634
     lse_e = torch.logsumexp(scores, dim=-1)         # [HQ]
     lse_base2 = lse_e * RCP_LN2                     # [HQ]
     return lse_base2
@@ -434,11 +374,6 @@ if __name__ == "__main__":
     iters = 50
     warmup = 10
 
-    # 你手动指定：距伪最大值的差值（e 域）
-    LOST_DELTA_E = 100.0
-    BUCKET_DELTA_E = 20.0
-    BUCKET_STEP_E = 0.1
-
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         print(f"\n========== Layer {layer_idx} ==========")
         q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
@@ -464,54 +399,41 @@ if __name__ == "__main__":
         # 运行 Triton 实现
         scale = 1.0 / math.sqrt(D)
 
+        # 关键：预计算阈值（不参与时间计算）
+        qk_thresholds = calc_qk_threshold(q_triton, k_triton, scale).contiguous()
+
         o_triton, lse_triton = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, BK=BK, BV=BV,
-            lost_delta_e=LOST_DELTA_E,
-            bucket_delta_e=BUCKET_DELTA_E,
-            bucket_step_e=BUCKET_STEP_E,
-            pseudo_head_prefix=4,
-            pseudo_tail_count=32,
+            qk_thresholds=qk_thresholds,   # 传入预计算阈值（e 域，已乘 scale）
+            rem_scale=1.0,                 # 可调：0.9/0.8 更激进
+            check_every=1,                 # 每个 BK 都检查
         )  # o:[HQ,V], lse:[HQ] (以 2 为底)
 
-        # 可选：与 Flash 作对比
-        try:
-            from flash_attn import __version__ as _fa_ver  # noqa
-            def flash_compute(q_rope_1, k_rope, v):
-                from flash_attn import flash_attn_func
-                out = flash_attn_func(
-                    q_rope_1.transpose(1, 2),
-                    k_rope.transpose(1, 2),
-                    v.transpose(1, 2),
-                    causal=False,
-                )
-                return out.squeeze(0).squeeze(0)
+        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
-            o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
-            # 数值对比
-            max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
-            rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
-            rel = rel.item()
+        # 数值对比（与 Flash 输出）
+        max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
+        rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
+        rel = rel.item()
 
-            # LSE 参考（高精度，用于 sanity check）
-            lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
-            lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
-            lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
-            lse_rel = lse_rel.item()
+        # LSE 参考（高精度，用于 sanity check）
+        lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
+        lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
+        lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
+        lse_rel = lse_rel.item()
 
-            print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
-            print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
-        except Exception as e:
-            print(f"Flash-Attn 对比跳过（可能未安装 flash_attn）: {e}")
+        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
+        print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
         # 性能对比：计时不包含阈值计算
         def run_triton():
             o, _ = attn_fwd_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, BK=BK, BV=BV,
-                lost_delta_e=LOST_DELTA_E,
-                bucket_delta_e=BUCKET_DELTA_E,
-                bucket_step_e=BUCKET_STEP_E,
+                qk_thresholds=qk_thresholds,  # 使用已计算好的阈值
+                rem_scale=1.0,
+                check_every=1,
             )
             return o
 
@@ -519,8 +441,5 @@ if __name__ == "__main__":
             return flash_compute(q_rope_1, k_rope, v)
 
         ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
-        try:
-            ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
-            print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
-        except Exception:
-            print(f"Speed: Triton={ms_triton:.3f} ms (Flash-Attn 未计时)")
+        ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
+        print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")

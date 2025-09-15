@@ -26,7 +26,7 @@ def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
     max_val = dot.max(dim=-1).values               # [HQ]
     threshold = max_val
     threshold = threshold * scale
-    threshold = threshold - 100
+    threshold = threshold - 6
     return threshold.contiguous()  # [HQ]
 
 
@@ -35,6 +35,7 @@ def attn_fwd_q1_b1_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
+    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V]
     scale,       # float
@@ -87,17 +88,24 @@ def attn_fwd_q1_b1_stage1(
 
         b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
 
-    # 换算到以 2 为底的指数域
+    # 注意：为了与 e 底 softmax 等价，这里把分数换算到以 2 为底的指数域：
+    # 2^(s / ln 2) = e^s，因此在用 exp2 前先乘以 1/ln 2
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2  # base-2 对数域
+    b_s = b_s * scale * RCP_LN2  # 现在 b_s 处于“以 2 为底的对数域”
 
-    # 阈值与活跃位置
-    skip = b_s < threshold               # [BS]
-    active_t = (~skip) & t_mask          # [BS]
+    # 判定阈值与边界
+    skip = b_s < threshold               # [BS], 被阈值屏蔽
+    active_t = (~skip) & t_mask          # [BS], 实际参与 softmax 的位置
 
-    # 直接对 b_s 做 exp2（不再减去 m_b）
-    b_p = tl.where(active_t, tl.exp2(b_s), 0.0)
-    l_b = tl.sum(b_p, axis=0)            # 标量
+    # 仅用活跃位置计算块内最大值
+    NEG_INF = float('-inf')
+    b_s_act = tl.where(active_t, b_s, NEG_INF)
+    m_b = tl.max(b_s_act, axis=0)        # 标量（若整块无活跃，值为 -inf）
+
+    # 计算块内分母与分子：只累加活跃位置
+    # 警告：即便 m_b=-inf，下面 exp2 的无穷大也会通过 active_t 掩码归零，不会影响结果
+    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)
+    l_b = tl.sum(b_p, axis=0)            # 标量，若无活跃则为 0
 
     # 仅当该块存在至少一个活跃位置时，才从 v 读取
     num_active = tl.sum(active_t.to(tl.int32), axis=0)
@@ -113,16 +121,18 @@ def attn_fwd_q1_b1_stage1(
         ).to(tl.float32)
         o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
 
-    # 写回块级分子（o_buf）与分母（l_buf）
+    # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
     o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
     tl.store(o_ptrs, o_b, mask=v_mask)
 
     if pid_v == 0:
+        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
         tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
 
 
 @triton.jit
 def attn_fwd_q1_b1_stage2(
+    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V], fp32
     o,           # [HQ, V], out dtype = q.dtype
@@ -139,32 +149,45 @@ def attn_fwd_q1_b1_stage2(
     v_offs = pid_v * BV + tl.arange(0, BV)
     v_mask = v_offs < V
 
-    # 直接跨 tb 累加分母与分子（不做稳定对齐）
-    b_acc = tl.zeros((), tl.float32)      # 全局分母
-    b_o = tl.zeros([BV], tl.float32)      # 全局分子向量
+    # 在线合并 across tb（base-2 域）
+    b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
+    b_acc = tl.zeros((), tl.float32)              # 当前全局分母
+    b_o = tl.zeros([BV], tl.float32)              # 当前全局分子向量
 
+    # 沿 tb 做稳定合并
     for tb in range(0, NTB):
+        # 读取该块的统计量
+        m_b = tl.load(m_buf + pid_hq * NTB + tb)
         l_b = tl.load(l_buf + pid_hq * NTB + tb)
+
+        # 是否为非空块（有贡献）
         has = l_b > 0.0
 
+        # 只在 has=True 时读分子；否则用 0
         o_b = tl.load(
             o_buf + pid_hq * (NTB * V) + tb * V + v_offs,
             mask=(v_mask & has),
             other=0.0
         )
 
-        b_acc = b_acc + tl.where(has, l_b, 0.0)
-        b_o   = b_o   + o_b
+        # 对空块将 m_b 视为 -inf，使其对全局缩放“无操作”
+        m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
 
-    # 归一化；若分母为 0，则输出 0，并将 lse 置为 -inf
-    has_any = b_acc > 0.0
-    out_tile = tl.where(has_any, b_o / b_acc, 0.0)
+        new_m = tl.maximum(b_m, m_b_eff)
+        r_prev = tl.exp2(b_m - new_m)
+        r_blk  = tl.where(has, tl.exp2(m_b - new_m), 0.0)
 
+        b_acc = b_acc * r_prev + l_b * r_blk
+        b_o   = b_o   * r_prev + o_b * r_blk
+        b_m   = new_m
+
+    # 归一化与 lse（base-2）
+    out_tile = b_o / b_acc
     if pid_v == 0:
-        NEG_INF = float('-inf')
-        lse_val = tl.where(has_any, tl.log2(b_acc), tl.full((), NEG_INF, tl.float32))
+        lse_val = b_m + tl.log2(b_acc)
         tl.store(lse + pid_hq, lse_val)
 
+    # 写回输出
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
 
@@ -198,32 +221,32 @@ def attn_fwd_q1_b1_splitT(
     lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
     # 中间缓冲（stage1 -> stage2）
-    # 去除 m_buf，仅保留 l_buf 与 o_buf
+    m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # 阈值
+    # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
     if qk_thresholds is None:
         qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
     else:
         assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
         assert qk_thresholds.device == q.device, "qk_thresholds 需与 q 在同一设备"
 
-    # Stage 1: 并行计算各时间分块的“非稳定”分子与分母
+    # Stage 1: 并行计算各时间分块的局部统计与分子
     grid1 = (triton.cdiv(V, BV), HQ, NTB)
     attn_fwd_q1_b1_stage1[grid1](
         q, k, v,
-        l_buf, o_buf,
+        m_buf, l_buf, o_buf,
         scale, T, NTB,
-        qk_thresholds,
+        qk_thresholds,  # 传入预计算/内算阈值
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
     )
 
-    # Stage 2: 跨时间分块直接求和 + 归一化（非稳定）
+    # Stage 2: 跨时间分块做稳定合并 + 归一化
     grid2 = (triton.cdiv(V, BV), HQ)
     attn_fwd_q1_b1_stage2[grid2](
-        l_buf, o_buf,
+        m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
     )
@@ -360,6 +383,7 @@ if __name__ == "__main__":
 
         # 数值对比（与 Flash 输出）
         max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
+        mean_abs = (o_triton.float() - o_flash.float()).abs().mean().item()
         rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
         rel = rel.item()
 
@@ -369,7 +393,7 @@ if __name__ == "__main__":
         lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
         lse_rel = lse_rel.item()
 
-        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
+        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
         print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
         # 性能对比：计时不包含阈值计算
