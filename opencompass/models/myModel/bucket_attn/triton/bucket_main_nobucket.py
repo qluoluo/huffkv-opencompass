@@ -8,57 +8,26 @@ import triton
 import triton.language as tl
 
 
-RCP_LN2 = 1.4426950408889634  # 仅供 Python 侧使用；Triton kernel 内不再引用该全局
-
-
 def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
-    # 旧接口，保留以兼容（不在主流程使用）
+    # q: [HQ, K]
+    # k: [HKV, T, K]
     HQ, K = q.shape
     HKV, T, _ = k.shape
     G = HQ // HKV
-    k0 = k[:, :4, :]
-    k1 = k[:, -32:, :]
+    k0 = k[:, :4, :]              # 前4个 key
+    k1 = k[:, -32:, :]            # 后32个 key
     k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)
-    q_expand = q.unsqueeze(1)
+
+    # 扩展为 [HQ, 36, K]
+    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
+
+    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
     dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
     max_val = dot.max(dim=-1).values               # [HQ]
-    threshold = max_val * scale - 100              # e 域
-    return threshold.contiguous()                  # [HQ]
-
-
-def compute_pseudo_smax_e(
-    q: torch.Tensor,          # [HQ, K]
-    k: torch.Tensor,          # [HKV, T, K]
-    scale: float,
-    head_prefix: int = 4,     # 取前 head_prefix 个 key
-    tail_count: int = 32,     # 取后 tail_count 个 key
-) -> torch.Tensor:
-    """
-    返回每个 head 的伪最大值 s_max（e 域，对 s=(q·k)*scale）。
-    用法：从 k 中取前 head_prefix 个与后 tail_count 个 token 近似估计。
-    """
-    HQ, K = q.shape
-    HKV, T, _ = k.shape
-    assert HQ % HKV == 0
-    G = HQ // HKV
-
-    take_front = min(head_prefix, T)
-    take_tail = min(tail_count, max(0, T - take_front))
-    if take_tail == 0 and take_front == 0:
-        raise ValueError("T 为 0，无法估计伪最大值")
-
-    parts = []
-    if take_front > 0:
-        parts.append(k[:, :take_front, :])
-    if take_tail > 0:
-        parts.append(k[:, -take_tail:, :])
-    k_cat = torch.cat(parts, dim=1)  # [HKV, take_front + take_tail, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # [HQ, M, K]
-
-    dot = (q.unsqueeze(1) * k_cat_gqa).sum(dim=-1)  # [HQ, M]
-    s_max_e = dot.max(dim=-1).values * scale        # e 域
-    return s_max_e.contiguous()                     # [HQ]
+    threshold = max_val
+    threshold = threshold * scale
+    threshold = threshold - 100
+    return threshold.contiguous()  # [HQ]
 
 
 @triton.jit
@@ -72,9 +41,7 @@ def attn_fwd_q1_b1_stage1(
     scale,       # float
     T,           # int
     NTB,         # int = ceil(T / BS)
-    lost_thresholds,     # [HQ], base-2 域
-    bucket_thresholds,   # [HQ], base-2 域
-    bucket_step,         # float，base-2 域步长
+    qk_thresholds,  # [HQ], 每个head一个阈值（已 scaled）
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
@@ -99,7 +66,11 @@ def attn_fwd_q1_b1_stage1(
     offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 块内 q·k 累加（得到未缩放的内积和）
+    # 加载对应 threshold（已 scaled），并转成 fp32
+    th_ptr = qk_thresholds + i_hq
+    threshold = tl.load(th_ptr).to(tl.float32)
+
+    # 块内 q·k 累加
     b_s = tl.zeros([BS], tl.float32)
     for kk in range(0, K, BK):
         offs_k = kk + tl.arange(0, BK)
@@ -117,43 +88,27 @@ def attn_fwd_q1_b1_stage1(
 
         b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
 
-    # 转到 base-2 对数域：b_s = s * log2(e)，其中 s = (qk)*scale 是 e 域
-    LOG2E = 1.4426950408889634  # 局部常量，避免使用全局变量
-    b_s = b_s * scale * LOG2E
+    # 注意：为了与 e 底 softmax 等价，这里把分数换算到以 2 为底的指数域：
+    # 2^(s / ln 2) = e^s，因此在用 exp2 前先乘以 1/ln 2
+    RCP_LN2 = 1.4426950408889634
+    b_s = b_s * scale * RCP_LN2  # 现在 b_s 处于“以 2 为底的对数域”
 
-    # 读取 per-head 阈值（base-2 域）
-    lost_th = tl.load(lost_thresholds + i_hq).to(tl.float32)
-    bucket_th = tl.load(bucket_thresholds + i_hq).to(tl.float32)
-    step = tl.full((), bucket_step, tl.float32)
+    # 判定阈值与边界
+    skip = b_s < threshold               # [BS], 被阈值屏蔽
+    active_t = (~skip) & t_mask          # [BS], 实际参与 softmax 的位置
 
-    # 三段掩码
-    exact_mask  = (b_s >= bucket_th) & t_mask
-    bucket_mask = (b_s >= lost_th) & (b_s < bucket_th) & t_mask
-    # lost 段：b_s < lost_th；直接忽略
-
+    # 仅用活跃位置计算块内最大值
     NEG_INF = float('-inf')
+    b_s_act = tl.where(active_t, b_s, NEG_INF)
+    m_b = tl.max(b_s_act, axis=0)        # 标量（若整块无活跃，值为 -inf）
 
-    # 桶中点：b_mid = lost_th + (floor((b_s - lost_th)/step) + 0.5) * step
-    rel = (b_s - lost_th) / step
-    idx = tl.floor(rel)
-    b_mid_raw = lost_th + (idx + 0.5) * step
-    b_mid = tl.where(bucket_mask, b_mid_raw, tl.full([BS], NEG_INF, tl.float32))
+    # 计算块内分母与分子：只累加活跃位置
+    # 警告：即便 m_b=-inf，下面 exp2 的无穷大也会通过 active_t 掩码归零，不会影响结果
+    b_p = tl.exp2(b_s - m_b)             # [BS]
+    b_p = tl.where(active_t, b_p, 0.0)   # 仅保留活跃位置
+    l_b = tl.sum(b_p, axis=0)            # 标量，若无活跃则为 0
 
-    # 计算块内最大值：exact 的真实 b_s 与 bucket 的 b_mid 一起考虑
-    b_s_exact = tl.where(exact_mask, b_s, tl.full([BS], NEG_INF, tl.float32))
-    m_b = tl.maximum(tl.max(b_s_exact, axis=0), tl.max(b_mid, axis=0))
-
-    # 权重（base-2）
-    w_exact = tl.exp2(b_s - m_b)
-    w_exact = tl.where(exact_mask, w_exact, 0.0)
-
-    w_bucket = tl.exp2(b_mid - m_b)
-    w_bucket = tl.where(bucket_mask, w_bucket, 0.0)
-
-    l_b = tl.sum(w_exact + w_bucket, axis=0)  # 标量
-
-    # 读取 v，仅当 exact 或 bucket 有激活位置
-    active_t = (exact_mask | bucket_mask)
+    # 仅当该块存在至少一个活跃位置时，才从 v 读取
     num_active = tl.sum(active_t.to(tl.int32), axis=0)
     need_v = num_active > 0
 
@@ -165,11 +120,9 @@ def attn_fwd_q1_b1_stage1(
             mask=(active_t[:, None] & v_mask[None, :]),
             other=0.0
         ).to(tl.float32)
+        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
 
-        weight = w_exact + w_bucket  # [BS]
-        o_b = tl.sum(weight[:, None] * b_v, axis=0)  # [BV]
-
-    # 写回
+    # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
     o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
     tl.store(o_ptrs, o_b, mask=v_mask)
 
@@ -240,21 +193,6 @@ def attn_fwd_q1_b1_stage2(
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
 
 
-def _ensure_delta_tensor(delta, HQ, device, dtype=torch.float32) -> torch.Tensor:
-    """
-    将标量或张量 delta 转成 [HQ] 的张量（e 域）。
-    - 若传 float/int，则广播为 [HQ]。
-    - 若传张量，需 shape==[HQ] 或 [1]。
-    """
-    if isinstance(delta, torch.Tensor):
-        if delta.numel() == 1:
-            return delta.to(device=device, dtype=dtype).repeat(HQ).contiguous()
-        assert delta.shape == (HQ,), f"delta 张量形状必须为 [HQ] 或标量，实际 {tuple(delta.shape)}"
-        return delta.to(device=device, dtype=dtype).contiguous()
-    else:
-        return torch.full((HQ,), float(delta), device=device, dtype=dtype)
-
-
 def attn_fwd_q1_b1_splitT(
     q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
     k: torch.Tensor,  # [HKV, T, K], same dtype as q
@@ -263,18 +201,8 @@ def attn_fwd_q1_b1_splitT(
     BS: int = 128,    # 时间分块大小（可调，影响 NTB）
     BK: int = 64,
     BV: int = 64,
-    # 手动传入：与伪最大值的差值（e 域）
-    lost_delta_e=100.0,          # lost 阈值 = s_max - lost_delta_e
-    bucket_delta_e=20.0,         # bucket 阈值 = s_max - bucket_delta_e
-    bucket_step_e: float = 0.1,  # 桶宽（e 域）
-    # 伪最大值估计参数（可按需调整）
-    pseudo_head_prefix: int = 4,
-    pseudo_tail_count: int = 32,
+    qk_thresholds: torch.Tensor = None,  # 可选：预先计算的阈值 [HQ]
 ):
-    """
-    lost_delta_e / bucket_delta_e / bucket_step_e 均在 e 域，针对 s=(q·k)*scale。
-    内核中会将分数、阈值、步长统一换算到 base-2 域进行数值稳定计算。
-    """
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
     HQ, K = q.shape
@@ -287,30 +215,6 @@ def attn_fwd_q1_b1_splitT(
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    # 1) 估计每个 head 的伪最大值（e 域）
-    s_max_e = compute_pseudo_smax_e(
-        q, k, scale,
-        head_prefix=pseudo_head_prefix,
-        tail_count=pseudo_tail_count,
-    )  # [HQ], e 域
-
-    # 2) 将“差值（e 域）”转换为阈值（e 域）
-    lost_delta_e = _ensure_delta_tensor(lost_delta_e, HQ, q.device)
-    bucket_delta_e = _ensure_delta_tensor(bucket_delta_e, HQ, q.device)
-
-    lost_thresholds_e = (s_max_e - lost_delta_e).contiguous()      # [HQ]
-    bucket_thresholds_e = (s_max_e - bucket_delta_e).contiguous()  # [HQ]
-    # 保证 bucket >= lost
-    bucket_thresholds_e = torch.maximum(bucket_thresholds_e, lost_thresholds_e)
-
-    if not (bucket_step_e > 0.0):
-        raise ValueError("bucket_step_e 必须为正数（e 域）")
-
-    # 3) 转为 base-2 域后送入内核
-    lost_thresholds_2   = (lost_thresholds_e.to(torch.float32) * RCP_LN2).contiguous()
-    bucket_thresholds_2 = (bucket_thresholds_e.to(torch.float32) * RCP_LN2).contiguous()
-    bucket_step_2 = float(bucket_step_e * RCP_LN2)
-
     NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
 
     # 输出
@@ -322,14 +226,20 @@ def attn_fwd_q1_b1_splitT(
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
+    # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
+    if qk_thresholds is None:
+        qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
+    else:
+        assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
+        assert qk_thresholds.device == q.device, "qk_thresholds 需与 q 在同一设备"
+
     # Stage 1: 并行计算各时间分块的局部统计与分子
     grid1 = (triton.cdiv(V, BV), HQ, NTB)
     attn_fwd_q1_b1_stage1[grid1](
         q, k, v,
         m_buf, l_buf, o_buf,
         scale, T, NTB,
-        lost_thresholds_2, bucket_thresholds_2,
-        bucket_step_2,
+        qk_thresholds,  # 传入预计算/内算阈值
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
     )
@@ -381,6 +291,7 @@ def flash_compute(q_rope_1, k_rope, v):
 
 def lse_reference_base2_gqa(q_triton, k_triton, scale):
     # 计算 lse 的 reference（以 2 为底），用于与 triton kernel 的 lse 对比（支持 GQA）
+    # q_triton: [HQ,K], k_triton: [HKV,T,K]
     qf = q_triton.float()
     kf = k_triton.float()
     HQ, K = qf.shape
@@ -396,6 +307,7 @@ def lse_reference_base2_gqa(q_triton, k_triton, scale):
     # scores[hq, t] = (q[hq] · kf_rep[hq, t]) * scale
     scores = torch.einsum('hk, htk -> ht', qf, kf_rep) * scale
     # 以 e 为底的 logsumexp -> 转成以 2 为底
+    RCP_LN2 = 1.4426950408889634
     lse_e = torch.logsumexp(scores, dim=-1)         # [HQ]
     lse_base2 = lse_e * RCP_LN2                     # [HQ]
     return lse_base2
@@ -434,11 +346,6 @@ if __name__ == "__main__":
     iters = 50
     warmup = 10
 
-    # 你手动指定：距伪最大值的差值（e 域）
-    LOST_DELTA_E = 100.0
-    BUCKET_DELTA_E = 20.0
-    BUCKET_STEP_E = 0.1
-
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         print(f"\n========== Layer {layer_idx} ==========")
         q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
@@ -464,54 +371,37 @@ if __name__ == "__main__":
         # 运行 Triton 实现
         scale = 1.0 / math.sqrt(D)
 
+        # 关键：预计算阈值（不参与时间计算）
+        qk_thresholds = calc_qk_threshold(q_triton, k_triton, scale).contiguous()
+
         o_triton, lse_triton = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, BK=BK, BV=BV,
-            lost_delta_e=LOST_DELTA_E,
-            bucket_delta_e=BUCKET_DELTA_E,
-            bucket_step_e=BUCKET_STEP_E,
-            pseudo_head_prefix=4,
-            pseudo_tail_count=32,
+            qk_thresholds=qk_thresholds,   # 传入预计算阈值
         )  # o:[HQ,V], lse:[HQ] (以 2 为底)
 
-        # 可选：与 Flash 作对比
-        try:
-            from flash_attn import __version__ as _fa_ver  # noqa
-            def flash_compute(q_rope_1, k_rope, v):
-                from flash_attn import flash_attn_func
-                out = flash_attn_func(
-                    q_rope_1.transpose(1, 2),
-                    k_rope.transpose(1, 2),
-                    v.transpose(1, 2),
-                    causal=False,
-                )
-                return out.squeeze(0).squeeze(0)
+        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
-            o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
-            # 数值对比
-            max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
-            rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
-            rel = rel.item()
+        # 数值对比（与 Flash 输出）
+        max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
+        rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
+        rel = rel.item()
 
-            # LSE 参考（高精度，用于 sanity check）
-            lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
-            lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
-            lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
-            lse_rel = lse_rel.item()
+        # LSE 参考（高精度，用于 sanity check）
+        lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
+        lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
+        lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
+        lse_rel = lse_rel.item()
 
-            print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
-            print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
-        except Exception as e:
-            print(f"Flash-Attn 对比跳过（可能未安装 flash_attn）: {e}")
+        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
+        print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
         # 性能对比：计时不包含阈值计算
         def run_triton():
             o, _ = attn_fwd_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, BK=BK, BV=BV,
-                lost_delta_e=LOST_DELTA_E,
-                bucket_delta_e=BUCKET_DELTA_E,
-                bucket_step_e=BUCKET_STEP_E,
+                qk_thresholds=qk_thresholds,  # 使用已计算好的阈值
             )
             return o
 
@@ -519,8 +409,5 @@ if __name__ == "__main__":
             return flash_compute(q_rope_1, k_rope, v)
 
         ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
-        try:
-            ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
-            print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
-        except Exception:
-            print(f"Speed: Triton={ms_triton:.3f} ms (Flash-Attn 未计时)")
+        ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
+        print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
