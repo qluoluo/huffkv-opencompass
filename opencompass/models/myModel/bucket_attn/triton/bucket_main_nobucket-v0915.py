@@ -26,7 +26,7 @@ def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
     max_val = dot.max(dim=-1).values               # [HQ]
     threshold = max_val
     threshold = threshold * scale
-    threshold = threshold - 5
+    threshold = threshold - 10
     return threshold.contiguous()  # [HQ]
 
 
@@ -70,23 +70,53 @@ def attn_fwd_q1_b1_stage1(
     th_ptr = qk_thresholds + i_hq
     threshold = tl.load(th_ptr).to(tl.float32)
 
-    # 块内 q·k 累加
+    # 块内 q·k 累加（使用 block_ptr + tl.dot）
     b_s = tl.zeros([BS], tl.float32)
+
+    # Q 的 block_ptr：将每个 head 的 q 视为 [1, K]，沿着 K 维分块
+    q_base = q + i_hq * K
+    q_mat_shape = (1, K)
+    q_mat_strides = (K, 1)
+
+    # K 的 block_ptr：将 k 视为 [K, T] 的 2D 视图（固定 head），按 [BK, BS] 分块
+    k_base = k + i_h * T * K + s0 * K
+    # 这里取一个 2D 视图：行=K，列=BS（位于原张量 T 维的一段），行步长=1，列步长=K
+    k_mat_shape = (K, BS)
+    k_mat_strides = (1, K)
+
     for kk in range(0, K, BK):
-        offs_k = kk + tl.arange(0, BK)
-        k_mask = offs_k < K
+        # Q tile: [1, BK]
+        q_bp = tl.make_block_ptr(
+            base=q_base,
+            shape=q_mat_shape,
+            strides=q_mat_strides,
+            offsets=(0, kk),
+            block_shape=(16, BK),
+            order=(1, 0),
+        )
+        q_tile = tl.load(
+            q_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [1, BK]
 
-        q_ptrs = q + i_hq * K + offs_k
-        q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        # K tile: [BK, BS]
+        k_bp = tl.make_block_ptr(
+            base=k_base,
+            shape=k_mat_shape,
+            strides=k_mat_strides,
+            offsets=(kk, 0),
+            block_shape=(BK, BS),
+            order=(1, 0),
+        )
+        k_tile = tl.load(
+            k_bp,
+            boundary_check=(0, 1),  # K 维和 T(切片) 维都做边界检查
+            padding_option="zero",
+        ).to(tl.float32)  # [BK, BS]
 
-        k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
-        k_chunk = tl.load(
-            k_ptrs,
-            mask=(k_mask[:, None] & t_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
-
-        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
+        # b_s += q_tile @ k_tile  -> [1, BS]，随后压到 [BS]
+        b_s += tl.dot(q_tile, k_tile, out_dtype=tl.float32)[0, :]
 
     # 注意：为了与 e 底 softmax 等价，这里把分数换算到以 2 为底的指数域：
     # 2^(s / ln 2) = e^s，因此在用 exp2 前先乘以 1/ln 2
@@ -104,8 +134,13 @@ def attn_fwd_q1_b1_stage1(
 
     # 计算块内分母与分子：只累加活跃位置
     # 警告：即便 m_b=-inf，下面 exp2 的无穷大也会通过 active_t 掩码归零，不会影响结果
-    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)
-    l_b = tl.sum(b_p, axis=0)            # 标量，若无活跃则为 0
+    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)  # [BS]
+
+    # 使用 tl.dot 来求和分母 l_b
+    # l_b = sum_j b_p[j]
+    b_p_row = tl.reshape(b_p, (1, BS))               # [1, BS]
+    ones_col = tl.full((BS, 1), 1.0, tl.float32)     # [BS, 1]
+    l_b = tl.dot(b_p_row, ones_col, out_dtype=tl.float32)[0, 0]  # 标量
 
     # 仅当该块存在至少一个活跃位置时，才从 v 读取
     num_active = tl.sum(active_t.to(tl.int32), axis=0)
@@ -113,17 +148,47 @@ def attn_fwd_q1_b1_stage1(
 
     o_b = tl.zeros([BV], tl.float32)
     if need_v:
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
+        # V 的 block_ptr：将 v 视为 [BS, V]（沿时间分块行、V 列），再按 [BS, BV] 取块
+        v_base = v + s0 * (HKV * V) + i_h * V
+        v_mat_shape = (BS, V)
+        v_mat_strides = (HKV * V, 1)
+        v_bp = tl.make_block_ptr(
+            base=v_base,
+            shape=v_mat_shape,
+            strides=v_mat_strides,
+            offsets=(0, pid_v * BV),
+            block_shape=(BS, BV),
+            order=(1, 0),
+        )
         b_v = tl.load(
-            v_ptrs,
-            mask=(active_t[:, None] & v_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
-        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
+            v_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [BS, BV]
+
+        # 仅活跃时间步参与：对不活跃位置清零
+        b_v = tl.where(active_t[:, None], b_v, 0.0)
+
+        # 使用 tl.dot 代替 sum：o_b = b_p^T @ b_v -> [1, BV]
+        o_tile = tl.dot(b_p_row, b_v, out_dtype=tl.float32)  # [1, BV]
+        o_b = o_tile[0, :]  # [BV]
 
     # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
-    o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
-    tl.store(o_ptrs, o_b, mask=v_mask)
+    # 用 block_ptr 存回 [1, BV] tile
+    o_base = o_buf + i_hq * (NTB * V) + pid_tb * V
+    o_bp = tl.make_block_ptr(
+        base=o_base,
+        shape=(1, V),
+        strides=(V, 1),
+        offsets=(0, pid_v * BV),
+        block_shape=(1, BV),
+        order=(1, 0),
+    )
+    tl.store(
+        o_bp,
+        tl.reshape(o_b, (1, BV)),
+        boundary_check=(0, 1),
+    )
 
     if pid_v == 0:
         tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
@@ -146,9 +211,6 @@ def attn_fwd_q1_b1_stage2(
     pid_v = tl.program_id(0)
     pid_hq = tl.program_id(1)
 
-    v_offs = pid_v * BV + tl.arange(0, BV)
-    v_mask = v_offs < V
-
     # 在线合并 across tb（base-2 域）
     b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
     b_acc = tl.zeros((), tl.float32)              # 当前全局分母
@@ -163,12 +225,22 @@ def attn_fwd_q1_b1_stage2(
         # 是否为非空块（有贡献）
         has = l_b > 0.0
 
-        # 只在 has=True 时读分子；否则用 0
-        o_b = tl.load(
-            o_buf + pid_hq * (NTB * V) + tb * V + v_offs,
-            mask=(v_mask & has),
-            other=0.0
+        # 读取该块的分子向量 o_b: [1, BV] tile via block_ptr
+        o_base = o_buf + pid_hq * (NTB * V) + tb * V
+        o_bp = tl.make_block_ptr(
+            base=o_base,
+            shape=(1, V),
+            strides=(V, 1),
+            offsets=(0, pid_v * BV),
+            block_shape=(1, BV),
+            order=(1, 0),
         )
+        o_b_tile = tl.load(
+            o_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [1, BV]
+        o_b = o_b_tile[0, :]  # [BV]
 
         # 对空块将 m_b 视为 -inf，使其对全局缩放“无操作”
         m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
@@ -187,9 +259,21 @@ def attn_fwd_q1_b1_stage2(
         lse_val = b_m + tl.log2(b_acc)
         tl.store(lse + pid_hq, lse_val)
 
-    # 写回输出
-    o_ptrs = o + pid_hq * V + v_offs
-    tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
+    # 写回输出（使用 block_ptr 保存 [1, BV]）
+    o_base = o + pid_hq * V
+    o_bp = tl.make_block_ptr(
+        base=o_base,
+        shape=(1, V),
+        strides=(V, 1),
+        offsets=(0, pid_v * BV),
+        block_shape=(1, BV),
+        order=(1, 0),
+    )
+    tl.store(
+        o_bp,
+        tl.reshape(out_tile, (1, BV)).to(o_base.dtype.element_ty),
+        boundary_check=(0, 1),
+    )
 
 
 def attn_fwd_q1_b1_splitT(
@@ -227,6 +311,9 @@ def attn_fwd_q1_b1_splitT(
 
     # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
     if qk_thresholds is None:
+        # 请确保提供 calc_qk_threshold，或在外部传入 qk_thresholds
+        # 这里假定存在该函数
+        from your_module import calc_qk_threshold  # 用户需自行实现/导入
         qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
     else:
         assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
@@ -241,7 +328,7 @@ def attn_fwd_q1_b1_splitT(
         qk_thresholds,  # 传入预计算/内算阈值
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
-        # num_warps=4,    # 在这里调
+        # num_warps=4,
         # num_stages=3,
     )
 
@@ -251,7 +338,7 @@ def attn_fwd_q1_b1_splitT(
         m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
-        # num_warps=4,    # 在这里调
+        # num_warps=4,
         # num_stages=3,
     )
     return o, lse

@@ -26,7 +26,7 @@ def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
     max_val = dot.max(dim=-1).values               # [HQ]
     threshold = max_val
     threshold = threshold * scale
-    threshold = threshold - 100
+    threshold = threshold - 10
     return threshold.contiguous()  # [HQ]
 
 
@@ -35,6 +35,7 @@ def attn_fwd_q1_b1_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
+    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V]
     scale,       # float
@@ -69,35 +70,77 @@ def attn_fwd_q1_b1_stage1(
     th_ptr = qk_thresholds + i_hq
     threshold = tl.load(th_ptr).to(tl.float32)
 
-    # 块内 q·k 累加
+    # 块内 q·k 累加（使用 block_ptr + tl.dot）
     b_s = tl.zeros([BS], tl.float32)
+
+    # Q 的 block_ptr：将每个 head 的 q 视为 [1, K]，沿着 K 维分块
+    q_base = q + i_hq * K
+    q_mat_shape = (1, K)
+    q_mat_strides = (K, 1)
+
+    # K 的 block_ptr：将 k 视为 [K, T] 的 2D 视图（固定 head），按 [BK, BS] 分块
+    k_base = k + i_h * T * K + s0 * K
+    # 这里取一个 2D 视图：行=K，列=BS（位于原张量 T 维的一段），行步长=1，列步长=K
+    k_mat_shape = (K, BS)
+    k_mat_strides = (1, K)
+
     for kk in range(0, K, BK):
-        offs_k = kk + tl.arange(0, BK)
-        k_mask = offs_k < K
+        # Q tile: [1, BK]
+        q_bp = tl.make_block_ptr(
+            base=q_base,
+            shape=q_mat_shape,
+            strides=q_mat_strides,
+            offsets=(0, kk),
+            block_shape=(1, BK),
+            order=(1, 0),
+        )
+        q_tile = tl.load(
+            q_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [1, BK]
 
-        q_ptrs = q + i_hq * K + offs_k
-        q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        # K tile: [BK, BS]
+        k_bp = tl.make_block_ptr(
+            base=k_base,
+            shape=k_mat_shape,
+            strides=k_mat_strides,
+            offsets=(kk, 0),
+            block_shape=(BK, BS),
+            order=(1, 0),
+        )
+        k_tile = tl.load(
+            k_bp,
+            boundary_check=(0, 1),  # K 维和 T(切片) 维都做边界检查
+            padding_option="zero",
+        ).to(tl.float32)  # [BK, BS]
 
-        k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
-        k_chunk = tl.load(
-            k_ptrs,
-            mask=(k_mask[:, None] & t_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
+        # b_s += q_tile @ k_tile  -> [1, BS]，随后压到 [BS]
+        b_s += tl.dot(q_tile, k_tile, out_dtype=tl.float32)[0, :]
 
-        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
-
-    # 换算到以 2 为底的指数域
+    # 注意：为了与 e 底 softmax 等价，这里把分数换算到以 2 为底的指数域：
+    # 2^(s / ln 2) = e^s，因此在用 exp2 前先乘以 1/ln 2
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2  # base-2 对数域
+    b_s = b_s * scale * RCP_LN2  # 现在 b_s 处于“以 2 为底的对数域”
 
-    # 阈值与活跃位置
-    skip = b_s < threshold               # [BS]
-    active_t = (~skip) & t_mask          # [BS]
+    # 判定阈值与边界
+    skip = b_s < threshold               # [BS], 被阈值屏蔽
+    active_t = (~skip) & t_mask          # [BS], 实际参与 softmax 的位置
 
-    # 直接对 b_s 做 exp2（不再减去 m_b）
-    b_p = tl.where(active_t, tl.exp2(b_s), 0.0)
-    l_b = tl.sum(b_p, axis=0)            # 标量
+    # 仅用活跃位置计算块内最大值
+    NEG_INF = float('-inf')
+    b_s_act = tl.where(active_t, b_s, NEG_INF)
+    m_b = tl.max(b_s_act, axis=0)        # 标量（若整块无活跃，值为 -inf）
+
+    # 计算块内分母与分子：只累加活跃位置
+    # 警告：即便 m_b=-inf，下面 exp2 的无穷大也会通过 active_t 掩码归零，不会影响结果
+    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)  # [BS]
+
+    # 使用 tl.dot 来求和分母 l_b
+    # l_b = sum_j b_p[j]
+    b_p_row = tl.reshape(b_p, (1, BS))               # [1, BS]
+    ones_col = tl.full((BS, 1), 1.0, tl.float32)     # [BS, 1]
+    l_b = tl.dot(b_p_row, ones_col, out_dtype=tl.float32)[0, 0]  # 标量
 
     # 仅当该块存在至少一个活跃位置时，才从 v 读取
     num_active = tl.sum(active_t.to(tl.int32), axis=0)
@@ -105,24 +148,56 @@ def attn_fwd_q1_b1_stage1(
 
     o_b = tl.zeros([BV], tl.float32)
     if need_v:
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
+        # V 的 block_ptr：将 v 视为 [BS, V]（沿时间分块行、V 列），再按 [BS, BV] 取块
+        v_base = v + s0 * (HKV * V) + i_h * V
+        v_mat_shape = (BS, V)
+        v_mat_strides = (HKV * V, 1)
+        v_bp = tl.make_block_ptr(
+            base=v_base,
+            shape=v_mat_shape,
+            strides=v_mat_strides,
+            offsets=(0, pid_v * BV),
+            block_shape=(BS, BV),
+            order=(1, 0),
+        )
         b_v = tl.load(
-            v_ptrs,
-            mask=(active_t[:, None] & v_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
-        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
+            v_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [BS, BV]
 
-    # 写回块级分子（o_buf）与分母（l_buf）
-    o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
-    tl.store(o_ptrs, o_b, mask=v_mask)
+        # 仅活跃时间步参与：对不活跃位置清零
+        b_v = tl.where(active_t[:, None], b_v, 0.0)
+
+        # 使用 tl.dot 代替 sum：o_b = b_p^T @ b_v -> [1, BV]
+        o_tile = tl.dot(b_p_row, b_v, out_dtype=tl.float32)  # [1, BV]
+        o_b = o_tile[0, :]  # [BV]
+
+    # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
+    # 用 block_ptr 存回 [1, BV] tile
+    o_base = o_buf + i_hq * (NTB * V) + pid_tb * V
+    o_bp = tl.make_block_ptr(
+        base=o_base,
+        shape=(1, V),
+        strides=(V, 1),
+        offsets=(0, pid_v * BV),
+        block_shape=(1, BV),
+        order=(1, 0),
+    )
+    tl.store(
+        o_bp,
+        tl.reshape(o_b, (1, BV)),
+        boundary_check=(0, 1),
+    )
 
     if pid_v == 0:
+        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
         tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
 
 
 @triton.jit
 def attn_fwd_q1_b1_stage2(
+    m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V], fp32
     o,           # [HQ, V], out dtype = q.dtype
@@ -136,37 +211,69 @@ def attn_fwd_q1_b1_stage2(
     pid_v = tl.program_id(0)
     pid_hq = tl.program_id(1)
 
-    v_offs = pid_v * BV + tl.arange(0, BV)
-    v_mask = v_offs < V
+    # 在线合并 across tb（base-2 域）
+    b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
+    b_acc = tl.zeros((), tl.float32)              # 当前全局分母
+    b_o = tl.zeros([BV], tl.float32)              # 当前全局分子向量
 
-    # 直接跨 tb 累加分母与分子（不做稳定对齐）
-    b_acc = tl.zeros((), tl.float32)      # 全局分母
-    b_o = tl.zeros([BV], tl.float32)      # 全局分子向量
-
+    # 沿 tb 做稳定合并
     for tb in range(0, NTB):
+        # 读取该块的统计量
+        m_b = tl.load(m_buf + pid_hq * NTB + tb)
         l_b = tl.load(l_buf + pid_hq * NTB + tb)
+
+        # 是否为非空块（有贡献）
         has = l_b > 0.0
 
-        o_b = tl.load(
-            o_buf + pid_hq * (NTB * V) + tb * V + v_offs,
-            mask=(v_mask & has),
-            other=0.0
+        # 读取该块的分子向量 o_b: [1, BV] tile via block_ptr
+        o_base = o_buf + pid_hq * (NTB * V) + tb * V
+        o_bp = tl.make_block_ptr(
+            base=o_base,
+            shape=(1, V),
+            strides=(V, 1),
+            offsets=(0, pid_v * BV),
+            block_shape=(1, BV),
+            order=(1, 0),
         )
+        o_b_tile = tl.load(
+            o_bp,
+            boundary_check=(0, 1),
+            padding_option="zero",
+        ).to(tl.float32)  # [1, BV]
+        o_b = o_b_tile[0, :]  # [BV]
 
-        b_acc = b_acc + tl.where(has, l_b, 0.0)
-        b_o   = b_o   + o_b
+        # 对空块将 m_b 视为 -inf，使其对全局缩放“无操作”
+        m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
 
-    # 归一化；若分母为 0，则输出 0，并将 lse 置为 -inf
-    has_any = b_acc > 0.0
-    out_tile = tl.where(has_any, b_o / b_acc, 0.0)
+        new_m = tl.maximum(b_m, m_b_eff)
+        r_prev = tl.exp2(b_m - new_m)
+        r_blk  = tl.where(has, tl.exp2(m_b - new_m), 0.0)
 
+        b_acc = b_acc * r_prev + l_b * r_blk
+        b_o   = b_o   * r_prev + o_b * r_blk
+        b_m   = new_m
+
+    # 归一化与 lse（base-2）
+    out_tile = b_o / b_acc
     if pid_v == 0:
-        NEG_INF = float('-inf')
-        lse_val = tl.where(has_any, tl.log2(b_acc), tl.full((), NEG_INF, tl.float32))
+        lse_val = b_m + tl.log2(b_acc)
         tl.store(lse + pid_hq, lse_val)
 
-    o_ptrs = o + pid_hq * V + v_offs
-    tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
+    # 写回输出（使用 block_ptr 保存 [1, BV]）
+    o_base = o + pid_hq * V
+    o_bp = tl.make_block_ptr(
+        base=o_base,
+        shape=(1, V),
+        strides=(V, 1),
+        offsets=(0, pid_v * BV),
+        block_shape=(1, BV),
+        order=(1, 0),
+    )
+    tl.store(
+        o_bp,
+        tl.reshape(out_tile, (1, BV)).to(o_base.dtype.element_ty),
+        boundary_check=(0, 1),
+    )
 
 
 def attn_fwd_q1_b1_splitT(
@@ -198,34 +305,41 @@ def attn_fwd_q1_b1_splitT(
     lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
     # 中间缓冲（stage1 -> stage2）
-    # 去除 m_buf，仅保留 l_buf 与 o_buf
+    m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # 阈值
+    # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
     if qk_thresholds is None:
+        # 请确保提供 calc_qk_threshold，或在外部传入 qk_thresholds
+        # 这里假定存在该函数
+        from your_module import calc_qk_threshold  # 用户需自行实现/导入
         qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
     else:
         assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
         assert qk_thresholds.device == q.device, "qk_thresholds 需与 q 在同一设备"
 
-    # Stage 1: 并行计算各时间分块的“非稳定”分子与分母
+    # Stage 1: 并行计算各时间分块的局部统计与分子
     grid1 = (triton.cdiv(V, BV), HQ, NTB)
     attn_fwd_q1_b1_stage1[grid1](
         q, k, v,
-        l_buf, o_buf,
+        m_buf, l_buf, o_buf,
         scale, T, NTB,
-        qk_thresholds,
+        qk_thresholds,  # 传入预计算/内算阈值
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
+        # num_warps=4,
+        # num_stages=3,
     )
 
-    # Stage 2: 跨时间分块直接求和 + 归一化（非稳定）
+    # Stage 2: 跨时间分块做稳定合并 + 归一化
     grid2 = (triton.cdiv(V, BV), HQ)
     attn_fwd_q1_b1_stage2[grid2](
-        l_buf, o_buf,
+        m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
+        # num_warps=4,
+        # num_stages=3,
     )
     return o, lse
 
@@ -341,6 +455,8 @@ if __name__ == "__main__":
         assert T == Tv
         assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
 
+        print(f"{T=}")
+
         # 准备给 Triton 内核的布局（支持 GQA）
         q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
 
@@ -360,6 +476,7 @@ if __name__ == "__main__":
 
         # 数值对比（与 Flash 输出）
         max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
+        mean_abs = (o_triton.float() - o_flash.float()).abs().mean().item()
         rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
         rel = rel.item()
 
@@ -369,7 +486,7 @@ if __name__ == "__main__":
         lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
         lse_rel = lse_rel.item()
 
-        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, rel={rel:.3e}")
+        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
         print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
         # 性能对比：计时不包含阈值计算
