@@ -3,9 +3,135 @@ import os
 from tqdm import tqdm
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 4}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_warps=4, num_stages=5),
+    ],
+    key=['M', 'N', 'K'],
+)
+@triton.jit
+def fp16_u8hi_matmul_kernel(
+    A_ptr, B8_ptr, C_ptr,
+    M, N, K,
+    stride_am, stride_ak,   # A[m, k] = A_ptr + m*stride_am + k*stride_ak
+    stride_bk, stride_bn,   # B8[k, n] = B8_ptr + k*stride_bk + n*stride_bn
+    stride_cm, stride_cn,   # C[m, n] = C_ptr + m*stride_cm + n*stride_cn
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    # persistent tiling: group along M to reuse A tiles across many N tiles
+    group_size = GROUP_M * num_pid_n
+    group_id = pid // group_size
+    first_pid_m = group_id * GROUP_M
+    pid_in_group = pid % group_size
+    pid_m = first_pid_m + (pid_in_group % GROUP_M)
+    pid_n = pid_in_group // GROUP_M
+
+    # guard: some programs may fall outside
+    if pid_m >= num_pid_m or pid_n >= num_pid_n:
+        return
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rk = tl.arange(0, BLOCK_K)
+
+    A_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak
+    B_ptrs = B8_ptr + rk[:, None] * stride_bk + rn[None, :] * stride_bn
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # hint for better codegen / tensor cores
+    tl.multiple_of(rk, 16)
+    tl.multiple_of(rm, 16)
+    tl.multiple_of(rn, 16)
+
+    for k0 in range(0, K, BLOCK_K):
+        k_mask_row = (k0 + rk) < K
+        # load A tile (fp16)
+        a = tl.load(
+            A_ptrs,
+            mask=(rm[:, None] < M) & k_mask_row[None, :],
+            other=0.0,
+            eviction_policy='evict_last'  # try to keep A around
+        )
+
+        # load B8 tile (uint8), then widen/shift/bitcast to fp16 on the fly
+        b8 = tl.load(
+            B_ptrs,
+            mask=k_mask_row[:, None] & (rn[None, :] < N),
+            other=0,
+            eviction_policy='evict_first'  # B 通常更“流”
+        )
+        b16 = b8.to(tl.uint16) << 8
+        b = tl.cast(b16, tl.float16)  # reinterpret as fp16, no numeric convert
+
+        # tensor-core friendly dot; acc in fp32
+        acc += tl.dot(a, b, out_dtype=tl.float32)
+
+        # advance
+        A_ptrs += BLOCK_K * stride_ak
+        B_ptrs += BLOCK_K * stride_bk
+
+    # store
+    C_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(C_ptrs, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
+
+def fp16_u8hi_matmul(A_fp16: torch.Tensor, B_hi_u8: torch.Tensor) -> torch.Tensor:
+    # A: [M, K] fp16, B_hi_u8: [K, N] uint8, return C: [M, N] fp32
+    assert A_fp16.dtype == torch.float16 and B_hi_u8.dtype == torch.uint8
+    assert A_fp16.is_cuda and B_hi_u8.is_cuda and A_fp16.device == B_hi_u8.device
+    assert A_fp16.shape[1] == B_hi_u8.shape[0]
+    M, K = A_fp16.shape
+    K2, N = B_hi_u8.shape
+    C = torch.empty((M, N), device=A_fp16.device, dtype=torch.float32)
+
+    # strides in elements
+    stride_am, stride_ak = A_fp16.stride()
+    stride_bk, stride_bn = B_hi_u8.stride()
+    stride_cm, stride_cn = C.stride()
+
+    # launch grid: number of program instances
+    grid = (triton.cdiv(M, 128) * triton.cdiv(N, 256),)  # will be overridden by autotune configs anyway
+
+    fp16_u8hi_matmul_kernel[grid](
+        A_fp16, B_hi_u8, C,
+        M, N, K,
+        stride_am, stride_ak,
+        stride_bk, stride_bn,
+        stride_cm, stride_cn,
+    )
+    return C
+
+def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
+    # q: [HQ, K]
+    # k: [HKV, T, K]
+    HQ, K = q.shape
+    HKV, T, _ = k.shape
+    G = HQ // HKV
+    k0 = k[:, :4, :]              # 前4个 key
+    k1 = k[:, -32:, :]            # 后32个 key
+    k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
+
+    # 扩展为 [HQ, 36, K]
+    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
+
+    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
+    dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
+    max_val = dot.max(dim=-1).values               # [HQ]
+    threshold = max_val
+    threshold = threshold * scale
+    threshold = threshold - 5
+    return threshold.contiguous()  # [HQ]
 
 
 def fp16_bytes_view(x: torch.Tensor):
@@ -15,41 +141,6 @@ def fp16_bytes_view(x: torch.Tensor):
     sizes   = list(x.size()) + [2]
     strides = [s * x.element_size() for s in x.stride()] + [1]
     return torch.empty(0, dtype=torch.uint8, device=x.device).set_(st, byte_offset, sizes, strides)
-
-
-def fp16_from_hi_u8(hi_u8: torch.Tensor) -> torch.Tensor:
-    # 给定 hi_u8（fp16 的高 8bit 视图），构造一个 fp16 张量，其低 8bit 清零，高 8bit=hi_u8
-    assert hi_u8.dtype == torch.uint8
-    zeros = torch.zeros_like(hi_u8, dtype=torch.uint8)
-    # 拼一个 [..., 2] 的字节张量：[..., 0]=lo=0, [..., 1]=hi
-    u8_2 = torch.stack([zeros, hi_u8], dim=-1).contiguous()
-    # 通过 bytes 视图反向映射回 fp16
-    st = u8_2.untyped_storage()
-    byte_offset = u8_2.storage_offset()  # already bytes
-    sizes = list(hi_u8.size())
-    # u8_2 的 strides 是以元素为单位（此处是 u8），对 fp16 而言需除以 2，但由于我们用了 contiguous()，可以直接按紧凑布局 set_
-    return torch.empty(0, dtype=torch.float16, device=hi_u8.device).set_(st, byte_offset, sizes, [s // 2 for s in u8_2.stride()[:-1]])
-
-
-def calc_qk_threshold_u8hi(q: torch.Tensor, k_hi_u8: torch.Tensor, scale: float):
-    # q: [HQ, K] (fp16/bf16/fp32)
-    # k_hi_u8: [HKV, T, K] (uint8, 仅高 8bit)
-    # 使用仅高 8bit 重构后的 k_fp16 来计算阈值，保证与主路径一致
-    HQ, K = q.shape
-    HKV, T, _ = k_hi_u8.shape
-    G = HQ // HKV
-    # 重构 k 的 fp16（低 8bit 清零）
-    k_fp16 = fp16_from_hi_u8(k_hi_u8)  # [HKV, T, K], fp16
-    k0 = k_fp16[:, :4, :]              # 前4个 key
-    k1 = k_fp16[:, -32:, :]            # 后32个 key
-    k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # [HQ, 36, K]
-
-    q_expand = q.unsqueeze(1)  # [HQ, 1, K]
-    dot = (q_expand * k_cat_gqa).sum(dim=-1).float()  # [HQ, 36] -> fp32
-    max_val = dot.max(dim=-1).values                   # [HQ]
-    threshold = max_val * scale - 3
-    return threshold.contiguous()  # [HQ], fp32
 
 
 @triton.jit
@@ -92,7 +183,7 @@ def attn_fwd_q1_b1_stage1_u8hi(
     th_ptr = qk_thresholds + i_hq
     threshold = tl.load(th_ptr).to(tl.float32)
 
-    # 计算块内的 q·k 累加，k 来自高 8bit（uint8），在核内重构为 fp16（低字节清零）
+    # q·k 累加（k 使用高 8bit 恢复的 fp16 值）
     b_s = tl.zeros([BS], tl.float32)
 
     for kk in range(0, K, BK):
@@ -103,7 +194,7 @@ def attn_fwd_q1_b1_stage1_u8hi(
         q_ptrs = q + i_hq * K + offs_k
         q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)  # [BK]
 
-        # load k_hi tile (uint8) -> reconstruct to fp16 by (u8<<8) bitcast
+        # load k_hi tile (uint8) -> (uint16 << 8) -> cast to fp16 -> widen to fp32
         k_ptrs_u8 = k_hi + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
         k_u8 = tl.load(
             k_ptrs_u8,
@@ -112,7 +203,7 @@ def attn_fwd_q1_b1_stage1_u8hi(
         )  # [BK, BS], uint8
 
         k_u16 = k_u8.to(tl.uint16) << 8
-        k_chunk = tl.cast(k_u16, tl.float16).to(tl.float32)  # bitcast to fp16, then widen to fp32
+        k_chunk = tl.cast(k_u16, tl.float16).to(tl.float32)  # 以“高字节+零低字节”的 fp16 近似
 
         b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
 
@@ -136,7 +227,7 @@ def attn_fwd_q1_b1_stage1_u8hi(
 
     o_b = tl.zeros([BV], tl.float32)
     if need_v:
-        # load v_hi tile (uint8) -> reconstruct to fp16 by (u8<<8) bitcast
+        # load v_hi tile (uint8) -> 恢复为 fp16（高字节+零低字节）-> fp32
         v_ptrs_u8 = v_hi + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
         v_u8 = tl.load(
             v_ptrs_u8,
@@ -145,7 +236,7 @@ def attn_fwd_q1_b1_stage1_u8hi(
         )  # [BS, BV], uint8
 
         v_u16 = v_u8.to(tl.uint16) << 8
-        b_v = tl.cast(v_u16, tl.float16).to(tl.float32)  # bitcast -> fp16 -> fp32
+        b_v = tl.cast(v_u16, tl.float16).to(tl.float32)
 
         o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
 
@@ -211,14 +302,14 @@ def attn_fwd_q1_b1_stage2(
 
 
 def attn_fwd_q1_b1_splitT_u8hi(
-    q: torch.Tensor,      # [HQ, K], fp16/bf16/fp32
-    k_hi_u8: torch.Tensor,# [HKV, T, K], uint8
-    v_hi_u8: torch.Tensor,# [T, HKV, V], uint8
-    scale: float = None,
+    q: torch.Tensor,       # [HQ, K], fp16/bf16/fp32
+    k_hi_u8: torch.Tensor, # [HKV, T, K], uint8
+    v_hi_u8: torch.Tensor, # [T, HKV, V], uint8
+    scale: float,
+    qk_thresholds: torch.Tensor,  # [HQ], 使用全精度 K 预先计算好的阈值
     BS: int = 128,
     BK: int = 64,
     BV: int = 64,
-    qk_thresholds: torch.Tensor = None,  # [HQ], 可选
 ):
     assert q.is_cuda and k_hi_u8.is_cuda and v_hi_u8.is_cuda
     assert q.ndim == 2 and k_hi_u8.ndim == 3 and v_hi_u8.ndim == 3
@@ -229,9 +320,6 @@ def attn_fwd_q1_b1_splitT_u8hi(
     assert HQ % HKV == 0, "GQA 需要 HQ 是 HKV 的整数倍"
     G = HQ // HKV
 
-    if scale is None:
-        scale = 1.0 / math.sqrt(K)
-
     NTB = triton.cdiv(T, BS)
 
     o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
@@ -240,12 +328,6 @@ def attn_fwd_q1_b1_splitT_u8hi(
     m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
-
-    if qk_thresholds is None:
-        qk_thresholds = calc_qk_threshold_u8hi(q, k_hi_u8, scale).contiguous()
-    else:
-        assert qk_thresholds.shape == (HQ,)
-        assert qk_thresholds.device == q.device
 
     grid1 = (triton.cdiv(V, BV), HQ, NTB)
     attn_fwd_q1_b1_stage1_u8hi[grid1](
@@ -269,12 +351,25 @@ def attn_fwd_q1_b1_splitT_u8hi(
     return o, lse
 
 
-def to_triton_layout_q(q_rope_1: torch.Tensor):
-    # q_rope_1: [B, Hq, 1, D] -> q_triton: [HQ, D]
-    assert q_rope_1.ndim == 4
+def to_triton_layout(q_rope_1, k_rope, v):
+    # q_rope_1: [B, Hq, 1, D], k_rope: [B, Hkv, T, D], v: [B, Hkv, T, Dv]
+    # 返回 q:[HQ,K], k:[HKV,T,K], v:[T,HKV,V]
+    assert q_rope_1.ndim == 4 and k_rope.ndim == 4 and v.ndim == 4
     B, Hq, qlen, Dq = q_rope_1.shape
-    assert B == 1 and qlen == 1
-    return q_rope_1[0, :, 0, :].contiguous()  # [HQ, D]
+    Bk, Hkv, T, Dk = k_rope.shape
+    Bv, Hvv, Tv, Dv = v.shape
+    assert B == Bk == Bv
+    assert T == Tv
+    assert Dq == Dk, "q/k head_dim 不一致"
+    assert Hkv == Hvv, "k/v 的 head 数必须一致"
+    assert B == 1, "该 kernel 仅支持 batch=1"
+    assert qlen == 1, "该 kernel 仅支持 qlen=1"
+    assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
+
+    q_triton = q_rope_1[0, :, 0, :].contiguous()            # [HQ, D]
+    k_triton = k_rope[0, :, :, :].contiguous()              # [HKV, T, D]
+    v_triton = v[0, :, :, :].permute(1, 0, 2).contiguous()  # [T, HKV, Dv]
+    return q_triton, k_triton, v_triton
 
 
 def to_triton_layout_u8hi(k_rope: torch.Tensor, v: torch.Tensor):
@@ -310,6 +405,7 @@ def flash_compute(q_rope_1, k_rope, v):
 
 
 def lse_reference_base2_gqa(q_triton, k_triton, scale):
+    # 计算 lse 的 reference（以 2 为底）
     qf = q_triton.float()
     kf = k_triton.float()
     HQ, K = qf.shape
@@ -343,103 +439,6 @@ def bench_op(fn, iters=50, warmup=10):
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / iters
     return ms
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 4}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_M': 64,  'BLOCK_N': 256, 'BLOCK_K': 64,  'GROUP_M': 8}, num_warps=4, num_stages=5),
-    ],
-    key=['M', 'N', 'K'],
-)
-@triton.jit
-def fp16_u8hi_matmul_kernel(
-    A_ptr, B8_ptr, C_ptr,
-    M, N, K,
-    stride_am, stride_ak,
-    stride_bk, stride_bn,
-    stride_cm, stride_cn,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(M, BLOCK_M)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-
-    group_size = GROUP_M * num_pid_n
-    group_id = pid // group_size
-    first_pid_m = group_id * GROUP_M
-    pid_in_group = pid % group_size
-    pid_m = first_pid_m + (pid_in_group % GROUP_M)
-    pid_n = pid_in_group // GROUP_M
-
-    if pid_m >= num_pid_m or pid_n >= num_pid_n:
-        return
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rk = tl.arange(0, BLOCK_K)
-
-    A_ptrs = A_ptr + rm[:, None] * stride_am + rk[None, :] * stride_ak
-    B_ptrs = B8_ptr + rk[:, None] * stride_bk + rn[None, :] * stride_bn
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    tl.multiple_of(rk, 16)
-    tl.multiple_of(rm, 16)
-    tl.multiple_of(rn, 16)
-
-    for k0 in range(0, K, BLOCK_K):
-        k_mask_row = (k0 + rk) < K
-        a = tl.load(
-            A_ptrs,
-            mask=(rm[:, None] < M) & k_mask_row[None, :],
-            other=0.0,
-            eviction_policy='evict_last'
-        )
-
-        b8 = tl.load(
-            B_ptrs,
-            mask=k_mask_row[:, None] & (rn[None, :] < N),
-            other=0,
-            eviction_policy='evict_first'
-        )
-        b16 = b8.to(tl.uint16) << 8
-        b = tl.cast(b16, tl.float16)
-
-        acc += tl.dot(a, b, out_dtype=tl.float32)
-
-        A_ptrs += BLOCK_K * stride_ak
-        B_ptrs += BLOCK_K * stride_bk
-
-    C_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(C_ptrs, acc, mask=(rm[:, None] < M) & (rn[None, :] < N))
-
-
-def fp16_u8hi_matmul(A_fp16: torch.Tensor, B_hi_u8: torch.Tensor) -> torch.Tensor:
-    # A: [M, K] fp16, B_hi_u8: [K, N] uint8, return C: [M, N] fp32
-    assert A_fp16.dtype == torch.float16 and B_hi_u8.dtype == torch.uint8
-    assert A_fp16.is_cuda and B_hi_u8.is_cuda and A_fp16.device == B_hi_u8.device
-    assert A_fp16.shape[1] == B_hi_u8.shape[0]
-    M, K = A_fp16.shape
-    K2, N = B_hi_u8.shape
-    assert K2 == K
-    C = torch.empty((M, N), device=A_fp16.device, dtype=torch.float32)
-
-    stride_am, stride_ak = A_fp16.stride()
-    stride_bk, stride_bn = B_hi_u8.stride()
-    stride_cm, stride_cn = C.stride()
-
-    grid = (triton.cdiv(M, 128) * triton.cdiv(N, 256),)
-    fp16_u8hi_matmul_kernel[grid](
-        A_fp16, B_hi_u8, C,
-        M, N, K,
-        stride_am, stride_ak,
-        stride_bk, stride_bn,
-        stride_cm, stride_cn,
-    )
-    return C
 
 
 if __name__ == "__main__":
@@ -478,27 +477,37 @@ if __name__ == "__main__":
 
         print(f"{T=} {Hq=} {Hkv=} {D=} {Dv=}")
 
-        # 准备给 Triton 内核的布局（支持 GQA）
-        q_triton = to_triton_layout_q(q_rope_1)               # [HQ, D], fp16
-        k_hi_triton, v_hi_triton = to_triton_layout_u8hi(k_rope, v)  # k:[HKV,T,D] u8, v:[T,HKV,Dv] u8
+        # Triton 布局（全精度）用于阈值与参考
+        q_triton, k_triton_full, v_triton_full = to_triton_layout(q_rope_1, k_rope, v)  # q:[HQ,D], k:[HKV,T,D], v:[T,HKV,Dv]
 
-        # 为对比/参考准备全精度 triton 布局（仅用于验证，不参与 u8hi 计算）
-        k_triton_full = k_rope[0].contiguous()                # [HKV, T, D], fp16
-        v_triton_full = v[0].permute(1, 0, 2).contiguous()    # [T, HKV, Dv], fp16
+        # 仅高 8bit 的 K/V（用于加速内核）
+        k_hi_triton, v_hi_triton = to_triton_layout_u8hi(k_rope, v)  # k:[HKV,T,D] u8, v:[T,HKV,Dv] u8
 
         scale = 1.0 / math.sqrt(D)
 
-        # 关键：使用 k 的高 8bit 计算阈值（不计入测时）
-        qk_thresholds = calc_qk_threshold_u8hi(q_triton, k_hi_triton, scale)
+        # 使用全精度 K 计算阈值（满足你的要求）
+        qk_thresholds = calc_qk_threshold(q_triton, k_triton_full, scale)
 
-        # 运行 Triton u8hi 实现（仅 K/V 高 8bit）
+        # 使用仅高 8bit 的 K/V 进行注意力计算
         o_triton, lse_triton = attn_fwd_q1_b1_splitT_u8hi(
             q_triton, k_hi_triton, v_hi_triton,
-            scale=scale, BS=BS, BK=BK, BV=BV,
+            scale=scale,
             qk_thresholds=qk_thresholds,
+            BS=BS, BK=BK, BV=BV,
         )
 
         # 与 Flash 全精度对比（参考）
+        def flash_compute(q_rope_1, k_rope, v):
+            from flash_attn import flash_attn_func
+            out = flash_attn_func(
+                q_rope_1.transpose(1, 2),
+                k_rope.transpose(1, 2),
+                v.transpose(1, 2),
+                causal=False,
+            )
+            out = out.squeeze(0).squeeze(0)  # [Hq, Dv]
+            return out
+
         o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, Dv]
 
         # 数值对比
@@ -520,8 +529,9 @@ if __name__ == "__main__":
         def run_triton_u8hi():
             o, _ = attn_fwd_q1_b1_splitT_u8hi(
                 q_triton, k_hi_triton, v_hi_triton,
-                scale=scale, BS=BS, BK=BK, BV=BV,
+                scale=scale,
                 qk_thresholds=qk_thresholds,
+                BS=BS, BK=BK, BV=BV,
             )
             return o
 
