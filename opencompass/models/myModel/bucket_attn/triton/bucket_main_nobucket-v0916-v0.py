@@ -26,12 +26,12 @@ def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
     max_val = dot.max(dim=-1).values               # [HQ]
     threshold = max_val
     threshold = threshold * scale
-    threshold = threshold - 5
+    threshold = threshold - 1000
     return threshold.contiguous()  # [HQ]
 
 
 @triton.jit
-def attn_fwd_q1_b1_stage1(
+def attn_fwd_qg_b1_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
@@ -42,22 +42,32 @@ def attn_fwd_q1_b1_stage1(
     T,           # int
     NTB,         # int = ceil(T / BS)
     qk_thresholds,  # [HQ], 每个head一个阈值（已 scaled）
+    NGQ,         # int = ceil(G / GQ)
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    G: tl.constexpr,
+    G: tl.constexpr,     # 每个 K 组包含的 Q heads 数 (= HQ/HKV)
+    GQ: tl.constexpr,    # 本 kernel 一次处理的同组 Q heads 数
     BS: tl.constexpr,
     BK: tl.constexpr,
     BV: tl.constexpr,
 ):
-    # 网格: (pid_v, pid_hq, pid_tb)
-    pid_v = tl.program_id(0)
-    pid_hq = tl.program_id(1)
-    pid_tb = tl.program_id(2)
+    # 网格: (pid_v, pid_h, pid_mix) 其中 pid_mix 编码了 (pid_tb, pid_gblk)
+    pid_v = tl.program_id(0)      # V 维 tiles
+    pid_h = tl.program_id(1)      # HKV head id
+    pid_mix = tl.program_id(2)    # 混合维
 
-    i_hq = pid_hq
-    i_h = i_hq // G
+    pid_tb = pid_mix // NGQ       # time-block id
+    pid_gblk = pid_mix % NGQ      # 同组 Q 的分块 id
+
+    i_h = pid_h                   # 当前处理的 HKV 组 id
+    # 该组内的 GQ 个 query heads 索引范围
+    hq_base = i_h * G + pid_gblk * GQ
+    q_offs_inblk = tl.arange(0, GQ)
+    i_hq_vec = hq_base + q_offs_inblk                  # [GQ]
+    # 该 GQ tile 中哪些 head 有效（最后一个 tile 可能不足 GQ）
+    hq_valid = i_hq_vec < (i_h + 1) * G
 
     v_offs = pid_v * BV + tl.arange(0, BV)
     v_mask = v_offs < V
@@ -66,19 +76,25 @@ def attn_fwd_q1_b1_stage1(
     offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 加载对应 threshold（已 scaled），并转成 fp32
-    th_ptr = qk_thresholds + i_hq
-    threshold = tl.load(th_ptr).to(tl.float32)
+    # 加载对应 threshold（已 scaled），并转成 fp32；对无效 head 填 -inf 便于后续跳过
+    th_ptrs = qk_thresholds + i_hq_vec
+    threshold = tl.load(th_ptrs, mask=hq_valid, other=float('-inf')).to(tl.float32)  # [GQ]
 
-    # 块内 q·k 累加
-    b_s = tl.zeros([BS], tl.float32)
+    # 块内 q·k 累加，形状 [GQ, BS]
+    b_s = tl.zeros([GQ, BS], tl.float32)
     for kk in range(0, K, BK):
         offs_k = kk + tl.arange(0, BK)
         k_mask = offs_k < K
 
-        q_ptrs = q + i_hq * K + offs_k
-        q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        # q_chunk: [GQ, BK]
+        q_ptrs = q + (i_hq_vec[:, None] * K) + offs_k[None, :]
+        q_chunk = tl.load(
+            q_ptrs,
+            mask=(hq_valid[:, None] & k_mask[None, :]),
+            other=0.0
+        ).to(tl.float32)
 
+        # k_chunk: [BK, BS]，同一 K 组只加载一次，供 GQ 个 Q 复用
         k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
         k_chunk = tl.load(
             k_ptrs,
@@ -86,48 +102,46 @@ def attn_fwd_q1_b1_stage1(
             other=0.0
         ).to(tl.float32)
 
-        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
+        # 累加到 [GQ, BS]
+        b_s += tl.sum(q_chunk[:, :, None] * k_chunk[None, :, :], axis=1)
 
-    # 注意：为了与 e 底 softmax 等价，这里把分数换算到以 2 为底的指数域：
-    # 2^(s / ln 2) = e^s，因此在用 exp2 前先乘以 1/ln 2
+    # 转 base-2 域
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2  # 现在 b_s 处于“以 2 为底的对数域”
+    b_s = b_s * scale * RCP_LN2  # [GQ, BS]
 
-    # 判定阈值与边界
-    skip = b_s < threshold               # [BS], 被阈值屏蔽
-    active_t = (~skip) & t_mask          # [BS], 实际参与 softmax 的位置
+    # 判定阈值与边界（对无效 head 全跳过）
+    # 注：为保持与原代码一致，这里 threshold 未乘 RCP_LN2
+    skip = b_s < threshold[:, None]                     # [GQ, BS]
+    active_t = (~skip) & t_mask[None, :] & hq_valid[:, None]  # [GQ, BS]
 
     # 仅用活跃位置计算块内最大值
     NEG_INF = float('-inf')
     b_s_act = tl.where(active_t, b_s, NEG_INF)
-    m_b = tl.max(b_s_act, axis=0)        # 标量（若整块无活跃，值为 -inf）
+    m_b = tl.max(b_s_act, axis=1)                       # [GQ]
 
     # 计算块内分母与分子：只累加活跃位置
-    # 警告：即便 m_b=-inf，下面 exp2 的无穷大也会通过 active_t 掩码归零，不会影响结果
-    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)
-    l_b = tl.sum(b_p, axis=0)            # 标量，若无活跃则为 0
+    b_p = tl.where(active_t, tl.exp2(b_s - m_b[:, None]), 0.0)  # [GQ, BS]
+    l_b = tl.sum(b_p, axis=1)                                   # [GQ]
 
-    # 仅当该块存在至少一个活跃位置时，才从 v 读取
-    num_active = tl.sum(active_t.to(tl.int32), axis=0)
-    need_v = num_active > 0
+    # 读取 V：同一 K 组只读一次，供 GQ 个 head 共享
+    b_v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
+    b_v = tl.load(
+        b_v_ptrs,
+        mask=(t_mask[:, None] & v_mask[None, :]),
+        other=0.0
+    ).to(tl.float32)  # [BS, BV]
 
-    o_b = tl.zeros([BV], tl.float32)
-    if need_v:
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
-        b_v = tl.load(
-            v_ptrs,
-            mask=(active_t[:, None] & v_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
-        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
+    # 分子向量：o_b = b_p @ b_v -> [GQ, BV]
+    o_b = tl.sum(b_p[:, :, None] * b_v[None, :, :], axis=1)
 
-    # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
-    o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
-    tl.store(o_ptrs, o_b, mask=v_mask)
+    # 写回 o_buf
+    o_ptrs = o_buf + (i_hq_vec[:, None] * (NTB * V)) + (pid_tb * V) + v_offs[None, :]
+    tl.store(o_ptrs, o_b, mask=(hq_valid[:, None] & v_mask[None, :]))
 
+    # 写回 m_buf/l_buf（仅在 pid_v==0 时写一次）
     if pid_v == 0:
-        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
-        tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
+        tl.store(m_buf + (i_hq_vec * NTB + pid_tb), m_b, mask=hq_valid)
+        tl.store(l_buf + (i_hq_vec * NTB + pid_tb), l_b, mask=hq_valid)
 
 
 @triton.jit
@@ -192,7 +206,7 @@ def attn_fwd_q1_b1_stage2(
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
 
 
-def attn_fwd_q1_b1_splitT(
+def attn_fwd_qg_b1_splitT(
     q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
     k: torch.Tensor,  # [HKV, T, K], same dtype as q
     v: torch.Tensor,  # [T, HKV, V], same dtype as q
@@ -200,6 +214,7 @@ def attn_fwd_q1_b1_splitT(
     BS: int = 128,    # 时间分块大小（可调，影响 NTB）
     BK: int = 64,
     BV: int = 64,
+    GQ: int = 4,      # 每个 kernel 同组 K 内并行处理的 Q heads 数
     qk_thresholds: torch.Tensor = None,  # 可选：预先计算的阈值 [HQ]
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -215,6 +230,7 @@ def attn_fwd_q1_b1_splitT(
         scale = 1.0 / math.sqrt(K)
 
     NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
+    NGQ = triton.cdiv(G, GQ)  # 每个 K 组中有多少个 GQ-tile
 
     # 输出
     o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
@@ -232,26 +248,28 @@ def attn_fwd_q1_b1_splitT(
         assert qk_thresholds.shape == (HQ,), "qk_thresholds 形状应为 [HQ]"
         assert qk_thresholds.device == q.device, "qk_thresholds 需与 q 在同一设备"
 
-    # Stage 1: 并行计算各时间分块的局部统计与分子
-    grid1 = (triton.cdiv(V, BV), HQ, NTB)
-    attn_fwd_q1_b1_stage1[grid1](
+    # Stage 1: 并行计算各时间分块的局部统计与分子（同组 K 内并行 GQ 个 Q heads）
+    grid1 = (triton.cdiv(V, BV), HKV, NTB * NGQ)
+    attn_fwd_qg_b1_stage1[grid1](
         q, k, v,
         m_buf, l_buf, o_buf,
         scale, T, NTB,
-        qk_thresholds,  # 传入预计算/内算阈值
-        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
+        qk_thresholds,
+        NGQ,
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G, GQ=GQ,
         BS=BS, BK=BK, BV=BV,
-        # num_warps=4,    # 在这里调
+        # 可按需调参：
+        # num_warps=4,
         # num_stages=3,
     )
 
-    # Stage 2: 跨时间分块做稳定合并 + 归一化
+    # Stage 2: 跨时间分块做稳定合并 + 归一化（逐 HQ 头）
     grid2 = (triton.cdiv(V, BV), HQ)
     attn_fwd_q1_b1_stage2[grid2](
         m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
-        # num_warps=4,    # 在这里调
+        # num_warps=4,
         # num_stages=3,
     )
     return o, lse
@@ -344,6 +362,7 @@ if __name__ == "__main__":
 
     dtype = torch.float16  # 建议 fp16/bf16 才能触发 Flash
     BS, BK, BV = 256, 64, 64  # Triton tile，可按需调参
+    GQ = 4                    # 关键：同组 K 内并行的 Q head 数（可调为 2/4/8等）
 
     # 计时参数
     iters = 50
@@ -354,6 +373,8 @@ if __name__ == "__main__":
         q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
         k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hkv, T, D]
         v      = layer_qkvh_data["v"].to('cuda', dtype=dtype).contiguous()       # [B, Hkv, T, Dv]
+
+        print(f"{q_rope.shape=}, {k_rope.shape=}, {v.shape=}")
 
         # 只取最后一个查询位置 -> qlen=1
         q_rope_1 = q_rope[:, :, -1:, :]  # [B, Hq, 1, D]
@@ -368,7 +389,7 @@ if __name__ == "__main__":
         assert T == Tv
         assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
 
-        print(f"{T=} {Hq=} {Hkv=} {D=} {Dv=}")
+        print(f"{T=}")
 
         # 准备给 Triton 内核的布局（支持 GQA）
         q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
@@ -379,11 +400,24 @@ if __name__ == "__main__":
         # 关键：预计算阈值（不参与时间计算）
         qk_thresholds = calc_qk_threshold(q_triton, k_triton, scale).contiguous()
 
-        o_triton, lse_triton = attn_fwd_q1_b1_splitT(
+        # 新版（同组 K 内并行多组 Q）
+        o_triton, lse_triton = attn_fwd_qg_b1_splitT(
             q_triton, k_triton, v_triton,
-            scale=scale, BS=BS, BK=BK, BV=BV,
+            scale=scale, BS=BS, BK=BK, BV=BV, GQ=GQ,
             qk_thresholds=qk_thresholds,   # 传入预计算阈值
         )  # o:[HQ,V], lse:[HQ] (以 2 为底)
+
+        # 对比 Flash
+        def flash_compute(q_rope_1, k_rope, v):
+            from flash_attn import flash_attn_func
+            out = flash_attn_func(
+                q_rope_1.transpose(1, 2),
+                k_rope.transpose(1, 2),
+                v.transpose(1, 2),
+                causal=False,
+            )
+            out = out.squeeze(0).squeeze(0)  # [H, Dv]
+            return out
 
         o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
@@ -404,9 +438,9 @@ if __name__ == "__main__":
 
         # 性能对比：计时不包含阈值计算
         def run_triton():
-            o, _ = attn_fwd_q1_b1_splitT(
+            o, _ = attn_fwd_qg_b1_splitT(
                 q_triton, k_triton, v_triton,
-                scale=scale, BS=BS, BK=BK, BV=BV,
+                scale=scale, BS=BS, BK=BK, BV=BV, GQ=GQ,
                 qk_thresholds=qk_thresholds,  # 使用已计算好的阈值
             )
             return o
