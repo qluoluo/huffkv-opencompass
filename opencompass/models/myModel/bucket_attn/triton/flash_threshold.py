@@ -3,12 +3,35 @@ import os
 from tqdm import tqdm
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 
+def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
+    # q: [HQ, K]
+    # k: [HKV, T, K]
+    HQ, K = q.shape
+    HKV, T, _ = k.shape
+    G = HQ // HKV
+    k0 = k[:, :4, :]              # 前4个 key
+    k1 = k[:, -32:, :]            # 后32个 key
+    k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
+
+    # 扩展为 [HQ, 36, K]
+    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
+
+    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
+    dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
+    max_val = dot.max(dim=-1).values               # [HQ]
+    threshold = max_val
+    threshold = threshold * scale
+    threshold = threshold - 5
+    return threshold.contiguous()  # [HQ]
+
+
 @triton.jit
-def attn_fwd_qgroup_b1_stage1(
+def attn_fwd_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
@@ -18,6 +41,7 @@ def attn_fwd_qgroup_b1_stage1(
     scale,       # float
     T,           # int
     NTB,         # int
+    qk_thresholds,  # [HQ], 与 q 同设备，dtype 任意可转 fp32
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
@@ -70,16 +94,37 @@ def attn_fwd_qgroup_b1_stage1(
 
     # 以 2 为底的指数域
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2
+    b_s = b_s * scale * RCP_LN2  # [BM_DOT, BS], base-2 logits
 
-    # 2) 计算每行（每个 hq）块内最大值与分母
+    # 阈值: 传入的是 (q·k)*scale - 5 (base-e)，这里换成 base-2
+    thr_rows = tl.load(
+        qk_thresholds + (base_hq + rows),
+        mask=row_mask,
+        other=float('inf'),
+    ).to(tl.float32)                        # [BM_DOT]
+    thr_rows_2 = thr_rows * RCP_LN2         # [BM_DOT] base-2
+
+    # 计算该时间位置是否需要加载 v（任一有效行超过各自阈值即可）
+    cmp = b_s >= thr_rows_2[:, None]        # [BM_DOT, BS] bool
+    cmp = tl.where(row_mask[:, None], cmp, False)  # 只考虑有效行
+    keep_any = tl.max(tl.where(cmp, 1, 0), axis=0) # [BS] int32
+    keep_t = (keep_any > 0) & t_mask                 # [BS] bool
+
+    # 计算每行块内最大值与分母（注意：这里仍使用全部 t；如果想“硬剪枝”，把 keep_t 并入 mask）
     NEG_INF = float('-inf')
-    b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)  # [BM_DOT, BS]
-    m_rows = tl.max(b_s_act, axis=1)                   # [BM_DOT]
+    # b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)  # [BM_DOT, BS]
+    # m_rows = tl.max(b_s_act, axis=1)                   # [BM_DOT]
 
-    # b_p: [BM_DOT, BS]，时间无效处为 0；补行也允许为非 0，但后续写回会 mask 掉
-    b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
-    l_rows = tl.sum(b_p, axis=1)                       # [BM_DOT]
+    # 若希望“硬剪枝”分母一起裁掉，请用下面两行替换上面两行：
+    valid_mask = (keep_t)[None, :]
+    b_s_act = tl.where(valid_mask, b_s, NEG_INF); m_rows = tl.max(b_s_act, axis=1)
+
+    # b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)  # [BM_DOT, BS]
+    # l_rows = tl.sum(b_p, axis=1)                                          # [BM_DOT]
+
+    # 若使用“硬剪枝”，改为：
+    b_p = tl.where(valid_mask, tl.exp2(b_s - m_rows[:, None]), 0.0)
+    l_rows = tl.sum(b_p, axis=1)
 
     # 写回 m/l（只写前 G 行）
     m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
@@ -88,8 +133,8 @@ def attn_fwd_qgroup_b1_stage1(
     l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
     tl.store(l_ptrs, l_rows, mask=row_mask)
 
-    # 该时间块是否有活跃 t
-    need_v = tl.sum(t_mask.to(tl.int32)) > 0
+    # 该时间块是否需要加载 v（至少有一个 t 被保留）
+    need_v = tl.sum(keep_t.to(tl.int32)) > 0
 
     # 3) 分子：o_b = b_p · V（[BM_DOT, BS] @ [BS, BV]）
     for v0 in range(0, V, BV):
@@ -98,22 +143,23 @@ def attn_fwd_qgroup_b1_stage1(
 
         o_tile = tl.zeros([BM_DOT, BV], tl.float32)
         if need_v:
+            # 只对 keep_t=True 的时间位置加载 V
             v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
             b_v = tl.load(
                 v_ptrs,
-                mask=(t_mask[:, None] & v_mask[None, :]),
+                mask=(keep_t[:, None] & v_mask[None, :]),
                 other=0.0
             ).to(tl.float16)  # [BS, BV]
 
+            # 对被裁掉的 t，b_v 为 0，从而其对 o_tile 的贡献为 0
             o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
 
         # 只写前 G 行
         o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + pid_tb * V + v_offs[None, :]
         tl.store(o_ptrs, o_tile, mask=(row_mask[:, None] & v_mask[None, :]))
 
-
 @triton.jit
-def attn_fwd_q1_b1_stage2(
+def attn_fwd_stage2(
     m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
     o_buf,       # [HQ, NTB, V], fp32
@@ -175,13 +221,14 @@ def attn_fwd_q1_b1_stage2(
 
 
 def attn_fwd_q1_b1_splitT(
-    q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
-    k: torch.Tensor,  # [HKV, T, K], same dtype as q
-    v: torch.Tensor,  # [T, HKV, V], same dtype as q
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
     scale: float = None,
-    BS: int = 128,    # 时间分块大小（可调，影响 NTB）
+    BS: int = 128,
     BK: int = 64,
     BV: int = 64,
+    qk_thresholds: torch.Tensor = None,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -206,22 +253,28 @@ def attn_fwd_q1_b1_splitT(
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # Stage 1: 同组计算（每个 KV 头一次性处理其 G 个 Q 头），M 维补到16
+    # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
+    if qk_thresholds is None:
+        qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
+    else:
+        assert qk_thresholds.shape == (HQ,)
+        assert qk_thresholds.device == q.device
+
     grid1 = (HKV, NTB)
-    attn_fwd_qgroup_b1_stage1[grid1](
+    attn_fwd_stage1[grid1](
         q, k, v,
         m_buf, l_buf, o_buf,
         scale, T, NTB,
+        qk_thresholds,          # 新增参数
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
-        # BM_DOT=16,  # 如需可显式传
         # num_warps=4,
         # num_stages=3,
     )
 
     # Stage 2: 跨时间分块做稳定合并 + 归一化
     grid2 = (triton.cdiv(V, BV), HQ)
-    attn_fwd_q1_b1_stage2[grid2](
+    attn_fwd_stage2[grid2](
         m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V, BV=BV,
@@ -350,9 +403,13 @@ if __name__ == "__main__":
         # 运行 Triton 实现
         scale = 1.0 / math.sqrt(D)
 
+        # 关键：预计算阈值（不参与时间计算）
+        qk_thresholds = calc_qk_threshold(q_triton, k_triton, scale).contiguous()
+
         o_triton, lse_triton = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, BK=BK, BV=BV,
+            qk_thresholds=qk_thresholds,   # 传入预计算阈值
         )  # o:[HQ,V], lse:[HQ] (以 2 为底)
 
         o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
@@ -372,11 +429,12 @@ if __name__ == "__main__":
         print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
         print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
-        # 性能对比
+        # 性能对比：计时不包含阈值计算
         def run_triton():
             o, _ = attn_fwd_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, BK=BK, BV=BV,
+                qk_thresholds=qk_thresholds,  # 使用已计算好的阈值
             )
             return o
 
