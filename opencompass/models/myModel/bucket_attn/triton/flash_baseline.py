@@ -8,95 +8,108 @@ import triton.language as tl
 
 
 @triton.jit
-def attn_fwd_q1_b1_stage1(
+def attn_fwd_qgroup_b1_stage1(
     q,           # [HQ, K]
     k,           # [HKV, T, K]
     v,           # [T, HKV, V]
     m_buf,       # [HQ, NTB]
     l_buf,       # [HQ, NTB]
-    o_buf,       # [HQ, NTB, V]
+    o_buf,       # [HQ, NTB, V] (fp32)
     scale,       # float
     T,           # int
-    NTB,         # int = ceil(T / BS)
+    NTB,         # int
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    G: tl.constexpr,
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+    G: tl.constexpr,     # 每个 KV 头对应的 Q 头个数（组大小）
+    BS: tl.constexpr,    # 要求: % 16 == 0
+    BK: tl.constexpr,    # 要求: % 16 == 0
+    BV: tl.constexpr,    # 要求: % 16 == 0
+    BM_DOT: tl.constexpr = 16,  # dot 的 M 维补到 16
 ):
-    # 网格: (pid_v, pid_hq, pid_tb)
-    pid_v = tl.program_id(0)
-    pid_hq = tl.program_id(1)
-    pid_tb = tl.program_id(2)
+    # 网格: (pid_hkv, pid_tb)
+    pid_hkv = tl.program_id(0)
+    pid_tb = tl.program_id(1)
 
-    i_hq = pid_hq
-    i_h = i_hq // G
+    base_hq = pid_hkv * G
 
-    v_offs = pid_v * BV + tl.arange(0, BV)
-    v_mask = v_offs < V
-
+    # 时间块
     s0 = pid_tb * BS
     offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 块内 q·k 累加
-    b_s = tl.zeros([BS], tl.float32)
+    # 行补到 16
+    rows = tl.arange(0, BM_DOT)          # [0..15]
+    row_mask = rows < G                  # 只前 G 行有效（真实 Q 行）
+
+    # 1) b_s = Q·K（[BM_DOT, BK] @ [BK, BS]）
+    b_s = tl.zeros([BM_DOT, BS], tl.float32)
+
     for kk in range(0, K, BK):
         offs_k = kk + tl.arange(0, BK)
         k_mask = offs_k < K
 
-        q_ptrs = q + i_hq * K + offs_k
-        q_chunk = tl.load(q_ptrs, mask=k_mask, other=0.0).to(tl.float32)
+        # Q tile: [BM_DOT, BK]
+        q_ptrs = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+        q_tile = tl.load(
+            q_ptrs,
+            mask=(row_mask[:, None] & k_mask[None, :]),
+            other=0.0
+        ).to(tl.float16)
 
-        k_ptrs = k + i_h * T * K + (offs_t[None, :] * K) + offs_k[:, None]
-        k_chunk = tl.load(
+        # K tile: [BK, BS]
+        k_ptrs = k + pid_hkv * T * K + (offs_t[None, :] * K) + offs_k[:, None]
+        k_tile = tl.load(
             k_ptrs,
             mask=(k_mask[:, None] & t_mask[None, :]),
             other=0.0
-        ).to(tl.float32)
+        ).to(tl.float16)
 
-        b_s += tl.sum(q_chunk[:, None] * k_chunk, axis=0)  # [BS]
+        b_s += tl.dot(q_tile, k_tile, out_dtype=tl.float32)
 
-    # 以 2 为底的指数域（稳定 softmax）
+    # 以 2 为底的指数域
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2  # 现在 b_s 处于“以 2 为底的对数域”
+    b_s = b_s * scale * RCP_LN2
 
-    # 稠密注意力：所有有效时间位置都参与 softmax
-    active_t = t_mask
-
-    # 仅用活跃位置计算块内最大值
+    # 2) 计算每行（每个 hq）块内最大值与分母
     NEG_INF = float('-inf')
-    b_s_act = tl.where(active_t, b_s, NEG_INF)
-    m_b = tl.max(b_s_act, axis=0)        # 标量（若整块无活跃，值为 -inf）
+    b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)  # [BM_DOT, BS]
+    m_rows = tl.max(b_s_act, axis=1)                   # [BM_DOT]
 
-    # 计算块内分母与分子
-    b_p = tl.where(active_t, tl.exp2(b_s - m_b), 0.0)
-    l_b = tl.sum(b_p, axis=0)            # 标量，若无活跃则为 0
+    # b_p: [BM_DOT, BS]，时间无效处为 0；补行也允许为非 0，但后续写回会 mask 掉
+    b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
+    l_rows = tl.sum(b_p, axis=1)                       # [BM_DOT]
 
-    # 仅当该块存在至少一个活跃位置时，才从 v 读取
-    num_active = tl.sum(active_t.to(tl.int32), axis=0)
-    need_v = num_active > 0
+    # 写回 m/l（只写前 G 行）
+    m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
+    tl.store(m_ptrs, m_rows, mask=row_mask)
 
-    o_b = tl.zeros([BV], tl.float32)
-    if need_v:
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (i_h * V) + v_offs[None, :]
-        b_v = tl.load(
-            v_ptrs,
-            mask=(active_t[:, None] & v_mask[None, :]),
-            other=0.0
-        ).to(tl.float32)
-        o_b = tl.sum(b_p[:, None] * b_v, axis=0)  # [BV]
+    l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
+    tl.store(l_ptrs, l_rows, mask=row_mask)
 
-    # 无论 need_v 与否，都写回 o_buf（空块写 0），提升阶段间缓存命中
-    o_ptrs = o_buf + i_hq * (NTB * V) + pid_tb * V + v_offs
-    tl.store(o_ptrs, o_b, mask=v_mask)
+    # 该时间块是否有活跃 t
+    need_v = tl.sum(t_mask.to(tl.int32)) > 0
 
-    if pid_v == 0:
-        tl.store(m_buf + i_hq * NTB + pid_tb, m_b)
-        tl.store(l_buf + i_hq * NTB + pid_tb, l_b)
+    # 3) 分子：o_b = b_p · V（[BM_DOT, BS] @ [BS, BV]）
+    for v0 in range(0, V, BV):
+        v_offs = v0 + tl.arange(0, BV)
+        v_mask = v_offs < V
+
+        o_tile = tl.zeros([BM_DOT, BV], tl.float32)
+        if need_v:
+            v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+            b_v = tl.load(
+                v_ptrs,
+                mask=(t_mask[:, None] & v_mask[None, :]),
+                other=0.0
+            ).to(tl.float16)  # [BS, BV]
+
+            o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
+
+        # 只写前 G 行
+        o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + pid_tb * V + v_offs[None, :]
+        tl.store(o_ptrs, o_tile, mask=(row_mask[:, None] & v_mask[None, :]))
 
 
 @triton.jit
@@ -193,14 +206,15 @@ def attn_fwd_q1_b1_splitT(
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # Stage 1: 并行计算各时间分块的局部统计与分子
-    grid1 = (triton.cdiv(V, BV), HQ, NTB)
-    attn_fwd_q1_b1_stage1[grid1](
+    # Stage 1: 同组计算（每个 KV 头一次性处理其 G 个 Q 头），M 维补到16
+    grid1 = (HKV, NTB)
+    attn_fwd_qgroup_b1_stage1[grid1](
         q, k, v,
         m_buf, l_buf, o_buf,
         scale, T, NTB,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G,
         BS=BS, BK=BK, BV=BV,
+        # BM_DOT=16,  # 如需可显式传
         # num_warps=4,
         # num_stages=3,
     )
