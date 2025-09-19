@@ -386,3 +386,8 @@ if __name__ == "__main__":
         ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
         ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
+
+        break
+
+        # if layer_idx > 0:
+        #     break

@@ -3,31 +3,8 @@ import os
 from tqdm import tqdm
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
-
-
-def calc_qk_threshold(q: torch.Tensor, k: torch.Tensor, scale: float):
-    # q: [HQ, K]
-    # k: [HKV, T, K]
-    HQ, K = q.shape
-    HKV, T, _ = k.shape
-    G = HQ // HKV
-    k0 = k[:, :4, :]              # 前4个 key
-    k1 = k[:, -32:, :]            # 后32个 key
-    k_cat = torch.cat([k0, k1], dim=1)  # [HKV, 36, K]
-
-    # 扩展为 [HQ, 36, K]
-    k_cat_gqa = k_cat.repeat_interleave(G, dim=0)  # 每个 query head 对应一组 key
-
-    q_expand = q.unsqueeze(1)                      # [HQ, 1, K]
-    dot = (q_expand * k_cat_gqa).sum(dim=-1)       # [HQ, 36]
-    max_val = dot.max(dim=-1).values               # [HQ]
-    threshold = max_val
-    threshold = threshold * scale
-    threshold = threshold - 5
-    return threshold.contiguous()  # [HQ]
 
 
 @triton.jit
@@ -41,39 +18,39 @@ def attn_fwd_stage1(
     scale,       # float
     T,           # int
     NTB,         # int
-    qk_thresholds,      # [HQ]
-    empty_blk_counter,  # int32[1]
     HKV: tl.constexpr,
     HQ: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
-    G: tl.constexpr,     # 每个 KV 头对应的 Q 头个数
-    GM: tl.constexpr,    # 行维 tile，最小的 2^n >= G，且 <= 16
-    BS: tl.constexpr,
-    BK: tl.constexpr,
-    BV: tl.constexpr,
+    G: tl.constexpr,     # 每个 KV 头对应的 Q 头个数（组大小）
+    BS: tl.constexpr,    # 要求: % 16 == 0
+    BK: tl.constexpr,    # 要求: % 16 == 0
+    BV: tl.constexpr,    # 要求: % 16 == 0
+    BM_DOT: tl.constexpr = 16,  # dot 的 M 维补到 16
 ):
+    # 网格: (pid_hkv, pid_tb)
     pid_hkv = tl.program_id(0)
-    pid_tb  = tl.program_id(1)
+    pid_tb = tl.program_id(1)
 
     base_hq = pid_hkv * G
 
     # 时间块
     s0 = pid_tb * BS
-    offs_t = s0 + tl.arange(0, BS)          # BS 建议仍取 2 的幂
+    offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 行 tile（GM 是 2 的幂），用 mask 只保留前 G 行
-    rows = tl.arange(0, GM)
-    row_mask = rows < G
+    # 行补到 16
+    rows = tl.arange(0, BM_DOT)          # [0..15]
+    row_mask = rows < G                  # 只前 G 行有效（真实 Q 行）
 
-    # 1) QK： [GM, BK] @ [BK, BS] （SIMT 路径；不再用 16 行 HMMA）
-    b_s = tl.zeros([GM, BS], dtype=tl.float32)
+    # 1) b_s = Q·K（[BM_DOT, BK] @ [BK, BS]）
+    b_s = tl.zeros([BM_DOT, BS], tl.float32)
+
     for kk in range(0, K, BK):
         offs_k = kk + tl.arange(0, BK)
         k_mask = offs_k < K
 
-        # Q tile: [GM, BK]
+        # Q tile: [BM_DOT, BK]
         q_ptrs = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
         q_tile = tl.load(
             q_ptrs,
@@ -82,7 +59,7 @@ def attn_fwd_stage1(
         ).to(tl.float16)
 
         # K tile: [BK, BS]
-        k_ptrs = k + pid_hkv * (T * K) + (offs_t[None, :] * K) + offs_k[:, None]
+        k_ptrs = k + pid_hkv * T * K + (offs_t[None, :] * K) + offs_k[:, None]
         k_tile = tl.load(
             k_ptrs,
             mask=(k_mask[:, None] & t_mask[None, :]),
@@ -91,67 +68,49 @@ def attn_fwd_stage1(
 
         b_s += tl.dot(q_tile, k_tile, out_dtype=tl.float32)
 
-    # base-2 logits
+    # 以 2 为底的指数域
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2  # [GM, BS]
+    b_s = b_s * scale * RCP_LN2
 
-    # 阈值（带掩码）
-    thr_rows = tl.load(
-        qk_thresholds + (base_hq + rows),
-        mask=row_mask,
-        other=float('inf'),
-    ).to(tl.float32)
-    thr_rows_2 = thr_rows * RCP_LN2
-
-    # 选 t
-    cmp = b_s >= thr_rows_2[:, None]                  # [GM, BS]
-    cmp = tl.where(row_mask[:, None], cmp, False)
-    keep_any = tl.max(tl.where(cmp, 1, 0), axis=0)    # [BS] int
-    keep_t = (keep_any > 0) & t_mask                  # [BS] bool
-    need_v = tl.sum(keep_t.to(tl.int32)) > 0
-
-    # m/l 写指针（带行掩码）
-    m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
-    l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
-
-    # 空块快速退出：直接写 m=-inf, l=0
-    if not need_v:
-        m_rows_empty = tl.full([GM], float('-inf'), tl.float32)
-        l_rows_empty = tl.zeros([GM], tl.float32)
-        tl.store(m_ptrs, m_rows_empty, mask=row_mask)
-        tl.store(l_ptrs, l_rows_empty, mask=row_mask)
-        tl.atomic_add(empty_blk_counter, 1)
-        return
-
-    # “硬剪枝”softmax（仅 keep_t 列参与）
+    # 2) 计算每行（每个 hq）块内最大值与分母
     NEG_INF = float('-inf')
-    valid_mask = keep_t[None, :]
-    b_s_act = tl.where(valid_mask, b_s, NEG_INF)
-    m_rows = tl.max(b_s_act, axis=1)                                   # [GM]
-    b_p = tl.where(valid_mask, tl.exp2(b_s - m_rows[:, None]), 0.0)    # [GM, BS]
-    l_rows = tl.sum(b_p, axis=1)                                       # [GM]
+    b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)  # [BM_DOT, BS]
+    m_rows = tl.max(b_s_act, axis=1)                   # [BM_DOT]
 
+    # b_p: [BM_DOT, BS]，时间无效处为 0；补行也允许为非 0，但后续写回会 mask 掉
+    b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
+    l_rows = tl.sum(b_p, axis=1)                       # [BM_DOT]
+
+    # 写回 m/l（只写前 G 行）
+    m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
     tl.store(m_ptrs, m_rows, mask=row_mask)
+
+    l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
     tl.store(l_ptrs, l_rows, mask=row_mask)
 
-    # 3) 分子：o_b = b_p @ V（仍为稠密形状；后续可按 keep_t 外积式优化）
+    # 该时间块是否有活跃 t
+    need_v = tl.sum(t_mask.to(tl.int32)) > 0
+
+    # 3) 分子：o_b = b_p · V（[BM_DOT, BS] @ [BS, BV]）
     for v0 in range(0, V, BV):
         v_offs = v0 + tl.arange(0, BV)
         v_mask = v_offs < V
 
-        o_tile = tl.zeros([GM, BV], tl.float32)
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
-        b_v = tl.load(
-            v_ptrs,
-            mask=(keep_t[:, None] & v_mask[None, :]),
-            other=0.0
-        ).to(tl.float16)
+        o_tile = tl.zeros([BM_DOT, BV], tl.float32)
+        if need_v:
+            v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+            b_v = tl.load(
+                v_ptrs,
+                mask=(t_mask[:, None] & v_mask[None, :]),
+                other=0.0
+            ).to(tl.float16)  # [BS, BV]
 
-        o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)  # [GM,BV]
+            o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
 
+        # 只写前 G 行
         o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + pid_tb * V + v_offs[None, :]
         tl.store(o_ptrs, o_tile, mask=(row_mask[:, None] & v_mask[None, :]))
-        
+
 
 @triton.jit
 def attn_fwd_stage2(
@@ -215,24 +174,14 @@ def attn_fwd_stage2(
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty), mask=v_mask)
 
 
-def _next_pow2_leq16(x: int) -> int:
-    gm = 1
-    while gm < x and gm < 16:
-        gm <<= 1
-    # 若 G>16 就用 16（通常 G 很小：1/2/3/4/8）
-    return gm
-
-
 def attn_fwd_q1_b1_splitT(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
+    q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
+    k: torch.Tensor,  # [HKV, T, K], same dtype as q
+    v: torch.Tensor,  # [T, HKV, V], same dtype as q
     scale: float = None,
-    BS: int = 128,
+    BS: int = 128,    # 时间分块大小（可调，影响 NTB）
     BK: int = 64,
     BV: int = 64,
-    qk_thresholds: torch.Tensor = None,
-    collect_stats: bool = False,     # 新增
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -247,7 +196,6 @@ def attn_fwd_q1_b1_splitT(
         scale = 1.0 / math.sqrt(K)
 
     NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
-    empty_blk_counter = torch.zeros(1, device=q.device, dtype=torch.int32)
 
     # 输出
     o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
@@ -258,39 +206,28 @@ def attn_fwd_q1_b1_splitT(
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # 阈值：若未传入则内部计算；建议外部预先计算并传入以避免计时包含这一步
-    if qk_thresholds is None:
-        qk_thresholds = calc_qk_threshold(q, k, scale).contiguous()
-    else:
-        assert qk_thresholds.shape == (HQ,)
-        assert qk_thresholds.device == q.device
-
-
-    GM = _next_pow2_leq16(G)
-    assert GM >= G and GM in (1,2,4,8,16)
-
+    # Stage 1: 同组计算（每个 KV 头一次性处理其 G 个 Q 头），M 维补到16
     grid1 = (HKV, NTB)
     attn_fwd_stage1[grid1](
         q, k, v,
         m_buf, l_buf, o_buf,
         scale, T, NTB,
-        qk_thresholds,
-        empty_blk_counter,
-        HKV=HKV, HQ=HQ, K=K, V=V,
-        G=G, GM=GM, BS=BS, BK=BK, BV=BV,
-        # num_warps=4, num_stages=3,
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
+        BS=BS, BK=BK, BV=BV,
+        # BM_DOT=16,  # 如需可显式传
+        # num_warps=4,
+        # num_stages=3,
     )
 
+    # Stage 2: 跨时间分块做稳定合并 + 归一化
     grid2 = (triton.cdiv(V, BV), HQ)
-    attn_fwd_stage2[grid2](m_buf, l_buf, o_buf, o, lse, NTB, HQ=HQ, V=V, BV=BV)
-
-    if collect_stats:
-        empty_blocks = int(empty_blk_counter.item())
-        total_blocks = int(HKV * NTB)
-        empty_ratio = empty_blocks / max(total_blocks, 1)
-        stats = dict(empty_blocks=empty_blocks, total_blocks=total_blocks, empty_ratio=empty_ratio)
-        return o, lse, stats
-
+    attn_fwd_stage2[grid2](
+        m_buf, l_buf, o_buf,
+        o, lse, NTB,
+        HQ=HQ, V=V, BV=BV,
+        # num_warps=4,
+        # num_stages=3,
+    )
     return o, lse
 
 
@@ -380,7 +317,7 @@ if __name__ == "__main__":
     layer_data_root = os.path.join(exp_root, 'layer_data')
 
     dtype = torch.float16  # 建议 fp16/bf16 才能触发 Flash
-    BS, BK, BV = 128, 64, 64  # Triton tile，可按需调参
+    BS, BK, BV = 256, 64, 64  # Triton tile，可按需调参
 
     # 计时参数
     iters = 50
@@ -413,18 +350,10 @@ if __name__ == "__main__":
         # 运行 Triton 实现
         scale = 1.0 / math.sqrt(D)
 
-        # 关键：预计算阈值（不参与时间计算）
-        qk_thresholds = calc_qk_threshold(q_triton, k_triton, scale).contiguous()
-
-        # 运行 Triton 实现（带统计）
-        o_triton, lse_triton, stats = attn_fwd_q1_b1_splitT(
+        o_triton, lse_triton = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, BK=BK, BV=BV,
-            qk_thresholds=qk_thresholds,
-            collect_stats=True,
-        )
-        print(f"Empty blocks: {stats['empty_blocks']}/{stats['total_blocks']} "
-            f"({stats['empty_ratio']*100:.1f}%)")
+        )  # o:[HQ,V], lse:[HQ] (以 2 为底)
 
         o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
@@ -443,13 +372,11 @@ if __name__ == "__main__":
         print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
         print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
-        # 基准测试时可不收集统计，避免原子开销干扰
+        # 性能对比
         def run_triton():
             o, _ = attn_fwd_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, BK=BK, BV=BV,
-                qk_thresholds=qk_thresholds,
-                collect_stats=False,
             )
             return o
 
@@ -459,3 +386,28 @@ if __name__ == "__main__":
         ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
         ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
+
+        from torch.profiler import profile, ProfilerActivity
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            with_stack=True, # 可选，将保留完整的调用栈，但相应地文件体积会飞速膨胀
+        ) as p:
+            run_triton()
+            x = torch.randn(100, 100) * torch.randn(100, 100)
+            del x
+            run_triton()
+        try:
+            import os
+            # local_rank = int(os.environ["LOCAL_RANK"])
+            # 下面是 profile 结果的存放路径
+            trace_save_dir = "/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass/opencompass/models/myModel/bucket_attn/triton/trace"
+            os.makedirs(trace_save_dir, exist_ok=True)
+            p.export_chrome_trace(os.path.join(trace_save_dir, "trace.json"))
+        except Exception as e:
+            print(f"Failed to capture snapshot {e}!")
+
+        break
+
+        # if layer_idx > 0:
+        #     break
