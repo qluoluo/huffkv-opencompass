@@ -1,3 +1,5 @@
+# 愚蠢的实现，仅作备份
+
 import math
 import os
 from tqdm import tqdm

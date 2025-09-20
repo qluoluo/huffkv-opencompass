@@ -1,3 +1,6 @@
+# 根据阈值筛选qk内积过小的，不进行后续操作
+# 计时不包括筛选时间
+
 import math
 import os
 from tqdm import tqdm

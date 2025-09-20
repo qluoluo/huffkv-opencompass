@@ -5,12 +5,6 @@
 #             在线累积 base-2 域的 m/l/o 统计量，写入中间缓冲区。
 # - Stage 2：沿 tb 维度做稳定的在线合并，得到最终输出以及以 2 为底的 lse（对数和）。
 #
-# 本版改动：
-# 1) BM_DOT 固定为 16（不再变化/调优）；
-# 2) Stage 1 使用 autotune 仅搜索 (BSI, num_warps, num_stages)；
-# 3) 移除所有 LSE 参考/误差对比相关代码与打印；
-# 4) 修正：去除张量条件下的 Python if，统一用掩码路径；越界访问全部用 mask 屏蔽。
-#
 # 张量布局（contiguous）：
 # - q: [HQ, K]
 # - k: [HKV, T, K]
