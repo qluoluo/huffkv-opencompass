@@ -8,137 +8,117 @@ import triton.language as tl
 
 
 @triton.jit
-def attn_fwd_stage1(
-    q,           # [HQ, K]
-    k,           # [HKV, T, K]
-    v,           # [T, HKV, V]
-    m_buf,       # [HQ, NTB]
-    l_buf,       # [HQ, NTB]
-    o_buf,       # [HQ, NTB, V] (fp32)
-    scale,       # float
-    T,           # int
-    NTB,         # int
-    HKV: tl.constexpr,
-    HQ: tl.constexpr,
-    K: tl.constexpr,
-    V: tl.constexpr,
-    G: tl.constexpr,     # 每个 KV 头对应的 Q 头个数（组大小）
-    BS: tl.constexpr,    # 时间分块大小
-    BM_DOT: tl.constexpr = 16,  # dot 的 M 维补到 16
+def attn_fwd_stage1_pruned(
+    q, k, v,
+    m_buf, l_buf, o_buf,
+    thres_buf,       # [HQ], fp32
+    scale, T, NTB,   # ints / float
+    delta,           # fp32：阈值 = max - delta
+    # compile-time switches
+    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    G: tl.constexpr, BS: tl.constexpr, BM_DOT: tl.constexpr = 16,
+    FIRST_LAST_PASS: tl.constexpr = False,  # 首尾两块 pass
+    ENABLE_PRUNE: tl.constexpr = True,      # 是否剪枝
+    UPDATE_THRES: tl.constexpr = False,     # 是否把 (max - delta) 写入 thres_buf
+    TB_OFFSET: tl.constexpr = 0,            # 遍历块起点（第二次 pass 用 1）
 ):
-    # 网格: (pid_hkv, pid_tb)
     pid_hkv = tl.program_id(0)
-    pid_tb = tl.program_id(1)
+    pid_tb  = tl.program_id(1)
+
+    # 选择要处理的时间块:
+    # - FIRST_LAST_PASS=True 时，n_y=2，对应 tb = 0 与 tb = NTB-1
+    # - 否则 tb = TB_OFFSET + pid_tb
+    tb = TB_OFFSET + pid_tb
+    if FIRST_LAST_PASS:
+        # pid_tb ∈ {0,1}，映射到 {0, NTB-1}
+        tb = pid_tb * (NTB - 1)
 
     base_hq = pid_hkv * G
+    rows = tl.arange(0, BM_DOT)
+    row_mask = rows < G
 
-    # 时间块
-    s0 = pid_tb * BS
+    offs_k = tl.arange(0, K)
+    q_ptrs = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+
+    s0 = tb * BS
     offs_t = s0 + tl.arange(0, BS)
     t_mask = offs_t < T
 
-    # 行补到 16
-    rows = tl.arange(0, BM_DOT)          # [0..15]
-    row_mask = rows < G                  # 只前 G 行有效（真实 Q 行）
-
-    # ---- 1) 直接用完整 K 维做 Q·K^T（[BM_DOT, K] @ [K, BS]）----
-    offs_k = tl.arange(0, K)             # 完整 K 维
-    # Q tile: [BM_DOT, K]
-    q_ptrs = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    q_tile = tl.load(
-        q_ptrs,
-        mask=(row_mask[:, None]),
-        other=0.0
-    ).to(tl.float16)
-
-    # K tile: [K, BS]
     k_ptrs = k + pid_hkv * T * K + (offs_t[None, :] * K) + offs_k[:, None]
-    k_tile = tl.load(
-        k_ptrs,
-        mask=(tl.full([K], True, tl.int1)[:, None] & t_mask[None, :]),
-        other=0.0
-    ).to(tl.float16)
+    k_tile = tl.load(k_ptrs, mask=(tl.full([K], True, tl.int1)[:, None] & t_mask[None, :]), other=0.0).to(tl.float16)
 
-    b_s = tl.dot(q_tile, k_tile, out_dtype=tl.float32)  # [BM_DOT, BS]
-
-    # 以 2 为底的指数域
     RCP_LN2 = 1.4426950408889634
-    b_s = b_s * scale * RCP_LN2
+    NEG_INF = float("-inf")
 
-    # ---- 2) 计算每行（每个 hq）块内最大值与分母 ----
-    NEG_INF = float('-inf')
-    b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)  # [BM_DOT, BS]
-    m_rows = tl.max(b_s_act, axis=1)                   # [BM_DOT]
+    # qk/log2
+    b_s = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
+    b_s_act = tl.where(t_mask[None, :], b_s, NEG_INF)
 
-    # b_p: [BM_DOT, BS]
-    b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
-    l_rows = tl.sum(b_p, axis=1)                       # [BM_DOT]
+    # 每行在该块的最大值
+    m_rows_blk = tl.max(b_s_act, axis=1)
 
-    # 写回 m/l（只写前 G 行）
-    m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
-    tl.store(m_ptrs, m_rows, mask=row_mask)
+    # 是否更新阈值：阈值 = max(first,last) - delta（用原子 max 聚合两个块）
+    if UPDATE_THRES:
+        th_update = m_rows_blk - delta
+        tl.atomic_max(thres_buf + (base_hq + rows), th_update, mask=row_mask)
 
-    l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
+    # 剪枝判定（第一次 pass 关闭剪枝）
+    prune_blk = False
+    if ENABLE_PRUNE:
+        th_rows = tl.load(thres_buf + (base_hq + rows), mask=row_mask, other=NEG_INF)
+        below   = (m_rows_blk < th_rows) & row_mask
+        n_below = tl.sum(below.to(tl.int32), axis=0)
+        n_valid = tl.sum(row_mask.to(tl.int32), axis=0)
+        prune_blk = n_below == n_valid
+
+    v_offs = tl.arange(0, V)
+    o_tile = tl.zeros([BM_DOT, V], tl.float32)
+    m_rows_store = tl.full([BM_DOT], NEG_INF, tl.float32)
+    l_rows = tl.zeros([BM_DOT], tl.float32)
+
+    if not prune_blk:
+        # 标准 Softmax-归一化的分块统计
+        m_rows = m_rows_blk
+        b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
+        l_rows = tl.sum(b_p, axis=1)
+        m_rows_store = m_rows
+
+        need_v = tl.sum(t_mask.to(tl.int32), axis=0) > 0
+        if need_v:
+            v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+            b_v = tl.load(v_ptrs, mask=t_mask[:, None], other=0.0).to(tl.float16)
+            o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
+
+    # 写回中间结果
+    m_ptrs = m_buf + (base_hq + rows) * NTB + tb
+    tl.store(m_ptrs, m_rows_store, mask=row_mask)
+
+    l_ptrs = l_buf + (base_hq + rows) * NTB + tb
     tl.store(l_ptrs, l_rows, mask=row_mask)
 
-    # 该时间块是否有活跃 t
-    need_v = tl.sum(t_mask.to(tl.int32)) > 0
-
-    # ---- 3) 直接用完整 V 维做分子：o_b = b_p · V（[BM_DOT, BS] @ [BS, V]）----
-    v_offs = tl.arange(0, V)             # 完整 V 维
-    o_tile = tl.zeros([BM_DOT, V], tl.float32)
-
-    if need_v:
-        v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
-        b_v = tl.load(
-            v_ptrs,
-            mask=(t_mask[:, None]),
-            other=0.0
-        ).to(tl.float16)  # [BS, V]
-        o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)  # [BM_DOT, V]
-
-    # 只写前 G 行
-    o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + pid_tb * V + v_offs[None, :]
-    tl.store(o_ptrs, o_tile, mask=(row_mask[:, None]))
+    o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + tb * V + v_offs[None, :]
+    tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
 
 
+# stage2 原样
 @triton.jit
 def attn_fwd_stage2(
-    m_buf,       # [HQ, NTB]
-    l_buf,       # [HQ, NTB]
-    o_buf,       # [HQ, NTB, V], fp32
-    o,           # [HQ, V], out dtype = q.dtype
-    lse,         # [HQ], fp32
-    NTB,         # int
-    HQ: tl.constexpr,
-    V: tl.constexpr,
+    m_buf, l_buf, o_buf, o, lse, NTB,
+    HQ: tl.constexpr, V: tl.constexpr,
 ):
-    # 网格: (pid_dummy=0, pid_hq)
     pid_hq = tl.program_id(1)
+    v_offs = tl.arange(0, V)
+    b_m = tl.full((), float('-inf'), tl.float32)
+    b_acc = tl.zeros((), tl.float32)
+    b_o = tl.zeros([V], tl.float32)
 
-    v_offs = tl.arange(0, V)                     # 完整 V 维
-    # 在线合并 across tb（base-2 域）
-    b_m = tl.full((), float('-inf'), tl.float32)  # 当前全局最大值
-    b_acc = tl.zeros((), tl.float32)              # 当前全局分母
-    b_o = tl.zeros([V], tl.float32)               # 当前全局分子向量
-
-    # 沿 tb 做稳定合并
     for tb in range(0, NTB):
-        # 读取该块的统计量
         m_b = tl.load(m_buf + pid_hq * NTB + tb)
         l_b = tl.load(l_buf + pid_hq * NTB + tb)
-
-        # 是否为非空块（有贡献）
         has = l_b > 0.0
 
-        # 只在 has=True 时读分子；否则用 0
-        o_b = tl.load(
-            o_buf + pid_hq * (NTB * V) + tb * V + v_offs,
-            mask=has,
-            other=0.0
-        )
-
-        # 对空块将 m_b 视为 -inf，使其对全局缩放“无操作”
+        o_b = tl.load(o_buf + pid_hq * (NTB * V) + tb * V + v_offs, mask=has, other=0.0)
         m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
 
         new_m = tl.maximum(b_m, m_b_eff)
@@ -149,21 +129,21 @@ def attn_fwd_stage2(
         b_o   = b_o   * r_prev + o_b * r_blk
         b_m   = new_m
 
-    # 归一化与 lse（base-2）
     out_tile = b_o / b_acc
     lse_val = b_m + tl.log2(b_acc)
     tl.store(lse + pid_hq, lse_val)
 
-    # 写回输出
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
+
 def attn_fwd_q1_b1_splitT(
-    q: torch.Tensor,  # [HQ, K], fp16/bf16/fp32
-    k: torch.Tensor,  # [HKV, T, K], same dtype as q
-    v: torch.Tensor,  # [T, HKV, V], same dtype as q
+    q: torch.Tensor,  # [HQ, K]
+    k: torch.Tensor,  # [HKV, T, K]
+    v: torch.Tensor,  # [T, HKV, V]
     scale: float = None,
-    BS: int = 128,    # 时间分块大小（可调，影响 NTB）
+    BS: int = 128,
+    delta: float = 3.0,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -171,44 +151,67 @@ def attn_fwd_q1_b1_splitT(
     HKV, T, Kk = k.shape
     Tv, HKV2, V = v.shape
     assert Kk == K and Tv == T and HKV2 == HKV
-    assert HQ % HKV == 0, "GQA 需要 HQ 是 HKV 的整数倍"
+    assert HQ % HKV == 0
     G = HQ // HKV
 
     if scale is None:
         scale = 1.0 / math.sqrt(K)
 
-    NTB = triton.cdiv(T, BS)  # 时间维被分成 NTB 个分块
+    NTB = triton.cdiv(T, BS)
 
-    # 输出
+    # 输出与中间缓冲
     o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
     lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
-    # 中间缓冲（stage1 -> stage2）
     m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # Stage 1: 同组计算（每个 KV 头一次性处理其 G 个 Q 头），M 维补到16
-    grid1 = (HKV, NTB)
-    attn_fwd_stage1[grid1](
+    # 阈值缓冲：先置为 -inf
+    thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+    thres_buf.fill_(-float('inf'))
+
+    # 1) Stage1 首次 launch：只跑首尾两块，正常计算 + 更新阈值
+    grid_first = (HKV, 1 if NTB == 1 else 2)
+    attn_fwd_stage1_pruned[grid_first](
         q, k, v,
         m_buf, l_buf, o_buf,
+        thres_buf,
         scale, T, NTB,
-        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
-        BS=BS,
-        # BM_DOT=16,
-        # num_warps=4,
-        # num_stages=3,
+        delta,
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS,
+        # 下面这些是 constexpr 参数
+        FIRST_LAST_PASS=True,
+        ENABLE_PRUNE=False,   # 首次不剪枝，确保首尾块一定被计算
+        UPDATE_THRES=True,    # 把(max - delta)聚合到 thres_buf
+        TB_OFFSET=0,
+        # num_warps=4, num_stages=3,
     )
 
-    # Stage 2: 跨时间分块做稳定合并 + 归一化（一次性处理完整 V）
+    # 2) Stage1 第二次 launch：遍历剩余块（tb=1..NTB-2），启用剪枝
+    if NTB > 2:
+        grid_rest = (HKV, NTB - 2)
+        attn_fwd_stage1_pruned[grid_rest](
+            q, k, v,
+            m_buf, l_buf, o_buf,
+            thres_buf,
+            scale, T, NTB,
+            delta,
+            HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS,
+            FIRST_LAST_PASS=False,
+            ENABLE_PRUNE=True,
+            UPDATE_THRES=False,
+            TB_OFFSET=1,        # 从 tb=1 开始
+            # num_warps=4, num_stages=3,
+        )
+
+    # 3) Stage2 合并
     grid2 = (1, HQ)
     attn_fwd_stage2[grid2](
         m_buf, l_buf, o_buf,
         o, lse, NTB,
         HQ=HQ, V=V,
-        # num_warps=4,
-        # num_stages=3,
+        # num_warps=4, num_stages=3,
     )
     return o, lse
 
@@ -372,7 +375,7 @@ if __name__ == "__main__":
         ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
 
-        break
+        # break
 
         # if layer_idx > 0:
         #     break
