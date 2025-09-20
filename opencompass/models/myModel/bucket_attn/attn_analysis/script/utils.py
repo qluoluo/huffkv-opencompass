@@ -53,16 +53,33 @@ def tokenize_text(tokenizer_path, text):
     return tokens
 
 
-def load_from_longbench_jsonl(jsonl_path, line_idx=0):
+def load_from_longbench_jsonl(jsonl_path, line_start=0, line_end=-1):
     import datasets
+    import os
+
+    # 确保 line_start 和 line_end 是整数
+    line_start = int(line_start)
+    line_end = int(line_end)
+    
+    # 如果只指定了一个行号，则只读取该行
+    if line_end < line_start:
+        line_end = line_start
 
     dataset_path = jsonl_path
     dataset = datasets.load_dataset("json", data_files=dataset_path, split="train")
-    raw_text = dataset[line_idx]["context"]
+    
+    # 生成需要读取的行索引列表
+    line_indices = list(range(line_start, line_end + 1))
+    
+    # 获取多个文本行并用换行符连接
+    raw_texts = [dataset[i]["context"] for i in line_indices]
+    raw_text = "\n".join(raw_texts)
 
+    # 生成包含所有索引范围的标识符
+    indices_str = f"{line_start}_{line_end}" if line_end > line_start else f"{line_start}"
     return (
         raw_text,
-        f"longbench_{os.path.splitext(os.path.basename(dataset_path))[0]}_{line_idx}",
+        f"longbench_{os.path.splitext(os.path.basename(dataset_path))[0]}_{indices_str}",
     )
 
 

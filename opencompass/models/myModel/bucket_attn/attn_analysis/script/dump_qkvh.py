@@ -1,8 +1,6 @@
 import os
 import torch
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
 from collections import defaultdict
 from tqdm import tqdm
 import json
@@ -80,47 +78,51 @@ def modify_model_attn(model, save_dirpath):
 if __name__ == "__main__":
     # model_path = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
     model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+
     # save_dirpath = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result'
     save_dirpath = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
 
 
-    # from utils import load_from_longbench_jsonl
-
-    line_idx = 46
-    opencompass_doot_dir = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass'
     
+    # opencompass_doot_dir = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass'
+    opencompass_doot_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass'
+
     # dataset_path = os.path.join(opencompass_doot_dir, 'data/Longbench/data/narrativeqa.jsonl')
     dataset_path = os.path.join(opencompass_doot_dir, 'data/Longbench/data/gov_report.jsonl')
-    raw_text, dataset_name = load_from_longbench_jsonl(dataset_path, line_idx)
+    
+    # line_idx = 50
+    # raw_text, dataset_name = load_from_longbench_jsonl(dataset_path, line_idx)
+    line_start, line_end = 48, 57
+    raw_text, dataset_name = load_from_longbench_jsonl(dataset_path, line_start, line_end)
 
     # dataset_path = os.path.join(opencompass_doot_dir, 'data/babilong/data/qa1/16k.json')
     # raw_text, dataset_name = load_from_babilong_json(dataset_path, line_idx)
-    
+
+    input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids
+
+    print(f"{input_ids.shape=}")
+    c = input("Enter c to continue...")
+    if c != 'c':
+        exit()
+
     save_dirpath = os.path.join(save_dirpath, os.path.basename(model_path), dataset_name)
     os.makedirs(save_dirpath, exist_ok=True)
-
     raw_text_savefp = os.path.join(save_dirpath, "raw_text.txt")
     with open(raw_text_savefp, 'w') as f:
         f.write(raw_text)
-
     save_layerdata_dirpath = os.path.join(save_dirpath, "layer_data")
     os.makedirs(save_layerdata_dirpath, exist_ok=True)
-    
-    # 加载模型和分词器
+
     model = AutoModelForCausalLM.from_pretrained(
         model_path, 
         torch_dtype=torch.bfloat16, 
         device_map='auto',
         trust_remote_code=True,
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    
-    # 修改模型以捕获注意力模式
     model = modify_model_attn(model, save_layerdata_dirpath)
 
-    
-
-    input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids.to(model.device)
-
     with torch.no_grad():
+        
+        input_ids = input_ids.to(model.device)
         model(input_ids)
