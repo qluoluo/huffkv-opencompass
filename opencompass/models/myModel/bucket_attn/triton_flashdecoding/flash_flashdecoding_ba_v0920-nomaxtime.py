@@ -10,6 +10,7 @@ import triton
 import triton.language as tl
 
 
+
 @triton.jit
 def attn_find_threshold_two_blocks(
     q, k, thres_buf, scale, T, NTB, delta,
@@ -75,16 +76,16 @@ def precompute_attn_thresholds(
         q, k, thres_buf,
         scale, T, NTB, delta,
         HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
-        # BM_DOT=16,
-        # num_warps=4,
-        # num_stages=3,
     )
     return thres_buf
 
 
 @triton.jit
 def attn_fwd_stage1_pruned(
-    q, k, v, m_buf, l_buf, o_buf, thres_buf, scale, T, NTB,
+    q, k, v,
+    m_buf, l_buf, o_buf,
+    thres_buf, mask_buf,          # 新增：mask_buf [HKV, NTB]，int8
+    scale, T, NTB,
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, BM_DOT: tl.constexpr = 16,
 ):
@@ -120,74 +121,88 @@ def attn_fwd_stage1_pruned(
     prune_blk = n_below == n_valid
 
     v_offs = tl.arange(0, V)
-    o_tile = tl.zeros([BM_DOT, V], tl.float32)
-
-    m_rows_store = tl.full([BM_DOT], NEG_INF, tl.float32)
-    l_rows = tl.zeros([BM_DOT], tl.float32)
 
     if not prune_blk:
+        # 只有在有效块时才计算并写回中间结果
         m_rows = m_rows_blk
         b_p = tl.where(t_mask[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
         l_rows = tl.sum(b_p, axis=1)
-        m_rows_store = m_rows
 
+        # V 路
         need_v = tl.sum(t_mask.to(tl.int32), axis=0) > 0
+        o_tile = tl.zeros([BM_DOT, V], tl.float32)
         if need_v:
             v_ptrs = v + (offs_t[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
             b_v = tl.load(v_ptrs, mask=t_mask[:, None], other=0.0).to(tl.float16)
             o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
 
         m_ptrs = m_buf + (base_hq + rows) * NTB + pid_tb
-        tl.store(m_ptrs, m_rows_store, mask=row_mask)
-
         l_ptrs = l_buf + (base_hq + rows) * NTB + pid_tb
-        tl.store(l_ptrs, l_rows, mask=row_mask)
-
         o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTB * V) + pid_tb * V + v_offs[None, :]
+
+        tl.store(m_ptrs, m_rows, mask=row_mask)
+        tl.store(l_ptrs, l_rows, mask=row_mask)
         tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
+
+        # 标记该 tb 为有效
+        tl.store(mask_buf + pid_hkv * NTB + pid_tb, tl.full((), 1, tl.int8))
+    else:
+        # 标记该 tb 为无效（阶段2会直接跳过）
+        tl.store(mask_buf + pid_hkv * NTB + pid_tb, tl.full((), 0, tl.int8))
 
 
 @triton.jit
-def attn_fwd_stage2(
-    m_buf,       # [HQ, NTB]
-    l_buf,       # [HQ, NTB]
-    o_buf,       # [HQ, NTB, V], fp32
-    o,           # [HQ, V], out dtype = q.dtype
-    lse,         # [HQ], fp32
-    NTB,         # int
-    HQ: tl.constexpr,
-    V: tl.constexpr,
+def attn_fwd_stage2_masked(
+    m_buf, l_buf, o_buf,     # [HQ, NTB], [HQ, NTB], [HQ, NTB, V]
+    mask_buf,                # [HKV, NTB], int8
+    o,                       # [HQ, V], out dtype = q.dtype
+    lse,                     # [HQ], fp32
+    NTB,                     # int
+    HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
 ):
-    pid_hq = tl.program_id(1)
+    pid_hkv = tl.program_id(0)
+    g       = tl.program_id(1)
+    pid_hq  = pid_hkv * G + g
 
     v_offs = tl.arange(0, V)
-    b_m = tl.full((), float('-inf'), tl.float32)
+    neg_inf = tl.full((), float('-inf'), tl.float32)
+
+    b_m   = neg_inf
     b_acc = tl.zeros((), tl.float32)
-    b_o = tl.zeros([V], tl.float32)
+    b_o   = tl.zeros([V], tl.float32)
 
     for tb in range(0, NTB):
-        m_b = tl.load(m_buf + pid_hq * NTB + tb)
-        l_b = tl.load(l_buf + pid_hq * NTB + tb)
-        has = l_b > 0.0
+        keep = tl.load(mask_buf + pid_hkv * NTB + tb).to(tl.int1)
+        if keep:
+            m_b = tl.load(m_buf + pid_hq * NTB + tb)
+            l_b = tl.load(l_buf + pid_hq * NTB + tb)
+            o_b = tl.load(o_buf + pid_hq * (NTB * V) + tb * V + v_offs)
 
-        o_b = tl.load(o_buf + pid_hq * (NTB * V) + tb * V + v_offs, mask=has, other=0.0)
-        m_b_eff = tl.where(has, m_b, tl.full((), float('-inf'), tl.float32))
+            new_m = tl.maximum(b_m, m_b)
+            r_prev = tl.exp2(b_m - new_m)
+            r_blk  = tl.exp2(m_b - new_m)
 
-        new_m = tl.maximum(b_m, m_b_eff)
-        r_prev = tl.exp2(b_m - new_m)
-        r_blk  = tl.where(has, tl.exp2(m_b - new_m), 0.0)
+            b_acc = b_acc * r_prev + l_b * r_blk
+            b_o   = b_o   * r_prev + o_b * r_blk
+            b_m   = new_m
+        # 否则：直接跳过，无任何 V 维计算
 
-        b_acc = b_acc * r_prev + l_b * r_blk
-        b_o   = b_o   * r_prev + o_b * r_blk
-        b_m   = new_m
+    # 空结果保护
+    is_empty = b_acc == 0.0
+    out_tile = tl.where(is_empty, tl.zeros([V], tl.float32), b_o / b_acc)
+    lse_val  = tl.where(is_empty, neg_inf, b_m + tl.log2(b_acc))
 
-    out_tile = b_o / b_acc
-    lse_val = b_m + tl.log2(b_acc)
     tl.store(lse + pid_hq, lse_val)
-
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
+def compute_skipped_block_ratio(mask_buf: torch.Tensor) -> float:
+    # mask_buf: [HKV, NTB], int8, 1=keep, 0=skip
+    assert mask_buf.dtype == torch.int8
+    kept = mask_buf.to(torch.int32).sum()     # device 上做 sum，避免 int8 溢出
+    total = mask_buf.numel()
+    skip_ratio = 1.0 - (kept.float() / float(total))
+    return float(skip_ratio.item())           # 注意：.item() 会触发同步
 
 def attn_fwd_q1_b1_splitT(
     q: torch.Tensor,      # [HQ, K]
@@ -195,8 +210,9 @@ def attn_fwd_q1_b1_splitT(
     v: torch.Tensor,      # [T, HKV, V]
     scale: float = None,
     BS: int = 128,
-    delta: float = 1000.0,
-    thres_buf: torch.Tensor | None = None,   # 新增：允许外部传入
+    delta: float = 5.0,
+    thres_buf: torch.Tensor | None = None,
+    return_skip_ratio: bool = False,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -213,44 +229,54 @@ def attn_fwd_q1_b1_splitT(
     NTB = triton.cdiv(T, BS)
 
     # 输出与中间缓冲
-    o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
+    o   = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
     lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
     m_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTB), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTB, V), device=q.device, dtype=torch.float32)
 
-    # 阈值缓冲：如果外部没给，就在这里算（默认行为）
+    # 每 (HKV, tb) 的有效性掩码
+    mask_buf = torch.empty((HKV, NTB), device=q.device, dtype=torch.int8)
+
+    # 阈值缓冲：如果外部没给，就在这里算
     if thres_buf is None:
         thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
-        grid_th = (HKV, 1)
-        attn_find_threshold_two_blocks[grid_th](
+        attn_find_threshold_two_blocks[(HKV, 1)](
             q, k, thres_buf,
             scale, T, NTB, delta,
             HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
         )
     else:
-        # 轻量健壮性检查（可选）
         assert thres_buf.shape == (HQ,) and thres_buf.dtype == torch.float32 and thres_buf.device == q.device
 
-    # Stage 1
-    grid1 = (HKV, NTB)
-    attn_fwd_stage1_pruned[grid1](
+    # Stage 1：计算、裁剪并写 mask_buf
+    attn_fwd_stage1_pruned[(HKV, NTB)](
         q, k, v,
         m_buf, l_buf, o_buf,
-        thres_buf,
+        thres_buf, mask_buf,
         scale, T, NTB,
-        HKV=HKV, HQ=HQ, K=K, V=V, G=G,
-        BS=BS,
+        HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS,
     )
 
-    # Stage 2
-    grid2 = (1, HQ)
-    attn_fwd_stage2[grid2](
+    # 如果需要，统计跳过的 block 比率（不建议在计时循环里开启）
+    skip_ratio = None
+    if return_skip_ratio:
+        kept = mask_buf.to(torch.int32).sum()
+        total = mask_buf.numel()
+        skip_ratio = float((1.0 - (kept.float() / float(total))).item())
+
+    # Stage 2：按 mask 跳过无效块
+    attn_fwd_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
+        mask_buf,
         o, lse, NTB,
-        HQ=HQ, V=V,
+        HKV=HKV, G=G, HQ=HQ, V=V,
     )
-    return o, lse
+
+    if return_skip_ratio:
+        return o, lse, skip_ratio
+    else:
+        return o, lse
 
 
 def to_triton_layout(q_rope_1, k_rope, v):
@@ -381,12 +407,13 @@ if __name__ == "__main__":
         )
         torch.cuda.synchronize()
 
-        o_triton, lse_triton = attn_fwd_q1_b1_splitT(
+        o_triton, lse_triton, skip_ratio = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS,
-
             thres_buf=thres_buf,
+            return_skip_ratio=True,   # 仅在这里拿统计；计时时不要开
         )
+        print(f"Skipped block ratio: {skip_ratio:.3%} (over HKV x NTB)")
 
         o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
