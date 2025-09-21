@@ -166,9 +166,9 @@ def attn_fwd_stage1_pruned(
 
             # 标记该 (tb, sb) 为有效
             tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
-        else:
-            # 标记该 (tb, sb) 为无效
-            tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 0, tl.int8))
+        # else:
+        #     # 标记该 (tb, sb) 为无效
+        #     tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 0, tl.int8))
 
 
 @triton.jit
@@ -176,7 +176,6 @@ def attn_fwd_stage2_masked(
     m_buf, l_buf, o_buf,     # [HQ, NTBS], [HQ, NTBS], [HQ, NTBS, V]
     mask_buf,                # [HKV, NTBS], int8（每个小块）
     o,                       # [HQ, V], out dtype = q.dtype
-    lse,                     # [HQ], fp32
     NTBS,                    # int: 总块数 = NTB * NSB
     HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
 ):
@@ -210,9 +209,7 @@ def attn_fwd_stage2_masked(
     # 空结果保护
     is_empty = b_acc == 0.0
     out_tile = tl.where(is_empty, tl.zeros([V], tl.float32), b_o / b_acc)
-    lse_val  = tl.where(is_empty, neg_inf, b_m + tl.log2(b_acc))
 
-    tl.store(lse + pid_hq, lse_val)
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
@@ -259,13 +256,13 @@ def attn_fwd_q1_b1_splitT(
 
     # 输出与中间缓冲（注意 NTBS）
     o   = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
-    lse = torch.empty((HQ,), device=q.device, dtype=torch.float32)
     m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
 
     # 每 (HKV, tb_sb) 的有效性掩码（小块粒度）
-    mask_buf = torch.empty((HKV, NTBS), device=q.device, dtype=torch.int8)
+    # mask_buf = torch.empty((HKV, NTBS), device=q.device, dtype=torch.int8)
+    mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
 
     # 阈值缓冲：如果外部没给，就在这里算
     if thres_buf is None:
@@ -285,6 +282,7 @@ def attn_fwd_q1_b1_splitT(
         thres_buf, mask_buf,
         scale, T, NTB, NTBS,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
+        # num_stages=3, num_warps=8,
     )
 
     # 如果需要，统计跳过的小块比率（不建议在计时循环里开启）
@@ -298,14 +296,15 @@ def attn_fwd_q1_b1_splitT(
     attn_fwd_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
-        o, lse, NTBS,
+        o, NTBS,
         HKV=HKV, G=G, HQ=HQ, V=V,
+        # num_warps=,
     )
 
     if return_skip_ratio:
-        return o, lse, skip_ratio
+        return o, skip_ratio
     else:
-        return o, lse
+        return o
 
 
 def to_triton_layout(q_rope_1, k_rope, v):
@@ -343,30 +342,6 @@ def flash_compute(q_rope_1, k_rope, v):
     return out
 
 
-def lse_reference_base2_gqa(q_triton, k_triton, scale):
-    # 计算 lse 的 reference（以 2 为底），用于与 triton kernel 的 lse 对比（支持 GQA）
-    # q_triton: [HQ,K], k_triton: [HKV,T,K]
-    qf = q_triton.float()
-    kf = k_triton.float()
-    HQ, K = qf.shape
-    HKV, T, Kk = kf.shape
-    assert Kk == K
-    assert HQ % HKV == 0
-    G = HQ // HKV
-    # 扩展 k 到 HQ 个 head（仅用于参考数值）
-    if G != 1:
-        kf_rep = kf.repeat_interleave(G, dim=0)  # [HQ, T, K]
-    else:
-        kf_rep = kf
-    # scores[hq, t] = (q[hq] · kf_rep[hq, t]) * scale
-    scores = torch.einsum('hk, htk -> ht', qf, kf_rep) * scale
-    # 以 e 为底的 logsumexp -> 转成以 2 为底
-    RCP_LN2 = 1.4426950408889634
-    lse_e = torch.logsumexp(scores, dim=-1)         # [HQ]
-    lse_base2 = lse_e * RCP_LN2                     # [HQ]
-    return lse_base2
-
-
 def bench_op(fn, iters=50, warmup=10):
     torch.cuda.synchronize()
     for _ in range(warmup):
@@ -400,9 +375,9 @@ if __name__ == "__main__":
     layer_data_root = os.path.join(exp_root, 'layer_data')
 
     dtype = torch.float16
-    BS = 512
+    BS = 256
     SBS = 256
-    delta = 5.0
+    delta = 8.0
 
     print(f"{BS=}")
 
@@ -411,6 +386,8 @@ if __name__ == "__main__":
     warmup = 100
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
+        # if layer_idx == 0:
+        #     continue
         print(f"\n========== Layer {layer_idx} ==========")
         q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
         k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hkv, T, D]
@@ -437,11 +414,11 @@ if __name__ == "__main__":
 
         thres_buf = precompute_attn_thresholds(
             q_triton, k_triton,
-            scale=scale, BS=BS, delta=delta,
+            scale=scale, BS=SBS, delta=delta,
         )
         torch.cuda.synchronize()
 
-        o_triton, lse_triton, skip_ratio = attn_fwd_q1_b1_splitT(
+        o_triton, skip_ratio = attn_fwd_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, SBS=SBS,
             thres_buf=thres_buf,
@@ -457,21 +434,13 @@ if __name__ == "__main__":
         rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
         rel = rel.item()
 
-        # LSE 参考（高精度，用于 sanity check）
-        lse_ref2 = lse_reference_base2_gqa(q_triton, k_triton, scale)  # [HQ], base-2
-        lse_max_abs = (lse_triton.float() - lse_ref2).abs().max().item()
-        lse_rel = (lse_triton.float() - lse_ref2).abs().max() / (lse_ref2.abs().max().clamp_min(1e-6))
-        lse_rel = lse_rel.item()
-
         print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
-        print(f"LSE (base-2) diff vs FP32 ref: max_abs={lse_max_abs:.3e}, rel={lse_rel:.3e}")
 
         # 性能对比
         def run_triton():
-            o, _ = attn_fwd_q1_b1_splitT(
+            o = attn_fwd_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
-
                 thres_buf=thres_buf,
             )
             return o

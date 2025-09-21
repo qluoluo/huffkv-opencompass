@@ -107,3 +107,8 @@ try:
     from .myModel.interkv.oc_model import LlamaForCausalLM_InterKV_OC
 except:
     pass
+
+try:
+    from .myModel.ffa.oc_model import LlamaForCausalLM_FFA_OC
+except:
+    pass
