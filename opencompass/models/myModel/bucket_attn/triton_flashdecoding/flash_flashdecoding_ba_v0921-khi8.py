@@ -104,8 +104,10 @@ def attn_fwd_stage1_pruned(
 
     offs_k   = tl.arange(0, K)
     q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    # q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
-    q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
+    if not USE_FP8_K:
+        q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    else:
+        q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
 
     # 常量
     RCP_LN2 = 1.4426950408889634
@@ -386,8 +388,9 @@ if __name__ == "__main__":
 
     # exp_root_subdir = 'Llama-3_2-3B/longbench_narrativeqa_42'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_46'
+    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_54'
-    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
+    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
 
     exp_root = os.path.join(exp_root_dir, exp_root_subdir)
     layer_data_root = os.path.join(exp_root, 'layer_data')
@@ -444,6 +447,8 @@ if __name__ == "__main__":
             scale=scale, BS=BS, SBS=SBS,
             thres_buf=thres_buf,
             return_skip_ratio=True,   # 仅在这里拿统计；计时时不要开
+            # use_fp8_k_high_byte=True,
+            use_fp8_k_high_byte=False,
             k_bytes=k_bytes,
         )
         print(f"Skipped block ratio: {skip_ratio:.3%} (over HKV x NTB)")
@@ -464,7 +469,7 @@ if __name__ == "__main__":
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
                 thres_buf=thres_buf,
-                # use_fp8_k_high_byte=False,
+                use_fp8_k_high_byte=False,
                 k_bytes=k_bytes,
             )
             return o
