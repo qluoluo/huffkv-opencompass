@@ -82,14 +82,13 @@ def precompute_attn_thresholds(
 
 @triton.jit
 def attn_fwd_stage1_pruned(
-    q, k, k_bytes, v,                # 新增：k_bytes (fp8_e5m2*)
+    q, k, v,
     m_buf, l_buf, o_buf,
-    thres_buf, mask_buf,
-    scale, T, NTB, NTBS,
+    thres_buf, mask_buf,          # 修改：mask_buf [HKV, NTBS]，int8
+    scale, T, NTB, NTBS,          # 新增：NTBS = NTB * NSB
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
+    G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,  # 新增：SBS（子块大小）
     BM_DOT: tl.constexpr = 16,
-    USE_FP8_K: tl.constexpr = True,  # 是否仅加载 k 的高 8 位（fp8_e5m2）
 ):
     pid_hkv = tl.program_id(0)
     pid_tb  = tl.program_id(1)
@@ -104,10 +103,7 @@ def attn_fwd_stage1_pruned(
 
     offs_k   = tl.arange(0, K)
     q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    if not USE_FP8_K:
-        q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
-    else:
-        q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
+    q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # 常量
     RCP_LN2 = 1.4426950408889634
@@ -117,34 +113,21 @@ def attn_fwd_stage1_pruned(
     # NSB 为编译期常量：每个大块内的子块数（= ceil(BS / SBS)）
     NSB: tl.constexpr = (BS + SBS - 1) // SBS
 
-    # 循环每个子块
+    # 循环每个子块，逻辑与原来 BS 一致
     for sb in tl.static_range(NSB):
         # 子块内的 T 偏移与 mask
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        # K 路：根据开关选择 FP8 高字节还是 FP16
-        if USE_FP8_K:
-            # k_bytes: [HKV, T, K], dtype = float8_e5m2（仅高 8 位）
-            kb_ptrs = k_bytes + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                kb_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            )
-            # ).to(tl.float16)
-        else:
-            # 原 FP16 路
-            k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                k_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            ).to(tl.float16)
+        # K 路
+        k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
+        k_tile = tl.load(k_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
 
-        # 注意：对数底为 2 的 softmax 形式
+        q_tile = q_tile.to(tl.float8e5)
+        k_tile = k_tile.to(tl.float8e5)
+
+        # 注意此处仍是对数底为 2 的 softmax 形式
         b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2  # [BM_DOT, SBS]
-        # b_s     = tl.dot(q_tile, k_tile) * scale * RCP_LN2  # [BM_DOT, SBS]
         b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
 
         # 子块内行最大值
@@ -159,7 +142,7 @@ def attn_fwd_stage1_pruned(
 
         # 写入索引：将子块映射为全局块 idx
         tb_sb = pid_tb * NSB + sb
-        v_offs = tl.arange(0, V) 
+        v_offs = tl.arange(0, V)
 
         if not prune_blk:
             # softmax 规范化（子块内）
@@ -186,7 +169,9 @@ def attn_fwd_stage1_pruned(
 
             # 标记该 (tb, sb) 为有效
             tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
-        # else: 跳过
+        # else:
+        #     # 标记该 (tb, sb) 为无效
+        #     tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 0, tl.int8))
 
 
 @triton.jit
@@ -243,16 +228,14 @@ def compute_skipped_block_ratio(mask_buf: torch.Tensor) -> float:
 
 def attn_fwd_q1_b1_splitT(
     q: torch.Tensor,      # [HQ, K]
-    k: torch.Tensor,      # [HKV, T, K], float16
+    k: torch.Tensor,      # [HKV, T, K]
     v: torch.Tensor,      # [T, HKV, V]
     scale: float = None,
     BS: int = 128,
-    SBS: int | None = None,
+    SBS: int | None = None,   # 新增：sub-block size；默认与 BS 相同（不细分）
     delta: float = 5.0,
     thres_buf: torch.Tensor | None = None,
     return_skip_ratio: bool = False,
-    use_fp8_k_high_byte: bool = True,   # 新增开关：默认开启高 8 位路径
-    k_bytes = None,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -260,7 +243,7 @@ def attn_fwd_q1_b1_splitT(
     HKV, T, Kk = k.shape
     Tv, HKV2, V = v.shape
     assert Kk == K and Tv == T and HKV2 == HKV
-    assert HQ % HKV == 0
+    assert HQ % HKV == 0, "GQA 需要 HQ 是 HKV 的整数倍"
     G = HQ // HKV
 
     if scale is None:
@@ -271,17 +254,20 @@ def attn_fwd_q1_b1_splitT(
     assert 1 <= SBS <= BS
 
     NTB = triton.cdiv(T, BS)
-    NSB = triton.cdiv(BS, SBS)
-    NTBS = NTB * NSB
+    NSB = triton.cdiv(BS, SBS)  # 每个 TB 中的小块数
+    NTBS = NTB * NSB            # 总块数
 
+    # 输出与中间缓冲（注意 NTBS）
     o   = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
     m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
 
+    # 每 (HKV, tb_sb) 的有效性掩码（小块粒度）
+    # mask_buf = torch.empty((HKV, NTBS), device=q.device, dtype=torch.int8)
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
 
-    # 阈值：保持原逻辑（仍然用 fp16 的 k）
+    # 阈值缓冲：如果外部没给，就在这里算
     if thres_buf is None:
         thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
         attn_find_threshold_two_blocks[(HKV, 1)](
@@ -292,34 +278,30 @@ def attn_fwd_q1_b1_splitT(
     else:
         assert thres_buf.shape == (HQ,) and thres_buf.dtype == torch.float32 and thres_buf.device == q.device
 
-    # 准备 k 的字节视图（必须 contiguous）
-    # k_bytes = k.contiguous().view(torch.uint8)
-    # k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2]
-    if k_bytes is None:
-        k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
-
-    # Stage 1：传入 k_bytes，并打开 USE_FP8_K
+    # Stage 1：每个 TB 内部再细分为 NSB 个小块
     attn_fwd_stage1_pruned[(HKV, NTB)](
-        q, k, k_bytes, v,
+        q, k, v,
         m_buf, l_buf, o_buf,
         thres_buf, mask_buf,
         scale, T, NTB, NTBS,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
-        USE_FP8_K=use_fp8_k_high_byte,
         # num_stages=3, num_warps=8,
     )
 
+    # 如果需要，统计跳过的小块比率（不建议在计时循环里开启）
     skip_ratio = None
     if return_skip_ratio:
         kept = mask_buf.to(torch.int32).sum()
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
+    # Stage 2：按 mask 跳过无效小块（遍历 NTBS）
     attn_fwd_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
         HKV=HKV, G=G, HQ=HQ, V=V,
+        # num_warps=,
     )
 
     if return_skip_ratio:
@@ -389,7 +371,6 @@ if __name__ == "__main__":
 
     # exp_root_subdir = 'Llama-3_2-3B/longbench_narrativeqa_42'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_46'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_54'
     exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
 
@@ -399,8 +380,7 @@ if __name__ == "__main__":
     dtype = torch.float16
     BS = 256
     SBS = 256
-    delta = 5.0
-    use_fp8_k_high_byte = True
+    delta = 8.0
 
     print(f"{BS=}")
 
@@ -435,9 +415,6 @@ if __name__ == "__main__":
         q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
         scale = 1.0 / math.sqrt(D)
 
-        k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
-        # k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2]
-
         thres_buf = precompute_attn_thresholds(
             q_triton, k_triton,
             scale=scale, BS=SBS, delta=delta,
@@ -449,8 +426,6 @@ if __name__ == "__main__":
             scale=scale, BS=BS, SBS=SBS,
             thres_buf=thres_buf,
             return_skip_ratio=True,   # 仅在这里拿统计；计时时不要开
-            use_fp8_k_high_byte=use_fp8_k_high_byte,
-            k_bytes=k_bytes,
         )
         print(f"Skipped block ratio: {skip_ratio:.3%} (over HKV x NTB)")
 
@@ -470,8 +445,6 @@ if __name__ == "__main__":
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
                 thres_buf=thres_buf,
-                use_fp8_k_high_byte=use_fp8_k_high_byte,
-                k_bytes=k_bytes,
             )
             return o
 
