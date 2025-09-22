@@ -20,6 +20,7 @@ models/*
 configs/internal/
 
 oc-eval-result
+triton_cache
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

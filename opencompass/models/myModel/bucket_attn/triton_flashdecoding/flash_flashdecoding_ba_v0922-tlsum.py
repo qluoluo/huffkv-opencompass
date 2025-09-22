@@ -395,6 +395,7 @@ if __name__ == "__main__":
     SBS = 64
 
     delta = 8.0
+    
     # use_fp8_k_high_byte = False
     use_fp8_k_high_byte = True
 

@@ -1,14 +1,13 @@
-# 根据阈值筛选qk内积过小的，不进行后续操作
-# 计时不包括筛选时间
+import os
+# os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), "triton_cache")
+# os.environ['TRITON_DUMP_ASSEMBLY'] = "1"
 
 import math
-import os
 from tqdm import tqdm
 
 import torch
 import triton
 import triton.language as tl
-
 
 
 @triton.jit
@@ -146,7 +145,7 @@ def attn_fwd_stage1_pruned(
             ).to(tl.float16)
 
         # 注意：对数底为 2 的 softmax 形式
-        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2  # [BM_DOT, SBS]
+        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32, ) * scale * RCP_LN2  # [BM_DOT, SBS]
         # b_s     = tl.dot(q_tile, k_tile) * scale * RCP_LN2  # [BM_DOT, SBS]
         b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
 
