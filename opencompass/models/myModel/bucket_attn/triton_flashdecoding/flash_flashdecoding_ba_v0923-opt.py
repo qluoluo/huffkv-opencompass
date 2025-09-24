@@ -1,14 +1,13 @@
-# 根据阈值筛选qk内积过小的，不进行后续操作
-# 计时不包括筛选时间
+import os
+# os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), "triton_cache")
+# os.environ['TRITON_DUMP_ASSEMBLY'] = "1"
 
 import math
-import os
 from tqdm import tqdm
 
 import torch
 import triton
 import triton.language as tl
-
 
 
 @triton.jit
@@ -80,108 +79,158 @@ def precompute_attn_thresholds(
     return thres_buf
 
 
+# 说明（总体语义与张量布局）
+# - 本 kernel 处理注意力前向（stage1，子块/裁剪版），以块（TB）+ 子块（SB）的方式扫描序列维度 T。
+# - 网格维度：pid_hkv ∈ [0, HKV)（对应 K/V 头维），pid_tb ∈ [0, NTB)（对应大块 TB）
+# - 每个 pid_hkv 一次性处理 G 行 Q（因此 HQ 必须满足 HQ = HKV * G），每个程序块取 BM_DOT 行（BM_DOT ≥ G），
+#   多余的行由 row_mask 屏蔽。
+# - 子块大小 SBS，TB 大小 BS，子块个数 NSB = ceil(BS / SBS)，NTBS = NTB * NSB（由外部传入，用于输出/掩码缓冲的步幅）
+# - softmax 使用以 2 为底（exp2）的形式：softmax(x) = exp2(x * RCP_LN2)（数值等价）
+#
+# 各输入/输出和缓冲区的 shape 与内存布局（连续方向为最后一维）：
+# - q:       [HQ, K]，行优先，连续维是 K；HQ = HKV * G。
+# - k:       [HKV, T, K]，最后一维 K 连续（在 USE_FP8_K=False 时使用）。
+# - k_bytes: [HKV, T, K]，dtype=float8_e5m2（仅加载 K 的“高 8 位”表征），最后一维 K 连续（在 USE_FP8_K=True 时使用）。
+# - v:       [T, HKV, V]，最后一维 V 连续。
+# - m_buf:   [HQ, NTBS]，行优先，连续维是 NTBS（每个 Q 行 × 所有(tb,sb)的线性索引）。
+# - l_buf:   [HQ, NTBS]，行优先，连续维是 NTBS（对应 softmax 的分母，按子块内规范化）。
+# - o_buf:   [HQ, NTBS, V]，最后一维 V 连续，其次是 NTBS（步幅 NTBS*V）。
+# - thres_buf: [HQ]，每行 Q 的阈值（用于裁剪判断）。
+# - mask_buf:  [HKV, NTBS]，标记(t b, s b)是否有效（保留=1，裁剪=0；裁剪时本 kernel 不写入，默认由外部清零）。
+#
+# 其他标量/常量：
+# - scale: 缩放系数（通常是 1 / sqrt(K)）
+# - T: 序列长度（time dimension）
+# - NTB: TB 的个数（沿 T 方向的大块数）
+# - NTBS: NTB * NSB（所有(tb,sb)对子块的总数；用作输出缓冲步幅）
+# - HKV: K/V 头的数量（编译期常量）
+# - HQ:  Q 头的“行”数量（编译期常量，HQ = HKV * G）
+# - K:   特征维（d_k）
+# - V:   特征维（d_v）
+# - G:   每个 KV 头所对应的 Q 行数（一个程序块处理的有效行数）
+# - BS:  TB 的长度（沿 T 方向的大块大小）
+# - SBS: 子块长度（沿 T 方向的小块大小）
+# - BM_DOT: 每个程序块内部用于 dot 的行 tile 尺寸（BM_DOT ≥ G，超出部分由 row_mask 屏蔽）
+# - USE_FP8_K: 是否从 k_bytes 读取（float8_e5m2），否则从 k（float16）读取
+
 @triton.jit
-def attn_fwd_stage1_pruned(
-    q, k, k_bytes, v,
+def attn_decode_stage1_pruned(
+    q, k, k_bytes, v,                # 新增：k_bytes (fp8_e5m2*)
     m_buf, l_buf, o_buf,
     thres_buf, mask_buf,
     scale, T, NTB, NTBS,
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
-    USE_FP8_K: tl.constexpr = True,
+    BM_DOT: tl.constexpr = 16,
+    # BM_DOT: tl.constexpr = 32,
+    USE_FP8_K: tl.constexpr = True,  # 是否仅加载 k 的高 8 位（fp8_e5m2）
 ):
-    # tile 维度：headq
-    pid_hq = tl.program_id(0)
-    pid_tb = tl.program_id(1)
+    pid_hkv = tl.program_id(0)  # 标量，int32，取值范围 [0, HKV)
+    pid_tb  = tl.program_id(1)  # 标量，int32，取值范围 [0, NTB)
+    base_hq = pid_hkv * G       # 标量，int32；该 KV 头对应的 Q 行起始索引（在 [0, HQ)）
 
-    # 由 headq 推出 headkv
-    hkv = pid_hq // G
-
-    # 本 TB 的起始全局 T 偏移
+    # 本 TB 的起始全局 T 偏移（标量）
     s0 = pid_tb * BS
 
-    # Q 行向量
-    offs_k = tl.arange(0, K)
-    q_row = tl.load(q + pid_hq * K + offs_k).to(tl.float16)
-    # q_row = tl.load(q + pid_hq * K + offs_k, other=0.0).to(tl.float16)
+    # 行/列常量与 Q tile
+    rows     = tl.arange(0, BM_DOT)                 # [BM_DOT]，int32，当前程序块内的行索引（局部）
+    row_mask = rows < G                             # [BM_DOT]，bool，前 G 行有效，其余行（若 BM_DOT>G）被屏蔽
+
+    offs_k   = tl.arange(0, K)                      # [K]，int32，K 维上的列偏移
+    # q_ptrs 指向一个 [BM_DOT, K] 的 tile（行是 base_hq+rows，列是 offs_k）
+    # 内存布局：q 是 [HQ, K] 行优先（K 连续）
+    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    # if not USE_FP8_K:
+    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    # else:
+    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
+
+    q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)  # [BM_DOT, K]，fp16
 
     # 常量
-    RCP_LN2 = 1.4426950408889634
-    NEG_INF = float("-inf")
+    RCP_LN2 = 1.4426950408889634                 # 标量，float64，= 1 / ln(2)
+    NEG_INF = float("-inf")                      # 标量，float64，用于屏蔽无效位置
+    TRUE_K  = tl.full([K], True, tl.int1)        # [K]，bool，全 True，用于便捷构造掩码
 
-    # 每个大块内的子块数（= ceil(BS / SBS)）
-    NSB: tl.constexpr = (BS + SBS - 1) // SBS
-
-    v_offs = tl.arange(0, V)
+    # NSB 为编译期常量：每个大块内的子块数（= ceil(BS / SBS)）
+    NSB: tl.constexpr = (BS + SBS - 1) // SBS    # 标量，constexpr
 
     # 循环每个子块
-    for sb in tl.static_range(NSB):
+    for sb in tl.static_range(NSB):              # sb: 编译期静态循环，范围 [0, NSB)
         # 子块内的 T 偏移与 mask
-        offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
-        t_mask_sb = offs_t_sb < T
+        offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)  # [SBS]，int32，当前子块覆盖的 T 索引
+        t_mask_sb = offs_t_sb < T                       # [SBS]，bool，越界屏蔽（最后一块可能不满）
 
-        # 载入 K 子块（[K, SBS]）
+        # K 路：根据开关选择 FP8 高字节还是 FP16
         if USE_FP8_K:
-            # k_bytes: [HKV, T, K], dtype = float8_e5m2（仅高 8 位）
-            kb_ptrs = k_bytes + hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
+            # k_bytes: [HKV, T, K], dtype = float8_e5m2（仅高 8 位表示）
+            # kb_ptrs 对应一个 [K, SBS] 的 tile（列主视角，仅指针算式；真实 load 结果转置到 [K, SBS]）
+            # 内存访问：先选中第 pid_hkv 个头，再按 T * K 展开，最终取 K 维为最快维
+            kb_ptrs = k_bytes + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
             k_tile = tl.load(
                 kb_ptrs,
-                mask=t_mask_sb[None, :],
+                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),  # [K, SBS]，bool
                 other=0.0
-            ).to(tl.float16)
+            # )
+            ).to(tl.float16)  # k_tile: [K, SBS]，fp16（由 fp8_e5m2 解码到 fp16）
         else:
-            k_ptrs = k + hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
+            # 原 FP16 路
+            # k_ptrs 指向 [K, SBS] 的 tile，布局同上
+            k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
             k_tile = tl.load(
                 k_ptrs,
-                mask=t_mask_sb[None, :],
+                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),  # [K, SBS]
                 other=0.0
-            ).to(tl.float16)
+            ).to(tl.float16)  # [K, SBS]，fp16
 
-        # QK：改为 tl.sum（float32 累加）
-        # q_f32 = q_row.to(tl.float32)                 # [K]
-        # k_f32 = k_tile.to(tl.float32)                # [K, SBS]
-        # b_s   = tl.sum(q_f32[:, None] * k_f32, axis=0) * scale * RCP_LN2  # [SBS]
-        b_s   = tl.sum(q_row[:, None] * k_tile, axis=0) * scale * RCP_LN2  # [SBS]
-        b_s_act = tl.where(t_mask_sb, b_s, NEG_INF)
+        # 注意：对数底为 2 的 softmax 形式
+        # q_tile: [BM_DOT, K]，k_tile: [K, SBS] -> b_s: [BM_DOT, SBS]（fp32 累加）
+        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2  # [BM_DOT, SBS]
+        # 对越界 T 位置填充 -inf
+        b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)                      # [BM_DOT, SBS]
 
-        # 子块内最大值（标量）
-        m_blk = tl.max(b_s_act, axis=0)
+        # 子块内行最大值（按列 axis=1 归约）
+        m_rows_blk = tl.max(b_s_act, axis=1)  # [BM_DOT]，每行在该子块上的最大值（用于数稳 softmax）
 
-        # 阈值与裁剪（对单行）
-        th = tl.load(thres_buf + pid_hq)
-        prune_blk = m_blk < th
+        # 阈值与裁剪
+        # 加载阈值（无效行用 -inf 占位）
+        th_rows = tl.load(thres_buf + (base_hq + rows), mask=row_mask, other=NEG_INF)  # [BM_DOT]
+
+        # 统计满足 m_rows_blk >= th_rows 的有效行数；若为 0 则整块裁剪
+        n_keep    = tl.sum(((m_rows_blk >= th_rows) & row_mask).to(tl.int32), axis=0)  # 标量，int32
+        prune_blk = n_keep == 0
 
         # 写入索引：将子块映射为全局块 idx
-        tb_sb = pid_tb * NSB + sb
+        tb_sb = pid_tb * NSB + sb  # 标量，int32，范围 [0, NTBS)
+        v_offs = tl.arange(0, V)   # [V]，int32，V 维偏移
 
         if not prune_blk:
-            # softmax（子块内）
-            b_p = tl.where(t_mask_sb, tl.exp2(b_s - m_blk), 0.0)  # [SBS]
-            l_b = tl.sum(b_p, axis=0)                             # 标量
+            # softmax 规范化（子块内）
+            m_rows = m_rows_blk                                                     # [BM_DOT]
+            b_p    = tl.where(t_mask_sb[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)  # [BM_DOT, SBS]，fp32
+            l_rows = tl.sum(b_p, axis=1)                                            # [BM_DOT]，softmax 分母（子块内）
 
-            # V：按需加载
-            need_v = tl.sum(t_mask_sb.to(tl.int32), axis=0) > 0
-            o_row = tl.zeros([V], tl.float32)
-            if need_v:
-                # v: [T, HKV, V]
-                v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (hkv * V) + v_offs[None, :]
-                b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)  # [SBS, V]
-
-                # P·V：也改为 tl.sum（float32 累加）
-                o_row = tl.sum(b_p[:, None].to(tl.float32) * b_v.to(tl.float32), axis=0)     # [V]
+            # V 路
+            # v: [T, HKV, V]，V 连续
+            v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+            b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)   # [SBS, V]，fp16
+            o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)                 # [BM_DOT, V]
 
             # 写回（注意 stride 里的 NTBS）
-            tl.store(m_buf + pid_hq * NTBS + tb_sb, m_blk)
-            tl.store(l_buf + pid_hq * NTBS + tb_sb, l_b)
-            tl.store(o_buf + pid_hq * (NTBS * V) + tb_sb * V + v_offs, o_row)
+            m_ptrs = m_buf + (base_hq + rows) * NTBS + tb_sb
+            l_ptrs = l_buf + (base_hq + rows) * NTBS + tb_sb
+            o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTBS * V) + tb_sb * V + v_offs[None, :]
 
-            # 标记该 (hkv, tb_sb) 为有效（并发写 1 幂等）
-            tl.store(mask_buf + hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
-        # else: 跳过
+            tl.store(m_ptrs, m_rows, mask=row_mask)           # 写入每行的 m（数稳项）
+            tl.store(l_ptrs, l_rows, mask=row_mask)           # 写入每行的 l（softmax 分母）
+            tl.store(o_ptrs, o_tile, mask=row_mask[:, None])  # 写入部分输出（按子块累积）
+
+            # 标记该 (tb, sb) 为有效
+            tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
 
 
 @triton.jit
-def attn_fwd_stage2_masked(
+def attn_decode_stage2_masked(
     m_buf, l_buf, o_buf,     # [HQ, NTBS], [HQ, NTBS], [HQ, NTBS, V]
     mask_buf,                # [HKV, NTBS], int8（每个小块）
     o,                       # [HQ, V], out dtype = q.dtype
@@ -290,7 +339,7 @@ def attn_fwd_q1_b1_splitT(
         k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
 
     # Stage 1：传入 k_bytes，并打开 USE_FP8_K
-    attn_fwd_stage1_pruned[(HQ, NTB)](
+    attn_decode_stage1_pruned[(HKV, NTB)](
         q, k, k_bytes, v,
         m_buf, l_buf, o_buf,
         thres_buf, mask_buf,
@@ -306,7 +355,7 @@ def attn_fwd_q1_b1_splitT(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    attn_fwd_stage2_masked[(HKV, G)](
+    attn_decode_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
@@ -388,15 +437,9 @@ if __name__ == "__main__":
     layer_data_root = os.path.join(exp_root, 'layer_data')
 
     dtype = torch.float16
-
-    # BS = 1024
-    # SBS = 1024
-
-    BS = 64
-    SBS = 64
-
+    BS = 256
+    SBS = 256
     delta = 8.0
-    
     # use_fp8_k_high_byte = False
     use_fp8_k_high_byte = True
 
@@ -405,6 +448,9 @@ if __name__ == "__main__":
     # 计时参数
     iters = 100
     warmup = 100
+
+    # iters = 1
+    # warmup = 0
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         # if layer_idx == 0:
@@ -438,7 +484,7 @@ if __name__ == "__main__":
 
         thres_buf = precompute_attn_thresholds(
             q_triton, k_triton,
-            scale=scale, BS=128, delta=delta,
+            scale=scale, BS=SBS, delta=delta,
         )
         torch.cuda.synchronize()
 
@@ -469,6 +515,7 @@ if __name__ == "__main__":
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
                 thres_buf=thres_buf,
+                return_skip_ratio=False,   # 计时时不开
                 use_fp8_k_high_byte=use_fp8_k_high_byte,
                 k_bytes=k_bytes,
             )

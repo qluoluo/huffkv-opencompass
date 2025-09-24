@@ -401,7 +401,7 @@ if __name__ == "__main__":
     dtype = torch.float16
     BS = 256
     SBS = 256
-    delta = 8.0
+    delta = 5.0
     # use_fp8_k_high_byte = False
     use_fp8_k_high_byte = True
 
@@ -411,9 +411,12 @@ if __name__ == "__main__":
     iters = 100
     warmup = 100
 
+    # iters = 1
+    # warmup = 0
+
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
-        # if layer_idx == 0:
-        #     continue
+        if layer_idx == 0:
+            continue
         print(f"\n========== Layer {layer_idx} ==========")
         q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
         k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hkv, T, D]
@@ -474,6 +477,7 @@ if __name__ == "__main__":
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
                 thres_buf=thres_buf,
+                return_skip_ratio=False,   # 计时时不开
                 use_fp8_k_high_byte=use_fp8_k_high_byte,
                 k_bytes=k_bytes,
             )
@@ -486,7 +490,7 @@ if __name__ == "__main__":
         ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
 
-        # break
+        break
 
         # if layer_idx > 0:
         #     break
