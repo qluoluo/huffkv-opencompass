@@ -282,79 +282,95 @@ def compute_skipped_block_ratio(mask_buf: torch.Tensor) -> float:
 
 
 def attn_fwd_q1_b1_splitT(
-    q: torch.Tensor,      # [HQ, K]
-    k: torch.Tensor,      # [HKV, T, K], float16
-    v: torch.Tensor,      # [T, HKV, V]
-    scale: float = None,
+    q_rope_1: torch.Tensor,   # [B, Hq, 1, D]
+    k_rope:   torch.Tensor,   # [B, Hkv, T, D]
+    v:        torch.Tensor,   # [B, Hkv, T, Dv]
+    *,
     BS: int = 128,
     SBS: int | None = None,
     delta: float = 5.0,
-    thres_buf: torch.Tensor | None = None,
+    use_fp8_k_high_byte: bool = True,
     return_skip_ratio: bool = False,
-    use_fp8_k_high_byte: bool = True,   # 新增开关：默认开启高 8 位路径
-    k_bytes = None,
 ):
-    assert q.is_cuda and k.is_cuda and v.is_cuda
-    assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
-    HQ, K = q.shape
-    HKV, T, Kk = k.shape
-    Tv, HKV2, V = v.shape
-    assert Kk == K and Tv == T and HKV2 == HKV
-    assert HQ % HKV == 0
+    """
+    输入/输出与 flash_compute 保持一致的 API：
+      attn_fwd_q1_b1_splitT(q_rope_1, k_rope, v) -> out  (默认仅返回 out)
+    其余参数作为可选 keyword 控制，默认不影响与 flash_compute 的一致性。
+    """
+    assert q_rope_1.is_cuda and k_rope.is_cuda and v.is_cuda
+    assert q_rope_1.ndim == 4 and k_rope.ndim == 4 and v.ndim == 4
+
+    B, Hq, qlen, Dq = q_rope_1.shape
+    Bk, Hkv, T, Dk  = k_rope.shape
+    Bv, Hvv, Tv, Dv = v.shape
+
+    # 形状/约束校验（与原 demo 一致）
+    assert B == Bk == Bv == 1, "该 kernel 仅支持 batch=1"
+    assert qlen == 1,          "该 kernel 仅支持 qlen=1"
+    assert Hkv == Hvv,         "k/v 的 head 数必须一致"
+    assert Dq == Dk,           "q/k head_dim 不一致"
+    assert T == Tv,            "k/v 的 seq_len 不一致"
+    assert Hq % Hkv == 0,      "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
+
+    # 将 layout 转为 Triton 内核所需
+    q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)  # q:[HQ,K], k:[HKV,T,K], v:[T,HKV,V]
+    HQ, K = q_triton.shape
+    HKV, Tk, Kk = k_triton.shape
+    Tv2, HKV2, V = v_triton.shape
+    assert Tk == T and Tv2 == T and HKV2 == HKV and Kk == K
+
     G = HQ // HKV
-
-    if scale is None:
-        scale = 1.0 / math.sqrt(K)
-
     if SBS is None:
         SBS = BS
     assert 1 <= SBS <= BS
 
-    NTB = triton.cdiv(T, BS)
-    NSB = triton.cdiv(BS, SBS)
+    # scale
+    scale = 1.0 / math.sqrt(K)
+
+    # 块参数
+    NTB  = triton.cdiv(T, BS)
+    NSB  = triton.cdiv(BS, SBS)
     NTBS = NTB * NSB
 
-    o   = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
-    m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
-    l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
-    o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
+    # 预处理1：阈值（注意这里应使用 TB 大小 BS，而非 SBS）
+    thres_buf = torch.empty((HQ,), device=q_triton.device, dtype=torch.float32)
+    attn_find_threshold_two_blocks[(HKV, 1)](
+        q_triton, k_triton, thres_buf,
+        scale, T, NTB, delta,
+        HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
+    )
 
-    mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
-
-    # 阈值：保持原逻辑（仍然用 fp16 的 k）
-    if thres_buf is None:
-        thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
-        attn_find_threshold_two_blocks[(HKV, 1)](
-            q, k, thres_buf,
-            scale, T, NTB, delta,
-            HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
-        )
+    # 预处理2：k 的高 8 位（如需）
+    if use_fp8_k_high_byte:
+        k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous()
     else:
-        assert thres_buf.shape == (HQ,) and thres_buf.dtype == torch.float32 and thres_buf.device == q.device
+        k_bytes = None  # 内核里仍会传参，但分支不会用到
 
-    # 准备 k 的字节视图（必须 contiguous）
-    # k_bytes = k.contiguous().view(torch.uint8)
-    # k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2]
-    if k_bytes is None:
-        k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
+    # 中间缓冲
+    o      = torch.empty((HQ, V), device=q_triton.device, dtype=q_triton.dtype)
+    m_buf  = torch.empty((HQ, NTBS), device=q_triton.device, dtype=torch.float32)
+    l_buf  = torch.empty((HQ, NTBS), device=q_triton.device, dtype=torch.float32)
+    o_buf  = torch.empty((HQ, NTBS, V), device=q_triton.device, dtype=torch.float32)
+    mask_buf = torch.zeros((HKV, NTBS), device=q_triton.device, dtype=torch.int8)
 
-    # Stage 1：传入 k_bytes，并打开 USE_FP8_K
+    # Stage 1
     attn_decode_stage1_pruned[(HKV, NTB)](
-        q, k, k_bytes, v,
+        q_triton, k_triton, k_bytes if k_bytes is not None else k_triton, v_triton,
         m_buf, l_buf, o_buf,
         thres_buf, mask_buf,
         scale, T, NTB, NTBS,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
         USE_FP8_K=use_fp8_k_high_byte,
-        # num_stages=3, num_warps=8,
     )
 
+    # 可选统计
     skip_ratio = None
     if return_skip_ratio:
         kept = mask_buf.to(torch.int32).sum()
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
+    # Stage 2
     attn_decode_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
@@ -362,6 +378,7 @@ def attn_fwd_q1_b1_splitT(
         HKV=HKV, G=G, HQ=HQ, V=V,
     )
 
+    # 返回：默认与 flash_compute 一致（只返回 out）
     if return_skip_ratio:
         return o, skip_ratio
     else:
@@ -463,45 +480,19 @@ if __name__ == "__main__":
         # 只取最后一个查询位置 -> qlen=1
         q_rope_1 = q_rope[:, :, -1:, :]  # [B, Hq, 1, D]
 
-        B, Hq, qlen, D = q_rope_1.shape
-        Bk, Hkv, T, Dk = k_rope.shape
-        Bv, Hv, Tv, Dv = v.shape
-        assert B == 1, "该 demo 仅支持 batch=1"
-        assert qlen == 1, "该 demo 仅支持 qlen=1"
-        assert Hkv == Hv, "k/v heads 必须一致"
-        assert D == Dk, "q/k head_dim 不一致"
-        assert T == Tv
-        assert Hq % Hkv == 0, "GQA 要求 Hq 是 Hkv 的整数倍（或 MQA Hkv=1）"
-
-        print(f"{T=} {Hq=} {Hkv=} {D=} {Dv=}")
-
-        # 准备给 Triton 内核的布局（支持 GQA）
-        q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
-        scale = 1.0 / math.sqrt(D)
-
-        k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
-        # k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2]
-
-        thres_buf = precompute_attn_thresholds(
-            q_triton, k_triton,
-            scale=scale, BS=SBS, delta=delta,
-        )
-        torch.cuda.synchronize()
-
+        # 直接调用（输入/输出与 flash_compute 一致）
         o_triton, skip_ratio = attn_fwd_q1_b1_splitT(
-            q_triton, k_triton, v_triton,
-            scale=scale, BS=BS, SBS=SBS,
+            q_rope_1, k_rope, v,
+            BS=BS, SBS=SBS,
             delta=delta,
-            thres_buf=thres_buf,
-            return_skip_ratio=True,   # 仅在这里拿统计；计时时不要开
             use_fp8_k_high_byte=use_fp8_k_high_byte,
-            k_bytes=k_bytes,
+            return_skip_ratio=True,   # 如需统计可打开；对齐 flash 行为时设为 False
         )
         print(f"Skipped block ratio: {skip_ratio:.3%} (over HKV x NTB)")
 
-        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
+        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, Dv]
 
-        # 数值对比（与 Flash 输出）
+        # 数值对比
         max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
         mean_abs = (o_triton.float() - o_flash.float()).abs().mean().item()
         rel = (o_triton.float() - o_flash.float()).abs().max() / (o_flash.float().abs().max().clamp_min(1e-6))
@@ -511,15 +502,12 @@ if __name__ == "__main__":
 
         # 性能对比
         def run_triton():
-            o = attn_fwd_q1_b1_splitT(
-                q_triton, k_triton, v_triton,
-                scale=scale, BS=BS, SBS=SBS,
-                thres_buf=thres_buf,
-                return_skip_ratio=False,   # 计时时不开
+            return attn_fwd_q1_b1_splitT(
+                q_rope_1, k_rope, v,
+                BS=BS, SBS=SBS,
                 use_fp8_k_high_byte=use_fp8_k_high_byte,
-                k_bytes=k_bytes,
+                return_skip_ratio=False,  # 计时时关闭
             )
-            return o
 
         def run_flash():
             return flash_compute(q_rope_1, k_rope, v)
