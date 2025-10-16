@@ -12,8 +12,8 @@ import triton.language as tl
 
 
 @triton.jit
-def attn_find_threshold_two_blocks(
-    q, k, thres_buf, scale, T, NTB, delta,
+def attn_compute_threshold_two_blocks(
+    q, k, threshold_buf, scale, T, NTB, delta,
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, G: tl.constexpr, BS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
 ):
@@ -52,10 +52,10 @@ def attn_find_threshold_two_blocks(
 
     m2 = tl.maximum(m0, m1)
     th = m2 - delta
-    tl.store(thres_buf + (base_hq + rows), th, mask=row_mask)
+    tl.store(threshold_buf + (base_hq + rows), th, mask=row_mask)
 
 
-def precompute_attn_thresholds(
+def compute_attn_thresholds(
     q: torch.Tensor,    # [HQ, K]
     k: torch.Tensor,    # [HKV, T, K]
     scale: float,
@@ -69,28 +69,26 @@ def precompute_attn_thresholds(
     G = HQ // HKV
     NTB = triton.cdiv(T, BS)
 
-    thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+    threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
     grid_th = (HKV, 1)
-    attn_find_threshold_two_blocks[grid_th](
-        q, k, thres_buf,
+    attn_compute_threshold_two_blocks[grid_th](
+        q, k, threshold_buf,
         scale, T, NTB, delta,
         HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
     )
-    return thres_buf
+    return threshold_buf
 
 
 @triton.jit
-def attn_fwd_stage1_pruned(
-    q, k, k_bytes, v,                # 新增：k_bytes (fp8_e5m2*)
+def attn_forward_stage1_pruned(
+    q, k, v,
     m_buf, l_buf, o_buf,
-    thres_buf, mask_buf,
+    threshold_buf, mask_buf,
     scale, T, NTB, NTBS,
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
-    # BM_DOT: tl.constexpr = 32,
-    USE_FP8_K: tl.constexpr = True,  # 是否仅加载 k 的高 8 位（fp8_e5m2）
 ):
     pid_hkv = tl.program_id(0)
     pid_tb  = tl.program_id(1)
@@ -105,12 +103,7 @@ def attn_fwd_stage1_pruned(
 
     offs_k   = tl.arange(0, K)
     q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    # if not USE_FP8_K:
-    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
-    # else:
-    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
-
-    q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # 常量
     RCP_LN2 = 1.4426950408889634
@@ -126,35 +119,23 @@ def attn_fwd_stage1_pruned(
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        # K 路：根据开关选择 FP8 高字节还是 FP16
-        if USE_FP8_K:
-            # k_bytes: [HKV, T, K], dtype = float8_e5m2（仅高 8 位）
-            kb_ptrs = k_bytes + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                kb_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            # )
-            ).to(tl.float16)
-        else:
-            # 原 FP16 路
-            k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                k_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            ).to(tl.float16)
+        # K 路：使用 FP16
+        k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
+        k_tile = tl.load(
+            k_ptrs,
+            mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
+            other=0.0
+        ).to(tl.float16)
 
         # 注意：对数底为 2 的 softmax 形式
-        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32, ) * scale * RCP_LN2  # [BM_DOT, SBS]
-        # b_s     = tl.dot(q_tile, k_tile) * scale * RCP_LN2  # [BM_DOT, SBS]
+        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2  # [BM_DOT, SBS]
         b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
 
         # 子块内行最大值
         m_rows_blk = tl.max(b_s_act, axis=1)
 
         # 阈值与裁剪
-        th_rows = tl.load(thres_buf + (base_hq + rows), mask=row_mask, other=NEG_INF)
+        th_rows = tl.load(threshold_buf + (base_hq + rows), mask=row_mask, other=NEG_INF)
         below   = (m_rows_blk < th_rows) & row_mask
         n_below = tl.sum(below.to(tl.int32), axis=0)
         n_valid = tl.sum(row_mask.to(tl.int32), axis=0)
@@ -162,7 +143,7 @@ def attn_fwd_stage1_pruned(
 
         # 写入索引：将子块映射为全局块 idx
         tb_sb = pid_tb * NSB + sb
-        v_offs = tl.arange(0, V) 
+        v_offs = tl.arange(0, V)
 
         if not prune_blk:
             # softmax 规范化（子块内）
@@ -193,7 +174,7 @@ def attn_fwd_stage1_pruned(
 
 
 @triton.jit
-def attn_fwd_stage2_masked(
+def attn_forward_stage2_masked(
     m_buf, l_buf, o_buf,     # [HQ, NTBS], [HQ, NTBS], [HQ, NTBS, V]
     mask_buf,                # [HKV, NTBS], int8（每个小块）
     o,                       # [HQ, V], out dtype = q.dtype
@@ -244,7 +225,7 @@ def compute_skipped_block_ratio(mask_buf: torch.Tensor) -> float:
     return float(skip_ratio.item())           # 注意：.item() 会触发同步
 
 
-def attn_fwd_q1_b1_splitT(
+def attn_forward_q1_b1_splitT(
     q: torch.Tensor,      # [HQ, K]
     k: torch.Tensor,      # [HKV, T, K], float16
     v: torch.Tensor,      # [T, HKV, V]
@@ -252,10 +233,8 @@ def attn_fwd_q1_b1_splitT(
     BS: int = 128,
     SBS: int | None = None,
     delta: float = 5.0,
-    thres_buf: torch.Tensor | None = None,
+    threshold_buf: torch.Tensor | None = None,
     return_skip_ratio: bool = False,
-    use_fp8_k_high_byte: bool = True,   # 新增开关：默认开启高 8 位路径
-    k_bytes = None,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.ndim == 2 and k.ndim == 3 and v.ndim == 3
@@ -285,30 +264,23 @@ def attn_fwd_q1_b1_splitT(
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
 
     # 阈值：保持原逻辑（仍然用 fp16 的 k）
-    if thres_buf is None:
-        thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
-        attn_find_threshold_two_blocks[(HKV, 1)](
-            q, k, thres_buf,
+    if threshold_buf is None:
+        threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+        attn_compute_threshold_two_blocks[(HKV, 1)](
+            q, k, threshold_buf,
             scale, T, NTB, delta,
             HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
         )
     else:
-        assert thres_buf.shape == (HQ,) and thres_buf.dtype == torch.float32 and thres_buf.device == q.device
+        assert threshold_buf.shape == (HQ,) and threshold_buf.dtype == torch.float32 and threshold_buf.device == q.device
 
-    # 准备 k 的字节视图（必须 contiguous）
-    # k_bytes = k.contiguous().view(torch.uint8)
-    # k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2]
-    if k_bytes is None:
-        k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
-
-    # Stage 1：传入 k_bytes，并打开 USE_FP8_K
-    attn_fwd_stage1_pruned[(HKV, NTB)](
-        q, k, k_bytes, v,
+    # Stage 1：仅使用 FP16 的 k
+    attn_forward_stage1_pruned[(HKV, NTB)](
+        q, k, v,
         m_buf, l_buf, o_buf,
-        thres_buf, mask_buf,
+        threshold_buf, mask_buf,
         scale, T, NTB, NTBS,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
-        USE_FP8_K=use_fp8_k_high_byte,
         # num_stages=3, num_warps=8,
     )
 
@@ -318,7 +290,7 @@ def attn_fwd_q1_b1_splitT(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    attn_fwd_stage2_masked[(HKV, G)](
+    attn_forward_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
@@ -331,7 +303,7 @@ def attn_fwd_q1_b1_splitT(
         return o
 
 
-def to_triton_layout(q_rope_1, k_rope, v):
+def convert_to_triton_layout(q_rope_1, k_rope, v):
     # q_rope_1: [B, Hq, 1, D], k_rope: [B, Hkv, T, D], v: [B, Hkv, T, Dv]
     # 返回 q:[HQ,K], k:[HKV,T,K], v:[T,HKV,V]
     assert q_rope_1.ndim == 4 and k_rope.ndim == 4 and v.ndim == 4
@@ -353,7 +325,7 @@ def to_triton_layout(q_rope_1, k_rope, v):
     return q_triton, k_triton, v_triton
 
 
-def flash_compute(q_rope_1, k_rope, v):
+def flash_attn_compute(q_rope_1, k_rope, v):
     from flash_attn import flash_attn_func
     # q_rope_1: [B=1, H, 1, D], k_rope: [1, H, T, D], v: [1, H, T, Dv]
     out = flash_attn_func(
@@ -366,7 +338,7 @@ def flash_compute(q_rope_1, k_rope, v):
     return out
 
 
-def bench_op(fn, iters=50, warmup=10):
+def benchmark(fn, iters=50, warmup=10):
     torch.cuda.synchronize()
     for _ in range(warmup):
         _ = fn()
@@ -384,7 +356,7 @@ def bench_op(fn, iters=50, warmup=10):
 
 
 if __name__ == "__main__":
-    from utils import load_qkvh
+    from load_utils import load_qkvh
 
     torch.set_float32_matmul_precision("high")
 
@@ -404,17 +376,12 @@ if __name__ == "__main__":
     BS = 256
     SBS = 256
     delta = 5.0
-    # use_fp8_k_high_byte = False
-    use_fp8_k_high_byte = True
 
     print(f"{BS=}")
 
     # 计时参数
     iters = 100
     warmup = 100
-
-    # iters = 1
-    # warmup = 0
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         if layer_idx == 0:
@@ -440,30 +407,25 @@ if __name__ == "__main__":
         print(f"{T=} {Hq=} {Hkv=} {D=} {Dv=}")
 
         # 准备给 Triton 内核的布局（支持 GQA）
-        q_triton, k_triton, v_triton = to_triton_layout(q_rope_1, k_rope, v)
+        q_triton, k_triton, v_triton = convert_to_triton_layout(q_rope_1, k_rope, v)
         scale = 1.0 / math.sqrt(D)
 
-        k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
-        # k_bytes = k_triton.contiguous().view(torch.float8_e5m2)[..., 1::2]
-
-        thres_buf = precompute_attn_thresholds(
+        threshold_buf = compute_attn_thresholds(
             q_triton, k_triton,
             scale=scale, BS=SBS, delta=delta,
         )
         torch.cuda.synchronize()
 
-        o_triton, skip_ratio = attn_fwd_q1_b1_splitT(
+        o_triton, skip_ratio = attn_forward_q1_b1_splitT(
             q_triton, k_triton, v_triton,
             scale=scale, BS=BS, SBS=SBS,
             delta=delta,
-            thres_buf=thres_buf,
+            threshold_buf=threshold_buf,
             return_skip_ratio=True,   # 仅在这里拿统计；计时时不要开
-            use_fp8_k_high_byte=use_fp8_k_high_byte,
-            k_bytes=k_bytes,
         )
         print(f"Skipped block ratio: {skip_ratio:.3%} (over HKV x NTB)")
 
-        o_flash = flash_compute(q_rope_1, k_rope, v)  # [Hq, V]
+        o_flash = flash_attn_compute(q_rope_1, k_rope, v)  # [Hq, V]
 
         # 数值对比（与 Flash 输出）
         max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
@@ -475,24 +437,19 @@ if __name__ == "__main__":
 
         # 性能对比
         def run_triton():
-            o = attn_fwd_q1_b1_splitT(
+            o = attn_forward_q1_b1_splitT(
                 q_triton, k_triton, v_triton,
                 scale=scale, BS=BS, SBS=SBS,
-                thres_buf=thres_buf,
+                threshold_buf=threshold_buf,
                 return_skip_ratio=False,   # 计时时不开
-                use_fp8_k_high_byte=use_fp8_k_high_byte,
-                k_bytes=k_bytes,
             )
             return o
 
         def run_flash():
-            return flash_compute(q_rope_1, k_rope, v)
+            return flash_attn_compute(q_rope_1, k_rope, v)
 
-        ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
-        ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
+        ms_triton = benchmark(run_triton, iters=iters, warmup=warmup)
+        ms_flash = benchmark(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
 
         break
-
-        # if layer_idx > 0:
-        #     break

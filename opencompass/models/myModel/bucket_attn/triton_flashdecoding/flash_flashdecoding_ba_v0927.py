@@ -426,9 +426,10 @@ def bench_op(fn, iters=50, warmup=10):
 if __name__ == "__main__":
     from utils import load_qkvh
 
-    torch.set_float32_matmul_precision("high")
+    # torch.set_float32_matmul_precision("high")
 
-    exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
+    # exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
+    exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
 
     # exp_root_subdir = 'Llama-3_2-3B/longbench_narrativeqa_42'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_46'
@@ -476,13 +477,6 @@ if __name__ == "__main__":
         # thres_buf = None
 
         # 只取最后一个查询位置 -> qlen=1
-        
-
-        # ===== 在计时之外准备连续的 kbytes（fp8 高字节视图）=====
-        # 说明：这里复用你原来的“高字节视图”语义：
-        #   先把 fp16 的 K 以 float8_e5m2 视图方式展开为 2*K，
-        #   再取高字节通道（[..., 1::2]），并 .contiguous() 以保证连续。
-        # 注意：这一步只做一次，不计入后续算子计时。
         k_view_for_bytes = k_rope[0]  # [HKV, T, K]，fp16
         # 按照原始代码的做法：把 fp16 的底层字节当作 float8_e5m2 视图，然后取高字节
         k_bytes_full = k_view_for_bytes.view(torch.float8_e5m2)  # 视图：最后一维等效变为 2*K

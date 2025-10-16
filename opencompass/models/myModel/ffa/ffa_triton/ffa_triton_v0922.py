@@ -384,9 +384,9 @@ def bench_op(fn, iters=50, warmup=10):
 
 
 if __name__ == "__main__":
-    from utils import load_qkvh
+    from load_utils import load_qkvh
 
-    torch.set_float32_matmul_precision("high")
+    # torch.set_float32_matmul_precision("high")
 
     # exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
     exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
@@ -420,9 +420,11 @@ if __name__ == "__main__":
         if layer_idx == 0:
             continue
         print(f"\n========== Layer {layer_idx} ==========")
-        q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hq, T, D]
-        k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype).contiguous()  # [B, Hkv, T, D]
-        v      = layer_qkvh_data["v"].to('cuda', dtype=dtype).contiguous()       # [B, Hkv, T, Dv]
+        q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype)  # [B, Hq, T, D]
+        k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype)  # [B, Hkv, T, D]
+        v      = layer_qkvh_data["v"].to('cuda', dtype=dtype)       # [B, Hkv, T, Dv]
+        
+        # import ipdb; ipdb.set_trace()
 
         # 只取最后一个查询位置 -> qlen=1
         q_rope_1 = q_rope[:, :, -1:, :]  # [B, Hq, 1, D]

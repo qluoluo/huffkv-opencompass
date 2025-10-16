@@ -12,7 +12,8 @@ from utils import *
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
     apply_rotary_pos_emb,
-    repeat_kv
+    repeat_kv,
+    Optional, Cache, TransformersKwargs, Unpack
 )
 
 # from transformers.models.qwen2.modeling_qwen2 import (
@@ -29,45 +30,52 @@ def modify_model_attn(model, save_dirpath):
     def custom_attn_forward(self, 
                             hidden_states: torch.Tensor,
                             position_embeddings: tuple[torch.Tensor, torch.Tensor],
-                            *args, **kwargs):
+                            attention_mask: Optional[torch.Tensor],
+                            past_key_values: Optional[Cache] = None,
+                            cache_position: Optional[torch.LongTensor] = None,
+                            **kwargs: Unpack[TransformersKwargs],
+                        ):
         # print("Enter Attn custom forward")
-
         # 获取层索引
         layer_idx = self.layer_idx
-        layer_save_dirpath = os.path.join(save_dirpath, f"layer_{layer_idx}")
-        os.makedirs(layer_save_dirpath, exist_ok=True)
+        print(f"Enter {layer_idx=}")
+        # print(f"{hidden_states.shape=}")
         
-        # 准备注意力计算
-        input_shape = hidden_states.shape[:-1]
-        hidden_shape = (*input_shape, -1, self.head_dim)
-        
-        import ipdb; ipdb.set_trace()
+        if hidden_states.shape[-2] == 1:
+            # decode stage
+            
+            layer_save_dirpath = os.path.join(save_dirpath, f"layer_{layer_idx}")
+            os.makedirs(layer_save_dirpath, exist_ok=True)
+            
+            save_fp = os.path.join(layer_save_dirpath, "attn_input.pt")
+            
+            torch.save(dict(
+                hidden_states=hidden_states,
+                position_embeddings=position_embeddings,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                cache_position=cache_position,
+                
+                q_proj_state=self.q_proj.state_dict(),
+                k_proj_state=self.k_proj.state_dict(),
+                v_proj_state=self.v_proj.state_dict(),
+                o_proj_state=self.o_proj.state_dict(),
+            ), save_fp)
 
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            print(f"Layer {layer_idx} saved Attn input to {save_fp}")
+            
+            if layer_idx == self.config.num_hidden_layers - 1:
+                exit()
 
-        torch.save(hidden_states, os.path.join(layer_save_dirpath, "h.pt"))
-        torch.save(query_states, os.path.join(layer_save_dirpath, "q_unrope.pt"))
-        torch.save(key_states, os.path.join(layer_save_dirpath, "k_unrope.pt"))
-        torch.save(value_states, os.path.join(layer_save_dirpath, "v.pt"))
 
-        # 应用位置编码
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        torch.save(query_states, os.path.join(layer_save_dirpath, "q_rope.pt"))
-        torch.save(key_states, os.path.join(layer_save_dirpath, "k_rope.pt"))
-
-        print(f"Layer {layer_idx} saved qkvhv for shape {query_states.shape=} {key_states.shape=} dtype={query_states.dtype}")
-
-        # 处理键值重复
-        # rep_nums = query_states.shape[1] // key_states.shape[1]
-        # key_states = repeat_kv(key_states, rep_nums)
-
-        return self._original_forward(hidden_states=hidden_states,
-                                    position_embeddings=position_embeddings,
-                                    *args, **kwargs)
+        return self._original_forward(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_key_values,
+                cache_position,
+                **kwargs,
+            )
 
     # 修改所有层的注意力前向传播
     for layer in model.model.layers:
@@ -87,7 +95,7 @@ if __name__ == "__main__":
     # save_dirpath = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/attn_analysis/result'
     # save_dirpath = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
 
-    save_dirpath = os.path.join(root_dir, "projects/ffa/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result")
+    save_dirpath = os.path.join(root_dir, "projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/ffa_Attention/dump_weights/result")
 
     
     # opencompass_root_dir = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass'
@@ -113,9 +121,9 @@ if __name__ == "__main__":
     input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids
 
     print(f"{input_ids.shape=}")
-    c = input("Enter c to continue...")
-    if c.lower().strip() != 'c':
-        exit()
+    # c = input("Enter c to continue...")
+    # if c.lower().strip() != 'c':
+    #     exit()
 
     save_dirpath = os.path.join(save_dirpath, os.path.basename(model_path), dataset_name)
     os.makedirs(save_dirpath, exist_ok=True)
@@ -137,4 +145,5 @@ if __name__ == "__main__":
 
     with torch.no_grad():
         input_ids = input_ids.to(model.device)
-        model(input_ids)
+        # model(input_ids)
+        model.generate(input_ids)

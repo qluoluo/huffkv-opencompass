@@ -405,23 +405,17 @@ def bench_op(fn, iters=50, warmup=10):
 
 
 if __name__ == "__main__":
-    from utils import load_qkvh
+    from load_utils import load_attn_input
 
-    torch.set_float32_matmul_precision("high")
+    data_root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/ffa_Attention/dump_weights/result'
+    
+    data_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
 
-    # exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
-    exp_root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/bucket_attn/attn_analysis/result'
-
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_narrativeqa_42'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_46'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_54'
-    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
-
-    exp_root = os.path.join(exp_root_dir, exp_root_subdir)
-    layer_data_root = os.path.join(exp_root, 'layer_data')
+    data_root = os.path.join(data_root_dir, data_root_subdir)
+    layer_data_root = os.path.join(data_root, 'layer_data')
 
     dtype = torch.float16
+    device = 'cuda:0'
     BS = 256
     SBS = 256
     delta = 8
@@ -433,13 +427,13 @@ if __name__ == "__main__":
     iters = 100
     warmup = 100
 
-    for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
+    for layer_idx, layer_qkvh_data in tqdm(enumerate(load_attn_input(layer_data_root, device=device))):
         print(f"\n========== Layer {layer_idx} ==========")
-        q_rope = layer_qkvh_data["q_rope"].to('cuda', dtype=dtype)  # [B, Hq, T, D]
-        k_rope = layer_qkvh_data["k_rope"].to('cuda', dtype=dtype)  # [B, Hkv, T, D]
-        v      = layer_qkvh_data["v"].to('cuda', dtype=dtype)       # [B, Hkv, T, Dv]
-
-        q_rope_1 = q_rope[:, :, -1:, :]  # [B, Hq, 1, D]
+        
+        if layer_idx == 0:
+            continue
+        
+        q_proj_state, k_
 
         # 与 kernel 对齐的零拷贝视图
         q_view, k_view, v_view = to_triton_layout_views(q_rope_1, k_rope, v)  # q:[HQ,K], k:[HKV,T,K], v:[HKV,T,V]

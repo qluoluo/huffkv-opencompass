@@ -14,45 +14,49 @@ import triton.language as tl
 @triton.jit
 def attn_find_threshold_two_blocks(
     q, k, thres_buf, scale, T, NTB, delta,
+    # strides (elements)
+    stride_qh, stride_qk,
+    stride_kh, stride_kt, stride_kk,
+    stride_th,
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, G: tl.constexpr, BS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
 ):
     pid_hkv = tl.program_id(0)
     base_hq = pid_hkv * G
 
-    rows = tl.arange(0, BM_DOT)
+    rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
-    offs_k = tl.arange(0, K)
+    offs_k   = tl.arange(0, K)
 
-    q_ptrs = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    q_ptrs = q + (base_hq + rows)[:, None] * stride_qh + offs_k[None, :] * stride_qk
     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
 
-    # tb = 0
-    tb0 = 0
+    # tb0 = 0
+    tb0     = 0
     offs_t0 = tb0 * BS + tl.arange(0, BS)
     t_mask0 = offs_t0 < T
-    k_ptrs0 = k + pid_hkv * T * K + offs_k[:, None] + offs_t0[None, :] * K
+    k_ptrs0 = k + pid_hkv * stride_kh + offs_k[:, None] * stride_kk + offs_t0[None, :] * stride_kt
     k_tile0 = tl.load(k_ptrs0, mask=(tl.full([K], True, tl.int1)[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
-    b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
-    m0 = tl.max(b_s0, axis=1)
+    b_s0    = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
+    b_s0    = tl.where(t_mask0[None, :], b_s0, NEG_INF)
+    m0      = tl.max(b_s0, axis=1)
 
-    # tb = NTB-1（当 NTB==1 时等于 0，与 tb0 相同）
-    tb1 = NTB - 1
+    # tb1 = NTB - 1 （当 NTB==1 时与 tb0 相同）
+    tb1     = NTB - 1
     offs_t1 = tb1 * BS + tl.arange(0, BS)
     t_mask1 = offs_t1 < T
-    k_ptrs1 = k + pid_hkv * T * K + offs_k[:, None] + offs_t1[None, :] * K
+    k_ptrs1 = k + pid_hkv * stride_kh + offs_k[:, None] * stride_kk + offs_t1[None, :] * stride_kt
     k_tile1 = tl.load(k_ptrs1, mask=(tl.full([K], True, tl.int1)[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
-    b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
-    m1 = tl.max(b_s1, axis=1)
+    b_s1    = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
+    b_s1    = tl.where(t_mask1[None, :], b_s1, NEG_INF)
+    m1      = tl.max(b_s1, axis=1)
 
     m2 = tl.maximum(m0, m1)
     th = m2 - delta
-    tl.store(thres_buf + (base_hq + rows), th, mask=row_mask)
+    tl.store(thres_buf + (base_hq + rows) * stride_th, th, mask=row_mask)
 
 
 def precompute_attn_thresholds(
@@ -71,133 +75,120 @@ def precompute_attn_thresholds(
 
     thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
+    # strides (elements)
+    sq_h, sq_k = q.stride()
+    sk_h, sk_t, sk_k = k.stride()
+    sth, = thres_buf.stride()
+
     grid_th = (HKV, 1)
     attn_find_threshold_two_blocks[grid_th](
         q, k, thres_buf,
         scale, T, NTB, delta,
+        sq_h, sq_k,
+        sk_h, sk_t, sk_k,
+        sth,
         HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
     )
     return thres_buf
 
-
 @triton.jit
 def attn_fwd_stage1_pruned(
-    q, k, k_bytes, v,                # 新增：k_bytes (fp8_e5m2*)
+    q, k, k_bytes, v,
     m_buf, l_buf, o_buf,
     thres_buf, mask_buf,
     scale, T, NTB, NTBS,
+    # strides (elements)
+    stride_qh, stride_qk,
+    stride_kh, stride_kt, stride_kk,
+    stride_kbh, stride_kbt, stride_kbk,   # k_bytes strides
+    stride_vt, stride_vh, stride_vv,
+    stride_mh, stride_mt,                 # m_buf [HQ, NTBS]
+    stride_lh, stride_lt,                 # l_buf [HQ, NTBS]
+    stride_ohq, stride_otb, stride_ov,    # o_buf [HQ, NTBS, V]
+    stride_th,                            # thres_buf [HQ]
+    stride_mkh, stride_mkt,               # mask_buf [HKV, NTBS]
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
-    # BM_DOT: tl.constexpr = 32,
-    USE_FP8_K: tl.constexpr = True,  # 是否仅加载 k 的高 8 位（fp8_e5m2）
+    USE_FP8_K: tl.constexpr = True,
 ):
     pid_hkv = tl.program_id(0)
     pid_tb  = tl.program_id(1)
     base_hq = pid_hkv * G
 
-    # 本 TB 的起始全局 T 偏移
-    s0 = pid_tb * BS
-
-    # 行/列常量与 Q tile
+    s0       = pid_tb * BS
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
-
     offs_k   = tl.arange(0, K)
-    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    # if not USE_FP8_K:
-    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
-    # else:
-    #     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float8e5)
 
+    q_ptrs = q + (base_hq + rows)[:, None] * stride_qh + offs_k[None, :] * stride_qk
     q_tile = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
-    # 常量
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
     TRUE_K  = tl.full([K], True, tl.int1)
 
-    # NSB 为编译期常量：每个大块内的子块数（= ceil(BS / SBS)）
     NSB: tl.constexpr = (BS + SBS - 1) // SBS
 
-    # 循环每个子块
     for sb in tl.static_range(NSB):
-        # 子块内的 T 偏移与 mask
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        # K 路：根据开关选择 FP8 高字节还是 FP16
         if USE_FP8_K:
-            # k_bytes: [HKV, T, K], dtype = float8_e5m2（仅高 8 位）
-            kb_ptrs = k_bytes + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                kb_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            # )
-            ).to(tl.float16)
+            kb_ptrs = k_bytes + pid_hkv * stride_kbh + offs_k[:, None] * stride_kbk + offs_t_sb[None, :] * stride_kbt
+            k_tile  = tl.load(kb_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
         else:
-            # 原 FP16 路
-            k_ptrs = k + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
-            k_tile = tl.load(
-                k_ptrs,
-                mask=(TRUE_K[:, None] & t_mask_sb[None, :]),
-                other=0.0
-            ).to(tl.float16)
+            k_ptrs = k + pid_hkv * stride_kh + offs_k[:, None] * stride_kk + offs_t_sb[None, :] * stride_kt
+            k_tile = tl.load(k_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
 
-        # 注意：对数底为 2 的 softmax 形式
-        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32, ) * scale * RCP_LN2  # [BM_DOT, SBS]
-        # b_s     = tl.dot(q_tile, k_tile) * scale * RCP_LN2  # [BM_DOT, SBS]
+        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
         b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
 
-        # 子块内行最大值
         m_rows_blk = tl.max(b_s_act, axis=1)
+        th_rows    = tl.load(thres_buf + (base_hq + rows) * stride_th, mask=row_mask, other=NEG_INF)
+        below      = (m_rows_blk < th_rows) & row_mask
+        n_below    = tl.sum(below.to(tl.int32), axis=0)
+        n_valid    = tl.sum(row_mask.to(tl.int32), axis=0)
+        prune_blk  = n_below == n_valid
 
-        # 阈值与裁剪
-        th_rows = tl.load(thres_buf + (base_hq + rows), mask=row_mask, other=NEG_INF)
-        below   = (m_rows_blk < th_rows) & row_mask
-        n_below = tl.sum(below.to(tl.int32), axis=0)
-        n_valid = tl.sum(row_mask.to(tl.int32), axis=0)
-        prune_blk = n_below == n_valid
-
-        # 写入索引：将子块映射为全局块 idx
-        tb_sb = pid_tb * NSB + sb
-        v_offs = tl.arange(0, V) 
+        tb_sb  = pid_tb * NSB + sb
+        v_offs = tl.arange(0, V)
 
         if not prune_blk:
-            # softmax 规范化（子块内）
             m_rows = m_rows_blk
             b_p    = tl.where(t_mask_sb[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
             l_rows = tl.sum(b_p, axis=1)
 
-            # V 路
             need_v = tl.sum(t_mask_sb.to(tl.int32), axis=0) > 0
             o_tile = tl.zeros([BM_DOT, V], tl.float32)
             if need_v:
-                v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+                v_ptrs = v + offs_t_sb[:, None] * stride_vt + pid_hkv * stride_vh + v_offs[None, :] * stride_vv
                 b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
                 o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
 
-            # 写回（注意 stride 里的 NTBS）
-            m_ptrs = m_buf + (base_hq + rows) * NTBS + tb_sb
-            l_ptrs = l_buf + (base_hq + rows) * NTBS + tb_sb
-            o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTBS * V) + tb_sb * V + v_offs[None, :]
+            m_ptrs = m_buf + (base_hq + rows) * stride_mh + tb_sb * stride_mt
+            l_ptrs = l_buf + (base_hq + rows) * stride_lh + tb_sb * stride_lt
+            o_ptrs = o_buf + (base_hq + rows)[:, None] * stride_ohq + tb_sb * stride_otb + v_offs[None, :] * stride_ov
 
             tl.store(m_ptrs, m_rows, mask=row_mask)
             tl.store(l_ptrs, l_rows, mask=row_mask)
             tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
 
-            # 标记该 (tb, sb) 为有效
-            tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
-        # else: 跳过
+            tl.store(mask_buf + pid_hkv * stride_mkh + tb_sb * stride_mkt, tl.full((), 1, tl.int8))
 
 
 @triton.jit
 def attn_fwd_stage2_masked(
     m_buf, l_buf, o_buf,     # [HQ, NTBS], [HQ, NTBS], [HQ, NTBS, V]
-    mask_buf,                # [HKV, NTBS], int8（每个小块）
-    o,                       # [HQ, V], out dtype = q.dtype
-    NTBS,                    # int: 总块数 = NTB * NSB
+    mask_buf,                # [HKV, NTBS], int8
+    o,                       # [HQ, V]
+    NTBS,
+    # strides (elements)
+    stride_mh, stride_mt,
+    stride_lh, stride_lt,
+    stride_ohq, stride_otb, stride_ov,    # o_buf
+    stride_mkh, stride_mkt,               # mask_buf
+    stride_out_h, stride_out_v,           # o
     HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
 ):
     pid_hkv = tl.program_id(0)
@@ -212,11 +203,11 @@ def attn_fwd_stage2_masked(
     b_o   = tl.zeros([V], tl.float32)
 
     for tb in range(0, NTBS):
-        keep = tl.load(mask_buf + pid_hkv * NTBS + tb).to(tl.int1)
+        keep = tl.load(mask_buf + pid_hkv * stride_mkh + tb * stride_mkt).to(tl.int1)
         if keep:
-            m_b = tl.load(m_buf + pid_hq * NTBS + tb)
-            l_b = tl.load(l_buf + pid_hq * NTBS + tb)
-            o_b = tl.load(o_buf + pid_hq * (NTBS * V) + tb * V + v_offs)
+            m_b = tl.load(m_buf + pid_hq * stride_mh + tb * stride_mt)
+            l_b = tl.load(l_buf + pid_hq * stride_lh + tb * stride_lt)
+            o_b = tl.load(o_buf + pid_hq * stride_ohq + tb * stride_otb + v_offs * stride_ov)
 
             new_m = tl.maximum(b_m, m_b)
             r_prev = tl.exp2(b_m - new_m)
@@ -225,13 +216,11 @@ def attn_fwd_stage2_masked(
             b_acc = b_acc * r_prev + l_b * r_blk
             b_o   = b_o   * r_prev + o_b * r_blk
             b_m   = new_m
-        # 无效小块直接跳过
 
-    # 空结果保护
     is_empty = b_acc == 0.0
     out_tile = tl.where(is_empty, tl.zeros([V], tl.float32), b_o / b_acc)
 
-    o_ptrs = o + pid_hq * V + v_offs
+    o_ptrs = o + pid_hq * stride_out_h + v_offs * stride_out_v
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
 
@@ -254,7 +243,7 @@ def attn_fwd_q1_b1_splitT(
     delta: float = 5.0,
     thres_buf: torch.Tensor | None = None,
     return_skip_ratio: bool = False,
-    use_fp8_k_high_byte: bool = True,   # 新增开关：默认开启高 8 位路径
+    use_fp8_k_high_byte: bool = True,
     k_bytes = None,
 ):
     assert q.is_cuda and k.is_cuda and v.is_cuda
@@ -273,40 +262,63 @@ def attn_fwd_q1_b1_splitT(
         SBS = BS
     assert 1 <= SBS <= BS
 
-    NTB = triton.cdiv(T, BS)
-    NSB = triton.cdiv(BS, SBS)
+    NTB  = triton.cdiv(T, BS)
+    NSB  = triton.cdiv(BS, SBS)
     NTBS = NTB * NSB
 
-    o   = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
+    o     = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
     m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
-
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
 
-    # 阈值：保持原逻辑（仍然用 fp16 的 k）
+    # 阈值
     if thres_buf is None:
         thres_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+        sq_h, sq_k = q.stride()
+        sk_h, sk_t, sk_k = k.stride()
+        sth, = thres_buf.stride()
         attn_find_threshold_two_blocks[(HKV, 1)](
             q, k, thres_buf,
             scale, T, NTB, delta,
+            sq_h, sq_k,
+            sk_h, sk_t, sk_k,
+            sth,
             HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
         )
     else:
         assert thres_buf.shape == (HQ,) and thres_buf.dtype == torch.float32 and thres_buf.device == q.device
 
-    # 准备 k 的字节视图（必须 contiguous）
-    # k_bytes = k.contiguous().view(torch.uint8)
-    # k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2]
+    # 准备 k 的高 8 位视图（不再要求 contiguous）
     if k_bytes is None:
-        k_bytes = k.contiguous().view(torch.float8_e5m2)[..., 1::2].contiguous() 
+        # 注意：这是一个非连续视图（最后一维 stride=2）
+        k_bytes = k.view(torch.float8_e5m2)[..., 1::2]
 
-    # Stage 1：传入 k_bytes，并打开 USE_FP8_K
+    # 所有 stride（elements）
+    sq_h, sq_k = q.stride()
+    sk_h, sk_t, sk_k = k.stride()
+    skb_h, skb_t, skb_k = k_bytes.stride()
+    sv_t, sv_h, sv_v = v.stride()
+    sm_h, sm_t = m_buf.stride()
+    sl_h, sl_t = l_buf.stride()
+    so_hq, so_tb, so_v = o_buf.stride()
+    sth, = thres_buf.stride()
+    smk_h, smk_t = mask_buf.stride()
+
     attn_fwd_stage1_pruned[(HKV, NTB)](
         q, k, k_bytes, v,
         m_buf, l_buf, o_buf,
         thres_buf, mask_buf,
         scale, T, NTB, NTBS,
+        sq_h, sq_k,
+        sk_h, sk_t, sk_k,
+        skb_h, skb_t, skb_k,
+        sv_t, sv_h, sv_v,
+        sm_h, sm_t,
+        sl_h, sl_t,
+        so_hq, so_tb, so_v,
+        sth,
+        smk_h, smk_t,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
         USE_FP8_K=use_fp8_k_high_byte,
         # num_stages=3, num_warps=8,
@@ -314,14 +326,22 @@ def attn_fwd_q1_b1_splitT(
 
     skip_ratio = None
     if return_skip_ratio:
-        kept = mask_buf.to(torch.int32).sum()
+        kept  = mask_buf.to(torch.int32).sum()
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
+
+    # stage2 strides
+    so_out_h, so_out_v = o.stride()
 
     attn_fwd_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
+        sm_h, sm_t,
+        sl_h, sl_t,
+        so_hq, so_tb, so_v,
+        smk_h, smk_t,
+        so_out_h, so_out_v,
         HKV=HKV, G=G, HQ=HQ, V=V,
     )
 
@@ -350,6 +370,11 @@ def to_triton_layout(q_rope_1, k_rope, v):
     q_triton = q_rope_1[0, :, 0, :].contiguous()            # [HQ, D]
     k_triton = k_rope[0, :, :, :].contiguous()              # [HKV, T, D]
     v_triton = v[0, :, :, :].permute(1, 0, 2).contiguous()  # [T, HKV, Dv]
+    
+    # q_triton = q_rope_1[0, :, 0, :]            # [HQ, D]
+    # k_triton = k_rope[0, :, :, :]              # [HKV, T, D]
+    # v_triton = v[0, :, :, :].permute(1, 0, 2)  # [T, HKV, Dv]
+    
     return q_triton, k_triton, v_triton
 
 
@@ -384,7 +409,7 @@ def bench_op(fn, iters=50, warmup=10):
 
 
 if __name__ == "__main__":
-    from utils import load_qkvh
+    from load_utils import load_qkvh
 
     torch.set_float32_matmul_precision("high")
 
