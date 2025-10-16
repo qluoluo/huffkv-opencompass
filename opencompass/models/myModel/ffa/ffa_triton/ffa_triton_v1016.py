@@ -1,3 +1,5 @@
+# 使用16位计算阈值
+
 import os
 # os.environ["CUDA_VISIABLE_DEVICES"] = "4"
 # os.environ["TRITON_CACHE_DIR"] = os.path.join(os.path.dirname(__file__), "triton_cache")
