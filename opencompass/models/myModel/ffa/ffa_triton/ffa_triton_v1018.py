@@ -95,6 +95,8 @@ def compute_attn_thresholds(
         q, k_mem, threshold_buf,
         scale, T, NTB, delta,
         HKV=HKV, HQ=HQ, K=K, G=G, BS=BS,
+        
+        num_warps=2, num_stages=1
     )
     return threshold_buf
 
@@ -408,8 +410,8 @@ if __name__ == "__main__":
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
     
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_8k'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_51_32k'
-    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_128k'
+    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_51_32k'
+    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_128k'
  
     exp_root = os.path.join(exp_root_dir, exp_root_subdir)
     layer_data_root = os.path.join(exp_root, 'layer_data')
@@ -419,7 +421,7 @@ if __name__ == "__main__":
     SBS = 256
     delta = 8.0
 
-    KERNEL_USE_FP8 = True   # True: 主 kernel 用 8bit（k_hi8）；False: 用 16bit（k_fp16）
+    KERNEL_USE_FP8 = False   # True: 主 kernel 用 8bit（k_hi8）；False: 用 16bit（k_fp16）
     PRECOMPUTE_THRESHOLD = True
     THRESH_USE_FP8 = False   # True: 阈值计算用 8bit（k_hi8）；False: 用 16bit（k_fp16）
     
@@ -523,7 +525,5 @@ if __name__ == "__main__":
         ms_flash = benchmark(run_flash, iters=iters, warmup=warmup)
         print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
 
-        break
-        
-        # if layer_idx >= 3:
-        #     break
+        if layer_idx >= 3:
+            break

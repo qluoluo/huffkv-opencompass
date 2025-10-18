@@ -59,7 +59,7 @@ def modify_model_attn(model, save_dirpath):
         torch.save(query_states, os.path.join(layer_save_dirpath, "q_rope.pt"))
         torch.save(key_states, os.path.join(layer_save_dirpath, "k_rope.pt"))
 
-        print(f"Layer {layer_idx} saved qkvhv for shape {query_states.shape=} {key_states.shape=} dtype={query_states.dtype}")
+        print(f"Layer {layer_idx} saved qkvh for shape {query_states.shape=} {key_states.shape=} dtype={query_states.dtype}")
 
         # 处理键值重复
         # rep_nums = query_states.shape[1] // key_states.shape[1]
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     
     # line_idx = 50
     # raw_text, dataset_name = load_from_longbench_jsonl(dataset_path, line_idx)
-    line_start, line_end = 48, 58
+    line_start, line_end = 48, 68
     raw_text, dataset_name = load_from_longbench_jsonl(dataset_path, line_start, line_end)
 
     repeat_text_num = 1
@@ -109,18 +109,19 @@ if __name__ == "__main__":
 
     input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids
     
-    sample_len_k = 128
+    sample_len_k = 64
     # sample_len_k = -1
     sample_len = sample_len_k * 1024
     if sample_len_k > 0 and input_ids.shape[-1] >= sample_len:
-        print(f"cut to {sample_len_k}k length..")
+        print(f"cut {input_ids.shape[-1]//1024}k to {sample_len_k}k length..")
         input_ids = input_ids[..., :sample_len]
         dataset_name = f"{dataset_name}_{sample_len_k}k"
 
     print(f"{input_ids.shape=}")
-    c = input("Enter c to continue...\n")
-    if c.lower().strip() != 'c':
-        exit()
+    
+    # c = input("Enter c to continue...\n")
+    # if c.lower().strip() != 'c':
+    #     exit()
 
     save_dirpath = os.path.join(save_dirpath, os.path.basename(model_path), dataset_name)
     os.makedirs(save_dirpath, exist_ok=True)
