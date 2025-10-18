@@ -409,9 +409,9 @@ if __name__ == "__main__":
     exp_root_dir = '/remote-home1/zgliu/projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/attn_analysis/result'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_57'
     
-    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_8k'
+    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_8k'
     # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_32k'
-    # exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_128k'
+    exp_root_subdir = 'Llama-3_2-3B/longbench_gov_report_48_58_128k'
  
     exp_root = os.path.join(exp_root_dir, exp_root_subdir)
     layer_data_root = os.path.join(exp_root, 'layer_data')

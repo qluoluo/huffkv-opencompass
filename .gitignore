@@ -141,3 +141,4 @@ core.*
 !requirements.txt
 !/requirements/*.txt
 !needle_bench_0.txt
+*.ncu-rep
