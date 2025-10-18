@@ -78,14 +78,13 @@ def modify_model_attn(model, save_dirpath):
     return model
 
 if __name__ == "__main__":
-    root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105'
-    # model_path = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
-    # model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+    # root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105'
+    root_dir = '/remote-home1/zgliu'
+
     model_path = os.path.join(root_dir, "models/Llama-3_2-3B")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
     save_dirpath = os.path.join(root_dir, "projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/attn_analysis/result")
-
     
     # opencompass_root_dir = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/projects/huffkv/huffkv-opencompass'
     # opencompass_root_dir = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/projects/huffKV/huffkv-opencompass'
@@ -109,7 +108,7 @@ if __name__ == "__main__":
 
     input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids
     
-    sample_len_k = 128
+    sample_len_k = 32
     # sample_len_k = -1
     sample_len = sample_len_k * 1024
     if sample_len_k > 0 and input_ids.shape[-1] >= sample_len:
