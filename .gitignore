@@ -126,7 +126,7 @@ turbomind/
 *.onnx
 *.gz
 *.gz.*
-*.png
+# *.png
 *.txt
 *.jpg
 *.json
