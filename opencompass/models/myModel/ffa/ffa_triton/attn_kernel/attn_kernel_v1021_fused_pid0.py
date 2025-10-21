@@ -1,7 +1,20 @@
-# 改进思想（简述）：
-# - 所有 stage1 kernel 都独立计算阈值（从首/尾两个 time-block 的最大值得到）。
-# - 阈值计算：th = max(m0, m1) - delta，其中 m0/m1 来自 tb0 与 tb_last 的行最大值。
-# - 随后各 kernel 使用相同的阈值对其负责的子块进行剪枝与计算，避免同步热点，提高可扩展性与稳定性（代价是重复计算阈值）。
+# 说明（重要变更）：
+# - 本版本实现“单点生产、全局消费”的阈值计算（threshold）同步机制：
+#   1) 对于每个 `pid_hkv`（即每个 KV 头组），所有并行实例共享：
+#        - `threshold_lock[pid_hkv]` 原子锁：用于选出“唯一生产者”。
+#        - `threshold_ready[pid_hkv]` 就绪标志：用于通知阈值已写入。
+#        - `threshold_buf[pid_hq]` 阈值缓冲：按每个查询头 `pid_hq` 存放阈值。
+#   2) 第一个通过 `atomic_cas(th_lock, 0->1)` 抢到锁的实例成为“Owner”，
+#      由它计算阈值（使用 k 的首块与末块）并写入 `threshold_buf`，随后将
+#      `threshold_ready` 从 0 置为 1（CAS 0->1，确保只有 Owner 能设置）。
+#   3) 所有非 Owner 的实例只“等待”：通过自旋轮询 `threshold_ready==1`，
+#      一旦就绪，读取 `threshold_buf` 使用。该版本移除了此前的“超时备用计算”，
+#      遵循“第一个计算并写入、其他仅等待”的逻辑。
+# - 注意：
+#   * Triton 不支持跨 CTA 的 barrier，这里使用“锁 + 就绪标志”的轻量同步。
+#   * 代码保证“先写阈值，再置 ready=1”，以避免读到未初始化的阈值。
+#   * `MAX_SPIN` 控制等待自旋的轮数，若仍未就绪将继续使用初始化值（-inf），
+#     实际使用中应将 `MAX_SPIN` 设为足够大，以确保 Owner 能在消费前完成写入。
 
 import os
 import math
@@ -17,11 +30,12 @@ def attn_forward_stage1_fused_threshold(
     m_buf, l_buf, o_buf,
     mask_buf,
     scale, T, NTB, NTBS, delta,
-    th_buf,                                  # 保留：把阈值写回（可选）
+    th_buf, th_ready, th_lock,          # 阈值、就绪标志、原子锁
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
+    MAX_SPIN: tl.constexpr = 4096,      # 自旋上限（建议较大，以确保等待到位）
 ):
     pid_hkv = tl.program_id(0)
     pid_tb  = tl.program_id(1)
@@ -37,30 +51,58 @@ def attn_forward_stage1_fused_threshold(
     NEG_INF = float("-inf")
     TRUE_K  = tl.full([K], True, tl.int1)
 
-    # 所有 kernel 独立计算阈值（tb0 与 tb_last）
-    tb0 = 0
-    offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
-    t_mask0 = offs_t0 < T
-    kb_ptrs0 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t0[None, :] * K
-    k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
-    b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
-    m0 = tl.max(b_s0, axis=1)
+    ready_ptr = th_ready + pid_hkv
+    lock_ptr  = th_lock  + pid_hkv
+    th_ptrs   = th_buf   + (base_hq + rows)
 
-    tb1 = NTB - 1
-    offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
-    t_mask1 = offs_t1 < T
-    kb_ptrs1 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t1[None, :] * K
-    k_tile1 = tl.load(kb_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
-    b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
-    m1 = tl.max(b_s1, axis=1)
+    th_rows = tl.full([BM_DOT], NEG_INF, tl.float32)
 
-    th_rows = tl.maximum(m0, m1) - delta
+    # 如果阈值已就绪，直接读取
+    if (tl.load(ready_ptr).to(tl.int32) == 1):
+        th_rows = tl.load(th_ptrs, mask=row_mask, other=NEG_INF)
+    else:
+        # 原子抢占：第一个把 lock 从 0 -> 1 的成为 owner
+        old = tl.atomic_cas(lock_ptr, tl.full((), 0, tl.int32), tl.full((), 1, tl.int32))
+        owner = (old == 0)
 
-    # 可选：把阈值写回（供调试/分析）
-    th_ptrs = th_buf + (base_hq + rows)
-    tl.store(th_ptrs, th_rows, mask=row_mask)
+        if owner:
+            # 计算阈值（tb0 与 tb1）
+            tb0 = 0
+            offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
+            t_mask0 = offs_t0 < T
+            kb_ptrs0 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t0[None, :] * K
+            k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
+            b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
+            b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
+            m0 = tl.max(b_s0, axis=1)
+
+            tb1 = NTB - 1
+            offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
+            t_mask1 = offs_t1 < T
+            kb_ptrs1 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t1[None, :] * K
+            k_tile1 = tl.load(kb_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
+            b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
+            b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
+            m1 = tl.max(b_s1, axis=1)
+
+            m2 = tl.maximum(m0, m1)
+            th_rows = m2 - delta
+
+            # 先写阈值，再把 ready 置 1（CAS 0->1，确保只有 owner 能设置）
+            tl.store(th_ptrs, th_rows, mask=row_mask)
+            tl.atomic_cas(ready_ptr, tl.full((), 0, tl.int32), tl.full((), 1, tl.int32))
+        else:
+            # 纯等待：自旋直到 ready==1，然后读取阈值
+            got = tl.zeros((), tl.int1)
+            th_tmp = tl.full([BM_DOT], NEG_INF, tl.float32)
+            for _ in range(0, MAX_SPIN):
+                rdy = tl.load(ready_ptr).to(tl.int32) == 1
+                need = (~got) & rdy
+                loaded = tl.load(th_ptrs, mask=(row_mask & need), other=NEG_INF)
+                th_tmp = tl.where(need, loaded, th_tmp)
+                got = got | rdy
+            # 不做备用计算：严格等待 owner 写入
+            th_rows = tl.where(got, th_tmp, th_rows)
 
     # 后续计算保持不变，直接使用 th_rows
     s0 = pid_tb * BS
@@ -170,16 +212,19 @@ def attn_forward(
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
     
-    # 保留：阈值缓冲（可选，用于调试/分析）
-    threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+    # 阈值缓冲、就绪标志、原子锁（每个 KV 头组 1 个锁与就绪；每个查询头 1 个阈值）
+    threshold_buf   = torch.empty((HQ,),    device=q.device, dtype=torch.float32)
+    threshold_ready = torch.zeros((HKV,),   device=q.device, dtype=torch.int32)
+    threshold_lock  = torch.zeros((HKV,),   device=q.device, dtype=torch.int32)
 
     attn_forward_stage1_fused_threshold[(HKV, NTB)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,
         scale, T, NTB, NTBS, delta,
-        threshold_buf,                         # 传入
+        threshold_buf, threshold_ready, threshold_lock,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
+        MAX_SPIN=4096,  # 建议较大，确保等待 owner 完成写入
     )
 
     skip_ratio = None

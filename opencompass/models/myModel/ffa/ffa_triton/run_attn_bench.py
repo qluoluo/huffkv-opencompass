@@ -15,9 +15,10 @@ from utils.plot import plot_speed_curve
 from utils.load import load_qkvh
 
 if __name__ == "__main__":
-    from attn_kernel.attn_kernel_v1019_unfused import attn_forward
-    # from attn_kernel.attn_kernel_v1019_fused import attn_forward
+    from attn_kernel.attn_kernel_v1019_fused import attn_forward
+    # from attn_kernel.attn_kernel_v1019_unfused import attn_forward
     # from attn_kernel.attn_kernel_v1020_onekernel import attn_forward
+    # from attn_kernel.attn_kernel_v1021_fused_pid0 import attn_forward
 
     # 获取attn kernel名称用于文件名
     attn_kernel_name = attn_forward.__module__.split('.')[-1]  # 获取'attn_kernel_v1020_onekernel'
