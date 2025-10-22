@@ -139,6 +139,8 @@ turbomind/
 # aliyun
 core.*
 
+plot/
+
 !requirements.txt
 !/requirements/*.txt
 !needle_bench_0.txt

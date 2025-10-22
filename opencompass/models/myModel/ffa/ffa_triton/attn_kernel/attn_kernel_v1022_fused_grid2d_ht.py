@@ -1,47 +1,98 @@
-# 改进思想（简述）：
-# - 所有 stage1 kernel 都独立计算阈值（从首/尾两个 time-block 的最大值得到）。
-# - 阈值计算：th = max(m0, m1) - delta，其中 m0/m1 来自 tb0 与 tb_last 的行最大值。
-# - 随后各 kernel 使用相同的阈值对其负责的子块进行剪枝与计算，避免同步热点，提高可扩展性与稳定性（代价是重复计算阈值）。
-
+# attn_kernel_v1022_fused_grid2d.py
 import os
 import math
-from tqdm import tqdm
+from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
 
+
+# ========================
+# Layout tools (merged)
+# ========================
+def convert_to_triton_layout(
+    q_rope_1: torch.Tensor,  # [B=1, Hq, 1, Dq]
+    k_rope: torch.Tensor,    # [B=1, Hkv, T, Dk]
+    v: torch.Tensor,         # [B=1, Hkv, T, Dv]
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Convert inputs to Triton-friendly tensors with time-major layout for K/V:
+    - q_triton: [Hq, Dq]
+    - k_triton_fp16: [T, Hkv, Dk]
+    - v_triton: [T, Hkv, Dv]
+    """
+    B, Hq, qlen, Dq = q_rope_1.shape
+    Bk, Hkv, T, Dk = k_rope.shape
+    Bv, Hvv, Tv, Dv = v.shape
+    assert B == 1 and qlen == 1 and Tv == T and Hvv == Hkv
+
+    q_triton = q_rope_1[0, :, 0, :].contiguous()                    # [Hq, D]
+    # Time-major for K: [T, Hkv, D]
+    k_triton_fp16 = k_rope[0].permute(1, 0, 2).contiguous()
+    # Time-major for V: [T, Hkv, Dv]
+    v_triton = v[0].permute(1, 0, 2).contiguous()
+    return q_triton, k_triton_fp16, v_triton
+
+
+def pack_k_hi_lo(k_fp16: torch.Tensor):
+    """
+    Pack fp16 K into two 8-bit halves keeping the same [T, Hkv, D] layout.
+    Returns:
+    - k_hi8: torch.float8_e5m2 (high 8 bits), shape [T, Hkv, D]
+    - k_lo8: torch.uint8        (low  8 bits), shape [T, Hkv, D]
+    """
+    k_fp16 = k_fp16.contiguous()
+    k_hi8 = k_fp16.view(torch.float8_e5m2)[..., 1::2].contiguous()
+    k_lo8 = k_fp16.view(torch.uint8)[..., 0::2].contiguous()
+    return k_hi8, k_lo8
+
+
+# ========================
+# Kernels
+# ========================
 @triton.jit
 def attn_forward_stage1_fused_threshold(
     q, k_hi8, v,
     m_buf, l_buf, o_buf,
     mask_buf,
     scale, T, NTB, NTBS, delta,
-    th_buf,                                  # 保留：把阈值写回（可选）
+    th_buf,                                  # 可选：把阈值写回（用于调试/分析）
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
 ):
+    # 2D grid = (HKV, NTB):
+    #   - program_id(0) => pid_hkv
+    #   - program_id(1) => pid_tb (大 time-block)
     pid_hkv = tl.program_id(0)
-    pid_tb  = tl.program_id(1)
+    pid_tb = tl.program_id(1)
+
+    RCP_LN2 = 1.4426950408889634
+    NEG_INF = float("-inf")
+    TRUE_K  = tl.full([K], True, tl.int1)
+
+    # 当前 tb 对应的时间起点（大块）
+    s0 = pid_tb * BS
+    NSB: tl.constexpr = (BS + SBS - 1) // SBS
+
+    # 基于当前 HKV 的 head-group
     base_hq = pid_hkv * G
 
+    # 取 q 的一个 tile（假设 BM_DOT >= G）
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
     offs_k   = tl.arange(0, K)
     q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
     q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
-    RCP_LN2 = 1.4426950408889634
-    NEG_INF = float("-inf")
-    TRUE_K  = tl.full([K], True, tl.int1)
-
     # 所有 kernel 独立计算阈值（tb0 与 tb_last）
     tb0 = 0
     offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
     t_mask0 = offs_t0 < T
-    kb_ptrs0 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t0[None, :] * K
+    # k_hi8 layout = [T, HKV, K] => ptr = t*(HKV*K) + hkv*K + k
+    kb_ptrs0 = k_hi8 + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
     b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
     b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
@@ -50,7 +101,7 @@ def attn_forward_stage1_fused_threshold(
     tb1 = NTB - 1
     offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
     t_mask1 = offs_t1 < T
-    kb_ptrs1 = k_hi8 + pid_hkv * T * K + offs_k[:, None] + offs_t1[None, :] * K
+    kb_ptrs1 = k_hi8 + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile1 = tl.load(kb_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
     b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
     b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
@@ -62,15 +113,12 @@ def attn_forward_stage1_fused_threshold(
     # th_ptrs = th_buf + (base_hq + rows)
     # tl.store(th_ptrs, th_rows, mask=row_mask)
 
-    # 后续计算保持不变，直接使用 th_rows
-    s0 = pid_tb * BS
-    NSB: tl.constexpr = (BS + SBS - 1) // SBS
-
+    # 遍历当前大块内的小块（SBS）
     for sb in tl.static_range(NSB):
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        kb_ptrs = k_hi8 + pid_hkv * T * K + (offs_t_sb[None, :] * K) + offs_k[:, None]
+        kb_ptrs = k_hi8 + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
         k_tile = tl.load(kb_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
 
         b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
@@ -94,6 +142,7 @@ def attn_forward_stage1_fused_threshold(
             need_v = tl.sum(t_mask_sb.to(tl.int32), axis=0) > 0
             o_tile = tl.zeros([BM_DOT, V], tl.float32)
             if need_v:
+                # v layout = [T, HKV, V] => ptr = t*(HKV*V) + hkv*V + v
                 v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
                 b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
                 o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
@@ -105,7 +154,6 @@ def attn_forward_stage1_fused_threshold(
             tl.store(l_ptrs, l_rows, mask=row_mask)
             tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
             tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
-
 
 
 @triton.jit
@@ -138,11 +186,15 @@ def attn_forward_stage2_masked(
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
+
+# ========================
+# Host wrapper
+# ========================
 def attn_forward(
     q: torch.Tensor,      # [HQ, K]
-    k_hi8: torch.Tensor,  # [HKV, T, K], float8_e5m2
-    k_lo8: torch.Tensor,  # [HKV, T, K], uint8
-    k_fp16: torch.Tensor,
+    k_hi8: torch.Tensor,  # [T, HKV, K], float8_e5m2
+    k_lo8: torch.Tensor,  # [T, HKV, K], uint8 (可选，不在本实现中使用)
+    k_fp16: torch.Tensor, # [T, HKV, K] (可选，仅便于打包/调试)
     v: torch.Tensor,      # [T, HKV, V]
     scale: float = None,
     BS: int = 128,
@@ -150,9 +202,11 @@ def attn_forward(
     delta: float = 5.0,
     return_skip_ratio: bool = False,
 ):
+    assert q.is_cuda and k_hi8.is_cuda and v.is_cuda
     HQ, K = q.shape
-    HKV, T, Kk = k_hi8.shape
+    T, HKV, Kk = k_hi8.shape
     Tv, HKVv, V = v.shape
+    assert Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [T, HKV, D]"
     G = HQ // HKV
 
     if scale is None:
@@ -169,16 +223,17 @@ def attn_forward(
     l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
-    
-    # 保留：阈值缓冲（可选，用于调试/分析）
+
+    # 可选：阈值缓冲（用于调试/分析）
     threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
+    # Stage 1：grid 改为 (HKV, NTB)
     attn_forward_stage1_fused_threshold[(HKV, NTB)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,
         scale, T, NTB, NTBS, delta,
-        threshold_buf,                         # 传入
+        threshold_buf,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
     )
 
@@ -188,7 +243,7 @@ def attn_forward(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    # Stage 2: 保持不变
+    # Stage 2：reduce（grid = (HKV, G) 保持不变）
     attn_forward_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
