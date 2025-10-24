@@ -1,4 +1,4 @@
-# attn_kernel_v1022_fused_grid2d_ht.py
+# attn_kernel_v1022_split_threshold.py
 import os
 import math
 from typing import Tuple
@@ -49,55 +49,43 @@ def pack_k_hi_lo(k_fp16: torch.Tensor):
 
 
 # ========================
-# Kernels
+# New: threshold kernel
 # ========================
 @triton.jit
-def attn_forward_stage1_fused_threshold(
-    q, k_hi8, v,
-    m_buf, l_buf, o_buf,
-    mask_buf,
-    scale, T, NTB, NTBS, delta,
-    th_buf,                                  # 可选：把阈值写回（用于调试/分析）
-    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
-    G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
+def compute_thresholds_kernel(
+    q, k_hi8, th_buf,
+    scale, T, NTB, delta,
+    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, G: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
 ):
-    # 2D grid = (HKV, NTB):
-    #   - program_id(0) => pid_hkv
-    #   - program_id(1) => pid_tb (大 time-block)
+    # 1D grid over HKV. Each program computes thresholds for G query rows of this KV head.
     pid_hkv = tl.program_id(0)
-    pid_tb = tl.program_id(1)
 
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
     TRUE_K  = tl.full([K], True, tl.int1)
 
-    # 当前 tb 对应的时间起点（大块）
-    s0 = pid_tb * BS
-    NSB: tl.constexpr = (BS + SBS - 1) // SBS
-
-    # 基于当前 HKV 的 head-group
     base_hq = pid_hkv * G
 
-    # 取 q 的一个 tile（假设 BM_DOT >= G）
+    # Load a tile of q (assume BM_DOT >= G)
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
     offs_k   = tl.arange(0, K)
     q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
     q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
-    # 所有 kernel 独立计算阈值（tb0 与 tb_last）
+    # First small time-chunk in tb0
     tb0 = 0
     offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
     t_mask0 = offs_t0 < T
-    # k_hi8 layout = [T, HKV, K] => ptr = t*(HKV*K) + hkv*K + k
     kb_ptrs0 = k_hi8 + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
     b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
     b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
     m0 = tl.max(b_s0, axis=1)
 
+    # Last small time-chunk in tb1 (could equal tb0 if NTB == 1)
     tb1 = NTB - 1
     offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
     t_mask1 = offs_t1 < T
@@ -107,13 +95,56 @@ def attn_forward_stage1_fused_threshold(
     b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
     m1 = tl.max(b_s1, axis=1)
 
+    # Threshold per row in this group: max(m0, m1) - delta
     th_rows = tl.maximum(m0, m1) - delta
 
-    # 可选：把阈值写回（供调试/分析）
-    # th_ptrs = th_buf + (base_hq + rows)
-    # tl.store(th_ptrs, th_rows, mask=row_mask)
+    # Store to th_buf[base_hq : base_hq + G]
+    th_ptrs = th_buf + (base_hq + rows)
+    tl.store(th_ptrs, th_rows, mask=row_mask)
 
-    # 遍历当前大块内的小块（SBS）
+
+# ========================
+# Stage-1: pruning + partial reductions (threshold read from buffer)
+# ========================
+@triton.jit
+def attn_forward_stage1_pruning(
+    q, k_hi8, v,
+    m_buf, l_buf, o_buf,
+    mask_buf,
+    th_buf,  # read-only thresholds of shape [HQ]
+    scale, T, NTB, NTBS,
+    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
+    BM_DOT: tl.constexpr = 16,
+):
+    # 2D grid = (HKV, NTB):
+    #   - program_id(0) => pid_hkv
+    #   - program_id(1) => pid_tb (big time-block)
+    pid_hkv = tl.program_id(0)
+    pid_tb = tl.program_id(1)
+
+    RCP_LN2 = 1.4426950408889634
+    NEG_INF = float("-inf")
+    TRUE_K  = tl.full([K], True, tl.int1)
+
+    # Current big time-block's start
+    s0 = pid_tb * BS
+    NSB: tl.constexpr = (BS + SBS - 1) // SBS
+
+    # head group base index
+    base_hq = pid_hkv * G
+
+    # Load q tile
+    rows     = tl.arange(0, BM_DOT)
+    row_mask = rows < G
+    offs_k   = tl.arange(0, K)
+    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+
+    # Load thresholds per row
+    th_rows = tl.load(th_buf + (base_hq + rows), mask=row_mask, other=float("-inf"))
+
+    # Iterate small blocks in this big block
     for sb in tl.static_range(NSB):
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
@@ -224,17 +255,25 @@ def attn_forward(
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
     mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
 
-    # 可选：阈值缓冲（用于调试/分析）
+    # 1) Compute thresholds in a dedicated kernel
     threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
+    compute_thresholds_kernel[(HKV,)](
+        q, k_hi8, threshold_buf,
+        scale, T, NTB, delta,
+        HKV=HKV, HQ=HQ, K=K, G=G,
+        # keep the same micro-params as before
+        BM_DOT=16, T_BS=16,
+    )
 
-    # Stage 1：grid 改为 (HKV, NTB)
-    attn_forward_stage1_fused_threshold[(HKV, NTB)](
+    # 2) Stage 1: prune and compute partial reductions (read thresholds)
+    attn_forward_stage1_pruning[(HKV, NTB)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,
-        scale, T, NTB, NTBS, delta,
         threshold_buf,
+        scale, T, NTB, NTBS,
         HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
+        BM_DOT=16,
     )
 
     skip_ratio = None
@@ -243,7 +282,7 @@ def attn_forward(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    # Stage 2：reduce（grid = (HKV, G) 保持不变）
+    # 3) Stage 2: masked reduce across kept blocks
     attn_forward_stage2_masked[(HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,

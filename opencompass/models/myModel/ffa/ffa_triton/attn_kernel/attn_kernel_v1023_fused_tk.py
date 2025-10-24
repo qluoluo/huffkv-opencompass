@@ -1,4 +1,4 @@
-# attn_kernel_v1022_fused_grid2d_ht.py
+# attn_kernel_v1022_fused_grid2d_tk.py
 import os
 import math
 from typing import Tuple
@@ -60,13 +60,12 @@ def attn_forward_stage1_fused_threshold(
     th_buf,                                  # 可选：把阈值写回（用于调试/分析）
     HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
-    BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
 ):
-    # 2D grid = (HKV, NTB):
-    #   - program_id(0) => pid_hkv
+    # 2D grid = (HQ, NTB):
+    #   - program_id(0) => pid_hq
     #   - program_id(1) => pid_tb (大 time-block)
-    pid_hkv = tl.program_id(0)
+    pid_hq = tl.program_id(0)
     pid_tb = tl.program_id(1)
 
     RCP_LN2 = 1.4426950408889634
@@ -77,41 +76,41 @@ def attn_forward_stage1_fused_threshold(
     s0 = pid_tb * BS
     NSB: tl.constexpr = (BS + SBS - 1) // SBS
 
-    # 基于当前 HKV 的 head-group
-    base_hq = pid_hkv * G
+    # 对应的 KV 头索引
+    pid_hkv = pid_hq // G
 
-    # 取 q 的一个 tile（假设 BM_DOT >= G）
-    rows     = tl.arange(0, BM_DOT)
-    row_mask = rows < G
-    offs_k   = tl.arange(0, K)
-    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
-    q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
+    # 取当前 HQ 的 q 向量
+    offs_k = tl.arange(0, K)
+    q_ptrs = q + pid_hq * K + offs_k
+    q_tile = tl.load(q_ptrs, mask=TRUE_K, other=0.0).to(tl.float16)
 
-    # 所有 kernel 独立计算阈值（tb0 与 tb_last）
+    # 阈值估计：比较 tb0 与 tb_last
     tb0 = 0
     offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
     t_mask0 = offs_t0 < T
     # k_hi8 layout = [T, HKV, K] => ptr = t*(HKV*K) + hkv*K + k
     kb_ptrs0 = k_hi8 + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
-    b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
-    m0 = tl.max(b_s0, axis=1)
+    # tl.dot -> tl.sum(q * k)
+    prod0 = q_tile.to(tl.float32)[:, None] * k_tile0.to(tl.float32)
+    b_s0 = tl.sum(prod0, axis=0) * scale * RCP_LN2
+    b_s0 = tl.where(t_mask0, b_s0, NEG_INF)
+    m0 = tl.max(b_s0, axis=0)
 
     tb1 = NTB - 1
     offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
     t_mask1 = offs_t1 < T
     kb_ptrs1 = k_hi8 + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile1 = tl.load(kb_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
-    b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
-    b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
-    m1 = tl.max(b_s1, axis=1)
+    prod1 = q_tile.to(tl.float32)[:, None] * k_tile1.to(tl.float32)
+    b_s1 = tl.sum(prod1, axis=0) * scale * RCP_LN2
+    b_s1 = tl.where(t_mask1, b_s1, NEG_INF)
+    m1 = tl.max(b_s1, axis=0)
 
-    th_rows = tl.maximum(m0, m1) - delta
+    th_row = tl.maximum(m0, m1) - delta
 
     # 可选：把阈值写回（供调试/分析）
-    # th_ptrs = th_buf + (base_hq + rows)
-    # tl.store(th_ptrs, th_rows, mask=row_mask)
+    # tl.store(th_buf + pid_hq, th_row)
 
     # 遍历当前大块内的小块（SBS）
     for sb in tl.static_range(NSB):
@@ -121,56 +120,55 @@ def attn_forward_stage1_fused_threshold(
         kb_ptrs = k_hi8 + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
         k_tile = tl.load(kb_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
 
-        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
-        b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
+        prod = q_tile.to(tl.float32)[:, None] * k_tile.to(tl.float32)
+        b_s = tl.sum(prod, axis=0) * scale * RCP_LN2
+        b_s_act = tl.where(t_mask_sb, b_s, NEG_INF)
 
-        m_rows_blk = tl.max(b_s_act, axis=1)
+        m_blk = tl.max(b_s_act, axis=0)
 
-        below   = (m_rows_blk < th_rows) & row_mask
-        n_below = tl.sum(below.to(tl.int32), axis=0)
-        n_valid = tl.sum(row_mask.to(tl.int32), axis=0)
-        prune_blk = n_below == n_valid
+        prune_blk = m_blk < th_row
 
         tb_sb = pid_tb * NSB + sb
         v_offs = tl.arange(0, V)
 
         if not prune_blk:
-            m_rows = m_rows_blk
-            b_p    = tl.where(t_mask_sb[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
-            l_rows = tl.sum(b_p, axis=1)
+            m_row = m_blk
+            b_p = tl.where(t_mask_sb, tl.exp2(b_s - m_row), 0.0)  # [SBS]
+
+            l_row = tl.sum(b_p, axis=0)
 
             need_v = tl.sum(t_mask_sb.to(tl.int32), axis=0) > 0
-            o_tile = tl.zeros([BM_DOT, V], tl.float32)
+            o_tile = tl.zeros([V], tl.float32)
             if need_v:
                 # v layout = [T, HKV, V] => ptr = t*(HKV*V) + hkv*V + v
                 v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
-                b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
-                o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
+                b_v = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
+                # tl.dot -> tl.sum(b_p[:, None] * b_v, axis=0)
+                o_tile = tl.sum(b_p.to(tl.float32)[:, None] * b_v.to(tl.float32), axis=0)
 
-            m_ptrs = m_buf + (base_hq + rows) * NTBS + tb_sb
-            l_ptrs = l_buf + (base_hq + rows) * NTBS + tb_sb
-            o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTBS * V) + tb_sb * V + v_offs[None, :]
-            tl.store(m_ptrs, m_rows, mask=row_mask)
-            tl.store(l_ptrs, l_rows, mask=row_mask)
-            tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
-            tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
+            m_ptrs = m_buf + pid_hq * NTBS + tb_sb
+            l_ptrs = l_buf + pid_hq * NTBS + tb_sb
+            o_ptrs = o_buf + pid_hq * (NTBS * V) + tb_sb * V + v_offs
+            tl.store(m_ptrs, m_row)
+            tl.store(l_ptrs, l_row)
+            tl.store(o_ptrs, o_tile)
+            tl.store(mask_buf + pid_hq * NTBS + tb_sb, tl.full((), 1, tl.int8))
 
 
 @triton.jit
 def attn_forward_stage2_masked(
     m_buf, l_buf, o_buf, mask_buf, o, NTBS,
-    HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
+    HQ: tl.constexpr, V: tl.constexpr,
 ):
-    pid_hkv = tl.program_id(0)
-    g = tl.program_id(1)
-    pid_hq = pid_hkv * G + g
+    # 1D grid = (HQ,)
+    pid_hq = tl.program_id(0)
     v_offs = tl.arange(0, V)
     neg_inf = tl.full((), float('-inf'), tl.float32)
     b_m = neg_inf
     b_acc = tl.zeros((), tl.float32)
     b_o = tl.zeros([V], tl.float32)
     for tb in range(0, NTBS):
-        keep = tl.load(mask_buf + pid_hkv * NTBS + tb).to(tl.int1)
+        keep = tl.load(mask_buf + pid_hq * NTBS + tb).to(tl.int1)
         if keep:
             m_b = tl.load(m_buf + pid_hq * NTBS + tb)
             l_b = tl.load(l_buf + pid_hq * NTBS + tb)
@@ -222,13 +220,13 @@ def attn_forward(
     m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
     o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
-    mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
+    mask_buf = torch.zeros((HQ, NTBS), device=q.device, dtype=torch.int8)
 
     # 可选：阈值缓冲（用于调试/分析）
     threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
 
-    # Stage 1：grid 改为 (HKV, NTB)
-    attn_forward_stage1_fused_threshold[(HKV, NTB)](
+    # Stage 1：grid 改为 (HQ, NTB)
+    attn_forward_stage1_fused_threshold[(HQ, NTB)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,
@@ -243,12 +241,12 @@ def attn_forward(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    # Stage 2：reduce（grid = (HKV, G) 保持不变）
-    attn_forward_stage2_masked[(HKV, G)](
+    # Stage 2：reduce（grid = (HQ,)）
+    attn_forward_stage2_masked[(HQ,)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
-        HKV=HKV, G=G, HQ=HQ, V=V,
+        HQ=HQ, V=V,
     )
 
     if return_skip_ratio:

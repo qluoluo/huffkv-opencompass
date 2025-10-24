@@ -12,8 +12,10 @@ SCRIPT="${SCRIPT_DIR}/run_attn_bench.py"
 # SBS_LIST=(64 128 256 512)
 # DELTA_LIST=(5.0 10.0)
 
-BS_LIST=(128 256 512)
-SBS_LIST=(64 128 256 512)
+# BS_LIST=(128 256 512 1024)
+# SBS_LIST=(128 256 512)
+BS_LIST=(256 512)
+SBS_LIST=(256 512)
 DELTA_LIST=(5.0)
 
 DTYPE=${DTYPE:-fp16}
@@ -22,7 +24,13 @@ WARMUP=${WARMUP:-1000}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_unfused}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_fused}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid1d}
-KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid2d_ht}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid2d_ht}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_unfused_grid2d_ht}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tk}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tbs4}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_onekernel_fullk}
+KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashdecoding}
+
 
 
 STEP=${STEP:-1024}

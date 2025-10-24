@@ -3,6 +3,7 @@ import torch
 
 __all__ = ["benchmark"]
 
+@torch.no_grad()
 def benchmark(fn, iters=50, warmup=10):
     torch.cuda.synchronize()
     for _ in range(warmup):
