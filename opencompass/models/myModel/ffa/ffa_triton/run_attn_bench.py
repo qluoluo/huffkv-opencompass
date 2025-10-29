@@ -29,6 +29,8 @@ def parse_args():
     parser.add_argument("--warmup", type=int, default=1000, help="Warmup iterations before timing")
     parser.add_argument("--no-plot-line", action="store_true", help="Disable length sweep plotting")
     parser.add_argument("--step", type=int, default=1024, help="Step size for length sweep")
+    parser.add_argument("--max-length", dest="max_length", type=int, default=None, help="最大测试长度（若为 None，则使用数据的完整长度）")
+    
     return parser.parse_args()
 
 def map_dtype(dtype_str: str):
@@ -92,7 +94,8 @@ if __name__ == "__main__":
 
     this_file = os.path.abspath(__file__)
     this_dir = os.path.dirname(this_file)
-    plot_root_dir = os.path.join(this_dir, "plot", f"{attn_kernel_name}", f"BS{BS}_SBS{SBS}_delta{delta}")
+    lmax_name = str(args.max_length) if args.max_length is not None else ""
+    plot_root_dir = os.path.join(this_dir, "plot", f"{attn_kernel_name}", f"BS{BS}_SBS{SBS}_delta{delta}" + f"_{lmax_name}" if args.max_length is not None else "")
     os.makedirs(plot_root_dir, exist_ok=True)
     raw_data_dir = os.path.join(plot_root_dir, "raw")
     os.makedirs(raw_data_dir, exist_ok=True)
@@ -117,6 +120,11 @@ if __name__ == "__main__":
     q_rope_full = layer_qkvh_data["q_rope"].to("cuda", dtype=dtype)   # [B=1, Hq, T, D]
     k_rope_full = layer_qkvh_data["k_rope"].to("cuda", dtype=dtype)   # [B=1, Hkv, T, D]
     v_full      = layer_qkvh_data["v"].to("cuda", dtype=dtype)        # [B=1, Hkv, T, Dv]
+    
+    if args.max_length is not None and args.max_length > 0:
+        q_rope_full = q_rope_full[..., :args.max_length, :]
+        k_rope_full = k_rope_full[..., :args.max_length, :]
+        v_full = v_full[..., :args.max_length, :]
 
     _, Hq, T_full, D  = q_rope_full.shape
     _, Hkv, _, _      = k_rope_full.shape

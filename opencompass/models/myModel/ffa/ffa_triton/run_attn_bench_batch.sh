@@ -14,13 +14,19 @@ SCRIPT="${SCRIPT_DIR}/run_attn_bench.py"
 
 # BS_LIST=(128 256 512 1024)
 # SBS_LIST=(128 256 512)
-BS_LIST=(256 512)
-SBS_LIST=(256 512)
+BS_LIST=(256)
+SBS_LIST=(256)
 DELTA_LIST=(5.0)
+
+MAX_LENGTH=$(( 32 * 1024 ))
 
 DTYPE=${DTYPE:-fp16}
 ITERS=${ITERS:-1000}
 WARMUP=${WARMUP:-1000}
+
+# ITERS=${ITERS:-10}
+# WARMUP=${WARMUP:-10}
+
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_unfused}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_fused}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid1d}
@@ -30,6 +36,7 @@ WARMUP=${WARMUP:-1000}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tbs4}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_onekernel_fullk}
 KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashdecoding}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashattn_onekernel}
 
 
 
@@ -58,6 +65,7 @@ for BS in "${BS_LIST[@]}"; do
         --warmup "${WARMUP}" \
         --kernel "${KERNEL}" \
         --step "${STEP}" \
+        --max-length "${MAX_LENGTH}" \
         ${EXTRA_ARGS}
     done
   done
