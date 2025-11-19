@@ -35,8 +35,10 @@ WARMUP=${WARMUP:-1000}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tk}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tbs4}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_onekernel_fullk}
-KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashdecoding}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashdecoding}
 # KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashattn_onekernel}
+# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1029_fused}
+KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1109_fused_x090}
 
 
 

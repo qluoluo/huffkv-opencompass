@@ -20,14 +20,14 @@ def to_k_str(n: int) -> str:
     val = n / 1024.0
     return f"{int(val)}k" if abs(val - int(val)) < 1e-9 else f"{val:.1f}k"
 
-def make_cache_file_path(raw_data_dir, layer_idx, T_full, Hq, Hkv, D, Dv, BS, SBS, delta, dtype, step, iters, warmup):
+def make_cache_file_path(raw_data_dir, layer_idx, T_full, Hq, Hkv, D, Dv, BS, SBS, delta, dtype, step, iters, warmup, bsz=1):
     def _to_k(n: int) -> str:
         val = n / 1024.0
         return f"{int(val)}k" if abs(val - int(val)) < 1e-9 else f"{val:.1f}k"
     fname = (
         f"layer_{layer_idx}_Tmax{_to_k(T_full)}_Hq{Hq}_Hkv{Hkv}_D{D}_Dv{Dv}"
         f"_BS{BS}_SBS{SBS}_delta{delta:g}_{dtype_key(dtype)}"
-        f"_step{step}_it{iters}_wu{warmup}.json"
+        f"_step{step}_it{iters}_wu{warmup}_bsz{bsz}.json"
     )
     return os.path.join(raw_data_dir, fname)
 

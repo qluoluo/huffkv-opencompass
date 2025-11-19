@@ -47,7 +47,7 @@ def compute_attention_stats(attn_weights):
     
     for head_idx in range(num_heads):
         head_attn = attn_weights[0, head_idx].float()  # [seq_len, seq_len]
-        head_attn_flat = head_attn.flatten()
+        head_attn_flat = head_attn[-1, :].flatten()
         
         # Sort for percentile calculations
         sorted_attn, _ = torch.sort(head_attn_flat, descending=True)
