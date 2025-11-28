@@ -96,7 +96,7 @@ if __name__ == "__main__":
     step = int(args.step)
     bsz = int(args.bsz)
 
-    exp_root_dir  = "/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/attn_analysis/result"
+    exp_root_dir  = "/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/attn_analysis/result"
     exp_root_subdir = "Llama-3_2-3B/longbench_gov_report_48_68_256k"
     exp_root = os.path.join(exp_root_dir, exp_root_subdir)
     layer_data_root = os.path.join(exp_root, "layer_data")
@@ -149,6 +149,8 @@ if __name__ == "__main__":
     q_rope_full = torch.cat(q_rope_full_list, dim=0).to("cuda", dtype=dtype)
     k_rope_full = torch.cat(k_rope_full_list, dim=0).to("cuda", dtype=dtype)
     v_full = torch.cat(v_full_list, dim=0).to("cuda", dtype=dtype)
+    
+    print(f"{q_rope_full.shape=}, {k_rope_full.shape=}, {v_full.shape=}")
     
     if args.max_length is not None and args.max_length > 0:
         q_rope_full = q_rope_full[..., :args.max_length, :]
@@ -260,7 +262,7 @@ if __name__ == "__main__":
 
     plot_path = plot_speed_curve(
         x_lengths, fused_ms_list, flash_ms_list,
-        T_full, BS, SBS, delta, f"layers_{layer_indices[0]}-{layer_indices[-1]}(bsz={bsz})", plot_root_dir, attn_kernel_name
+        T_full, BS, SBS, delta, f"layers_{layer_indices[0]}_bsz_{bsz}", plot_root_dir, attn_kernel_name
     )
 
     print(f"Layers {layer_indices} | bsz={bsz} | T={to_k_str(T_full)} Hq={Hq} Hkv={Hkv} D={D} Dv={Dv} "

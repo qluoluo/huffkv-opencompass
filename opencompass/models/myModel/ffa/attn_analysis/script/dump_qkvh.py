@@ -79,7 +79,7 @@ def modify_model_attn(model, save_dirpath):
 
 if __name__ == "__main__":
     # root_dir = '/inspire/hdd/project/embodied-multimodality/liuzhigeng-253108120105'
-    root_dir = '/remote-home1/zgliu'
+    root_dir = '/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105'
 
     model_path = os.path.join(root_dir, "models/Llama-3_2-3B")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -108,7 +108,7 @@ if __name__ == "__main__":
 
     input_ids = tokenizer(raw_text, truncation=False, padding=False, return_tensors="pt").input_ids
     
-    sample_len_k = 64
+    sample_len_k = 32
     # sample_len_k = -1
     sample_len = sample_len_k * 1024
     if sample_len_k > 0 and input_ids.shape[-1] >= sample_len:

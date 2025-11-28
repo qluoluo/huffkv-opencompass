@@ -1,4 +1,4 @@
-# attn_kernel_v1029_fused_nothres.py
+# attn_kernel_v1109_fused_bsz.py
 import os
 import math
 from typing import Tuple
