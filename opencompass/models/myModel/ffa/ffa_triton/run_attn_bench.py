@@ -45,7 +45,7 @@ def parse_args():
         dest="max_length",
         type=int,
         default=None,
-        help="最大测试长度（若为 None，则使用数据的完整长度）",
+        help="最大测试长度（若为 None 或 <0，则使用数据的完整长度）",
     )
     parser.add_argument(
         "--no-thres-time",
@@ -145,6 +145,7 @@ def load_layer_batch(layer_data_root, layer_indices, dtype, max_length):
 
 def main():
     args = parse_args()
+    max_length = None if args.max_length is not None and args.max_length < 0 else args.max_length
     (
         kernel_module,
         attn_forward,
@@ -175,12 +176,12 @@ def main():
     this_file = os.path.abspath(__file__)
     this_dir = os.path.dirname(this_file)
     plot_root_dir, raw_data_dir = build_plot_dirs(
-        attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, args.max_length, args.no_thres_time, this_dir
+        attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, args.no_thres_time, this_dir
     )
 
     layer_indices = list(range(1, 1 + bsz))
 
-    q_rope_full, k_rope_full, v_full = load_layer_batch(layer_data_root, layer_indices, dtype, args.max_length)
+    q_rope_full, k_rope_full, v_full = load_layer_batch(layer_data_root, layer_indices, dtype, max_length)
 
     bsz_actual, Hq, T_full, D = q_rope_full.shape
     _, Hkv, _, _ = k_rope_full.shape

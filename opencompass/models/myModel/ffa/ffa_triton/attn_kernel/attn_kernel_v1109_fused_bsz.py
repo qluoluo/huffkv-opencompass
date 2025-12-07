@@ -65,13 +65,13 @@ def attn_forward_stage1_fused_threshold(
     T_BS: tl.constexpr = 16,
     USE_EXT_TH: tl.constexpr = False,        # 是否使用外部阈值
 ):
-    # 3D grid = (B, HKV, NTB):
-    #   - program_id(0) => pid_b
-    #   - program_id(1) => pid_hkv
-    #   - program_id(2) => pid_tb (大 time-block)
-    pid_b = tl.program_id(0)
-    pid_hkv = tl.program_id(1)
-    pid_tb = tl.program_id(2)
+    # 3D grid = (NTB, B, HKV):
+    #   - program_id(0) => pid_tb (大 time-block)
+    #   - program_id(1) => pid_b
+    #   - program_id(2) => pid_hkv
+    pid_tb = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_hkv = tl.program_id(2)
 
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
@@ -316,8 +316,8 @@ def attn_forward(
         threshold_buf = torch.empty((B, HQ), device=q.device, dtype=torch.float32)
         use_ext_th = False
 
-    # Stage 1：grid 改为 (B, HKV, NTB)
-    attn_forward_stage1_fused_threshold[(B, HKV, NTB)](
+    # Stage 1：grid 改为 (NTB, B, HKV) 以使时间块维度成为最快变化维
+    attn_forward_stage1_fused_threshold[(NTB, B, HKV)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,

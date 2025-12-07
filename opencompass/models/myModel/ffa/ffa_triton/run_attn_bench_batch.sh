@@ -7,11 +7,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=${PY:-python}
 SCRIPT="${SCRIPT_DIR}/run_attn_bench.py"
 
-BS_LIST=(64 128 256)
-SBS_LIST=(64 128 256)
+BS_LIST=(32 64 128 256)
+SBS_LIST=(32 64 128 256)
 DELTA_LIST=(5.0)
 
-MAX_LENGTH=$(( 32 * 1024 ))
+# MAX_LENGTH=$(( 32 * 1024 ))
+MAX_LENGTH=$(( -1 ))
 
 DTYPE=${DTYPE:-fp16}
 ITERS=${ITERS:-1000}
