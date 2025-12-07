@@ -159,7 +159,7 @@ def compute_threshold_external(
 # ========================
 # Host wrapper
 # ========================
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor, k_hi8: torch.Tensor, k_lo8: torch.Tensor, k_fp16: torch.Tensor, v: torch.Tensor,
     scale: float = None, BS: int = 128, SBS: int | None = None, delta: float = 5.0,
     return_skip_ratio: bool = False, precomputed_threshold: torch.Tensor | None = None,

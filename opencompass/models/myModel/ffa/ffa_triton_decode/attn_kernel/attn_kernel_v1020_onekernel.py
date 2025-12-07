@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-__all__ = ["attn_forward_single_kernel", "attn_forward"]
+__all__ = ["attn_forward_single_kernel", "attn_forward_decode"]
 
 @triton.jit
 def attn_forward_single_kernel(
@@ -125,7 +125,7 @@ def attn_forward_single_kernel(
     # 写回本 HKV 的保留子块数
     tl.store(kept_buf + pid_hkv, kept)
 
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,
     k_hi8: torch.Tensor,
     k_lo8: torch.Tensor,   # 保持签名一致（此核未使用）

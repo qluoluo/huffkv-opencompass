@@ -30,7 +30,7 @@ def parse_args():
         "--kernel",
         type=str,
         default="attn_kernel.attn_kernel_v1109_fused_bsz",
-        help="Python module path for attn_forward (e.g., attn_kernel.attn_kernel_v1029_fused_nothres)",
+        help="Python module path for attn_forward_decode (e.g., attn_kernel.attn_kernel_v1029_fused_nothres)",
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--BS", type=int, default=256, help="Block size (BS)")
@@ -68,17 +68,17 @@ def map_dtype(dtype_str: str):
 
 def load_kernel_components(kernel_path: str):
     kernel_module = importlib.import_module(kernel_path)
-    if not hasattr(kernel_module, "attn_forward"):
-        raise AttributeError(f"Module {kernel_path} does not define 'attn_forward'")
+    if not hasattr(kernel_module, "attn_forward_decode"):
+        raise AttributeError(f"Module {kernel_path} does not define 'attn_forward_decode'")
 
     if not hasattr(kernel_module, "convert_to_triton_layout") or not hasattr(kernel_module, "pack_k_hi_lo"):
         raise AttributeError(f"Module {kernel_path} must define 'convert_to_triton_layout' and 'pack_k_hi_lo'")
 
-    attn_forward = getattr(kernel_module, "attn_forward")
+    attn_forward_decode = getattr(kernel_module, "attn_forward_decode")
     convert_to_triton_layout = getattr(kernel_module, "convert_to_triton_layout")
     pack_k_hi_lo = getattr(kernel_module, "pack_k_hi_lo")
     compute_threshold_external = getattr(kernel_module, "compute_threshold_external", None)
-    return kernel_module, attn_forward, convert_to_triton_layout, pack_k_hi_lo, compute_threshold_external
+    return kernel_module, attn_forward_decode, convert_to_triton_layout, pack_k_hi_lo, compute_threshold_external
 
 
 def get_gpu_info():
@@ -148,7 +148,7 @@ def main():
     max_length = None if args.max_length is not None and args.max_length < 0 else args.max_length
     (
         kernel_module,
-        attn_forward,
+        attn_forward_decode,
         convert_to_triton_layout,
         pack_k_hi_lo,
         compute_threshold_external,
@@ -210,7 +210,7 @@ def main():
             )
 
         def run_fused():
-            return attn_forward(
+            return attn_forward_decode(
                 q=q_triton,
                 k_hi8=k_hi8,
                 k_lo8=k_lo8,
@@ -227,7 +227,7 @@ def main():
         def run_flash():
             return flash_attn_compute(q_rope_1, k_rope, v)
 
-        output, sr = attn_forward(
+        output, sr = attn_forward_decode(
             q=q_triton,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
@@ -257,7 +257,7 @@ def main():
                 q=q_triton, k_fp16=k_triton_fp16, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
             )
 
-        o_triton, skip_ratio = attn_forward(
+        o_triton, skip_ratio = attn_forward_decode(
             q=q_triton,
             k_hi8=k_hi8,
             k_lo8=k_lo8,

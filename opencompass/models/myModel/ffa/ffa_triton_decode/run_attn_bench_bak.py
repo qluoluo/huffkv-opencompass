@@ -20,7 +20,7 @@ def parse_args():
     parser.add_argument("--kernel", type=str,
                         # 例如：attn_kernel.attn_kernel_v1029_fused_nothres
                         default="attn_kernel.attn_kernel_v1029_fused_nothres",
-                        help="Python module path for attn_forward")
+                        help="Python module path for attn_forward_decode")
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--BS", type=int, default=256, help="Block size (BS)")
     parser.add_argument("--SBS", type=int, default=256, help="Sub block size (SBS)")
@@ -66,9 +66,9 @@ if __name__ == "__main__":
 
     # 动态加载内核模块
     kernel_module = importlib.import_module(args.kernel)
-    if not hasattr(kernel_module, "attn_forward"):
-        raise AttributeError(f"Module {args.kernel} does not define 'attn_forward'")
-    attn_forward = getattr(kernel_module, "attn_forward")
+    if not hasattr(kernel_module, "attn_forward_decode"):
+        raise AttributeError(f"Module {args.kernel} does not define 'attn_forward_decode'")
+    attn_forward_decode = getattr(kernel_module, "attn_forward_decode")
     
     # 同时从内核模块使用合并后的 layout 工具
     if not hasattr(kernel_module, "convert_to_triton_layout") or not hasattr(kernel_module, "pack_k_hi_lo"):
@@ -161,7 +161,7 @@ if __name__ == "__main__":
             )
 
         def run_fused():
-            return attn_forward(
+            return attn_forward_decode(
                 q=q_triton, k_hi8=k_hi8, k_lo8=k_lo8, k_fp16=k_triton_fp16, v=v_triton,
                 scale=scale, BS=BS, SBS=SBS, delta=delta, return_skip_ratio=False,
                 precomputed_threshold=pre_th
@@ -170,7 +170,7 @@ if __name__ == "__main__":
         def run_flash():
             return flash_attn_compute(q_rope_1, k_rope, v)
 
-        _, sr = attn_forward(
+        _, sr = attn_forward_decode(
             q=q_triton, k_hi8=k_hi8, k_lo8=k_lo8, k_fp16=k_triton_fp16, v=v_triton,
             scale=scale, BS=BS, SBS=SBS, delta=delta, return_skip_ratio=True,
             precomputed_threshold=pre_th
@@ -192,7 +192,7 @@ if __name__ == "__main__":
                 q=q_triton, k_fp16=k_triton_fp16, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
             )
 
-        o_triton, skip_ratio = attn_forward(
+        o_triton, skip_ratio = attn_forward_decode(
             q=q_triton, k_hi8=k_hi8, k_lo8=k_lo8, k_fp16=k_triton_fp16, v=v_triton,
             scale=scale, BS=BS, SBS=SBS, delta=delta, return_skip_ratio=True,
             precomputed_threshold=pre_th

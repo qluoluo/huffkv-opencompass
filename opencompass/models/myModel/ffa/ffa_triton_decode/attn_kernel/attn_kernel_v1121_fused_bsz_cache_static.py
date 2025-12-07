@@ -195,7 +195,7 @@ def attn_forward_stage2_masked(
 # ========================
 # Host wrapper
 # ========================
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,
     k_hi8: torch.Tensor,
     k_lo8: torch.Tensor,

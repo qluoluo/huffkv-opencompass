@@ -225,7 +225,7 @@ def compute_skipped_block_ratio(mask_buf: torch.Tensor) -> float:
     return float(skip_ratio.item())           # 注意：.item() 会触发同步
 
 
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,         # [HQ, K]
     k_hi8: torch.Tensor,     # [HKV, T, K], float8_e5m2（高 8 位）
     k_lo8: torch.Tensor,     # [HKV, T, K], uint8（低 8 位）

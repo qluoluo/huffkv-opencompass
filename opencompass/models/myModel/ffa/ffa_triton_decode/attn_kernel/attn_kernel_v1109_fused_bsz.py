@@ -271,7 +271,7 @@ def compute_threshold_external(
 # ========================
 # Host wrapper
 # ========================
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,      # [B, HQ, K]
     k_hi8: torch.Tensor,  # [B, T, HKV, K], float8_e5m2
     k_lo8: torch.Tensor,  # [B, T, HKV, K], uint8 (可选，不在本实现中使用)
@@ -420,7 +420,7 @@ if __name__ == "__main__":
     k_hi8, k_lo8 = pack_k_hi_lo(k_triton_fp16)
 
     # 先跑一次获取跳过率等信息
-    o_ref, skip_ratio = attn_forward(
+    o_ref, skip_ratio = attn_forward_decode(
         q=q_triton,
         k_hi8=k_hi8,
         k_lo8=k_lo8,
@@ -442,7 +442,7 @@ if __name__ == "__main__":
     mean_abs = (o_ref.float() - o_flash.float()).abs().mean().item()
 
     def run_fused():
-        return attn_forward(
+        return attn_forward_decode(
             q=q_triton,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
@@ -460,7 +460,7 @@ if __name__ == "__main__":
 
     ms_fused = benchmark(run_fused, iters=ITERS, warmup=WARMUP)
     ms_flash = benchmark(run_flash, iters=ITERS, warmup=WARMUP)
-    print(f"[Bench] attn_forward: {ms_fused:.3f} ms (avg over {ITERS} iters, warmup={WARMUP})")
+    print(f"[Bench] attn_forward_decode: {ms_fused:.3f} ms (avg over {ITERS} iters, warmup={WARMUP})")
     print(f"[Bench] flash_attn:   {ms_flash:.3f} ms (avg over {ITERS} iters, warmup={WARMUP})")
     print(
         f"[Stats] skip_ratio={skip_ratio:.3%}, "

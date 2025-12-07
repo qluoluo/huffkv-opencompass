@@ -124,7 +124,7 @@ def attn_forward_fused(
 # ========================
 # Host wrapper
 # ========================
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,      # [HQ, K]
     k_hi8: torch.Tensor,  # [T, HKV, K], kept for interface compatibility (unused)
     k_lo8: torch.Tensor,  # [T, HKV, K], kept for interface compatibility (unused)

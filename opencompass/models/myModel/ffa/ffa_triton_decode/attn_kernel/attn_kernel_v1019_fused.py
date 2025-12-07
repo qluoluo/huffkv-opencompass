@@ -138,7 +138,7 @@ def attn_forward_stage2_masked(
     o_ptrs = o + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,      # [HQ, K]
     k_hi8: torch.Tensor,  # [HKV, T, K], float8_e5m2
     k_lo8: torch.Tensor,  # [HKV, T, K], uint8

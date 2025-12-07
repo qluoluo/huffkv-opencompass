@@ -240,7 +240,7 @@ def attn_forward_stage2_masked(
 # ========================
 # Host wrapper
 # ========================
-def attn_forward(
+def attn_forward_decode(
     q: torch.Tensor,      # [HQ, K]
     k_hi8: torch.Tensor,  # [T, HKV, K], float8_e5m2
     k_lo8: torch.Tensor,  # [T, HKV, K], uint8 (可选，不在本实现中使用)
