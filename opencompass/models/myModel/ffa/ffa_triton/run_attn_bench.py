@@ -34,7 +34,7 @@ def parse_args():
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
     parser.add_argument("--BS", type=int, default=256, help="Block size (BS)")
-    parser.add_argument("--SBS", type=int, default=256, help="Sub block size (SBS)")
+    parser.add_argument("--SBS", type=int, default=None, help="Sub block size (SBS). Defaults to BS when omitted.")
     parser.add_argument("--delta", type=float, default=5.0, help="Delta parameter for skipping")
     parser.add_argument("--iters", type=int, default=1000, help="Benchmark iterations")
     parser.add_argument("--warmup", type=int, default=1000, help="Warmup iterations before timing")
@@ -158,7 +158,7 @@ def main():
 
     dtype = map_dtype(args.dtype)
     BS = int(args.BS)
-    SBS = int(args.SBS)
+    SBS = int(args.SBS) if args.SBS is not None else BS
     delta = float(args.delta)
     iters = int(args.iters)
     warmup = int(args.warmup)

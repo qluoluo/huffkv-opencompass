@@ -7,15 +7,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY=${PY:-python}
 SCRIPT="${SCRIPT_DIR}/run_attn_bench.py"
 
-# 参数集合可按需调整
-# BS_LIST=(64 128 256 512)
-# SBS_LIST=(64 128 256 512)
-# DELTA_LIST=(5.0 10.0)
-
-# BS_LIST=(128 256 512 1024)
-# SBS_LIST=(128 256 512)
-BS_LIST=(256)
-SBS_LIST=(256)
+BS_LIST=(64 128 256)
+SBS_LIST=(64 128 256)
 DELTA_LIST=(5.0)
 
 MAX_LENGTH=$(( 32 * 1024 ))
@@ -24,22 +17,7 @@ DTYPE=${DTYPE:-fp16}
 ITERS=${ITERS:-1000}
 WARMUP=${WARMUP:-1000}
 
-# ITERS=${ITERS:-10}
-# WARMUP=${WARMUP:-10}
-
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_unfused}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1019_fused}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid1d}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_fused_grid2d_ht}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1022_unfused_grid2d_ht}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tk}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1023_fused_tbs4}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_onekernel_fullk}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashdecoding}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1024_flashattn_onekernel}
-# KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1029_fused}
-KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1109_fused_x090}
-
+KERNEL=${KERNEL:-attn_kernel.attn_kernel_v1109_fused_bsz}
 
 
 STEP=${STEP:-1024}
