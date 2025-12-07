@@ -1,5 +1,5 @@
 # from .cache_utils import *
-import opencompass.models.myModel.general_quant.cache_utils
+# import opencompass.models.myModel.general_quant.cache_utils
 
 import os
 from typing import Dict, List, Optional, Union
@@ -37,10 +37,10 @@ class LlamaForCausalLM_FFA_OC(HuggingFaceCausalLM):
 
         model_kwargs = kwargs
         config_attn_settings = dict(
-            use_ffa = False,
-            BS = 256,
-            SBS = 256,
+            use_ffa_prefill = False,
+            use_ffa_decode = False,
             delta = 5.0,
+            pattern_layers = None,
         )
 
         # 使用字典推导式提取值并设置默认值

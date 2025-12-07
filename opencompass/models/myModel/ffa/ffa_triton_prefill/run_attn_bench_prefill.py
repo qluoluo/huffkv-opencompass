@@ -17,6 +17,7 @@ from utils.cache import (
 )
 from utils.plot import plot_speed_curve
 from utils.load import load_qkvh
+from utils.pack import pack_k_hi_lo
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run attention benchmark (prefill) with configurable hyperparameters.")
@@ -75,13 +76,6 @@ if __name__ == "__main__":
     if not hasattr(kernel_module, "attn_forward_prefill"):
         raise AttributeError(f"Module {args.kernel} does not define 'attn_forward_prefill'")
     attn_forward_prefill = getattr(kernel_module, "attn_forward_prefill")
-  
-    # 同时从内核模块使用合并后的 layout 工具
-    if not hasattr(kernel_module, "convert_to_triton_layout") or not hasattr(kernel_module, "pack_k_hi_lo"):
-        raise AttributeError(f"Module {args.kernel} must define 'convert_to_triton_layout' and 'pack_k_hi_lo'")
-  
-    convert_to_triton_layout = getattr(kernel_module, "convert_to_triton_layout")
-    pack_k_hi_lo = getattr(kernel_module, "pack_k_hi_lo")
 
     # 可选：外部阈值计算函数（用于 --no-thres-time）
     compute_threshold_external = getattr(kernel_module, "compute_threshold_external", None)
@@ -176,9 +170,7 @@ if __name__ == "__main__":
         k_rope_L = k_rope_full[:, :, :L, :]      # [bsz, Hkv, L, D]
         v_L      = v_full[:, :, :L, :]           # [bsz, Hkv, L, Dv]
 
-        # 使用合并到内核模块的布局工具，得到 K/V 为 [bsz, T, Hkv, D]（或内核约定的格式）
-        q_triton, k_triton, v_triton = convert_to_triton_layout(q_rope_L, k_rope_L, v_L)
-        k_hi8, k_lo8 = pack_k_hi_lo(k_triton)
+        k_hi8, k_lo8 = None, None
 
         # 可选：外部预计算阈值（不计入 fused 计时）
         pre_th = None
@@ -188,12 +180,12 @@ if __name__ == "__main__":
             # 注意：NTB 的计算逻辑与内核保持一致（按 K 轴分块）
             NTB = (L + BS - 1) // BS
             pre_th = compute_threshold_external(
-                q=q_triton, k=k_triton, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
+                q=q_rope_L, k=k_rope_L, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
             )
 
         def run_fused():
             return attn_forward_prefill(
-                q=q_triton, k=k_triton, v=v_triton, k_hi8=k_hi8, k_lo8=k_lo8,
+                q=q_rope_L, k=k_rope_L, v=v_L,
                 scale=scale, BT=BT, BS=BS, BK=BK, delta=delta, return_skip_ratio=False,
                 precomputed_threshold=pre_th
             )
@@ -203,7 +195,7 @@ if __name__ == "__main__":
 
         # 运行一次获取 skip ratio（维度随内核实现，通常聚合到一个标量）
         output, sr = attn_forward_prefill(
-            q=q_triton, k=k_triton, v=v_triton, k_hi8=k_hi8, k_lo8=k_lo8,
+            q=q_rope_L, k=k_rope_L, v=v_L, k_hi8=k_hi8, k_lo8=k_lo8,
             scale=scale, BT=BT, BS=BS, BK=BK, delta=delta, return_skip_ratio=True,
             precomputed_threshold=pre_th
         )
@@ -214,18 +206,16 @@ if __name__ == "__main__":
 
     def validate_full():
         # [Prefill] 全长 q/k/v，一次性前向
-        q_triton, k_triton, v_triton = convert_to_triton_layout(q_rope_full, k_rope_full, v_full)
-        k_hi8, k_lo8 = pack_k_hi_lo(k_triton)
 
         pre_th = None
         if args.no_thres_time:
             NTB = (T_full + BS - 1) // BS
             pre_th = compute_threshold_external(
-                q=q_triton, k=k_triton, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
+                q=q_rope_full, k=k_rope_full, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
             )
 
         o_triton, skip_ratio = attn_forward_prefill(
-            q=q_triton, k=k_triton, v=v_triton, k_hi8=k_hi8, k_lo8=k_lo8,
+            q=q_rope_full, k=k_rope_full, v=v_full,
             scale=scale, BT=BT, BS=BS, BK=BK, delta=delta, return_skip_ratio=True,
             precomputed_threshold=pre_th
         )

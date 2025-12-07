@@ -12,22 +12,22 @@ os.environ['TRITON_PRINT_AUTOTUNING'] = '1'
 # ====== 修改：autotune 配置，移除 BV ======
 TUNE_CONFIGS = [
     # 轻量形状 / 小 V 瓶颈
-    triton.Config({'BT': 64,  'BS': 128}, num_warps=4, num_stages=2),
-    triton.Config({'BT': 128, 'BS': 128}, num_warps=4, num_stages=2),
+    # triton.Config({'BT': 64,  'BS': 128}, num_warps=4, num_stages=2),
+    # triton.Config({'BT': 128, 'BS': 128}, num_warps=4, num_stages=2),
 
-    # 中等形状
-    triton.Config({'BT': 128, 'BS': 128}, num_warps=4, num_stages=2),
-    triton.Config({'BT': 128, 'BS': 256}, num_warps=8, num_stages=2),
+    # # 中等形状
+    # triton.Config({'BT': 128, 'BS': 128}, num_warps=4, num_stages=2),
+    # triton.Config({'BT': 128, 'BS': 256}, num_warps=8, num_stages=2),
 
-    # 序列更长 / 更深流水（H100 更友好）
-    triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=2),
-    triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=3),
-    triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=4),
+    # # 序列更长 / 更深流水（H100 更友好）
+    # triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=2),
+    # triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=3),
+    # triton.Config({'BT': 128, 'BS': 128}, num_warps=8, num_stages=4),
     
-    triton.Config({'BT': 256, 'BS': 128}, num_warps=8, num_stages=3),
+    # triton.Config({'BT': 256, 'BS': 128}, num_warps=8, num_stages=3),
 
-    # 保底小块
-    triton.Config({'BT': 64,  'BS': 64},  num_warps=4, num_stages=2),
+    # # 保底小块
+    # triton.Config({'BT': 64,  'BS': 64},  num_warps=4, num_stages=2),
 ]
 
 # 关键：对不同问题规模分别缓存最佳配置（T/K/V/HQ 变化会重新搜索一次后缓存）
@@ -40,6 +40,9 @@ def parallel_attn_fwd_kernel(
     B: tl.constexpr, H: tl.constexpr, HQ: tl.constexpr, G: tl.constexpr,
     K: tl.constexpr, V: tl.constexpr,
     BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr,
+    delta: tl.constexpr,  # 新增：阈值参数
+    skip_counter,  # 新增：跳过块计数器
+    total_counter,  # 新增：总块计数器
 ):
     # 修改：移除 i_v，只用 i_t 和 i_bh
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
@@ -89,30 +92,57 @@ def parallel_attn_fwd_kernel(
 
     # 当前块：带因果掩码
     o_q = i_t * BT + tl.arange(0, BT)
+    
+    # 计算当前最大值的阈值
+    threshold = b_m - delta
+    
+    # 统计变量
+    local_skip_count = 0
+    local_total_count = 0
+    
     for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
+        # 先只加载k来计算最大值
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H*K),
                                 (0, i_s), (BK, BS), (0, 1))
-        # 修改：V指针现在处理整个V维度
-        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1),
-                                (i_s, 0), (BS, V), (1, 0))
 
         o_k = i_s + tl.arange(0, BS)
         m_k = o_k < T
 
         b_k = tl.load(p_k, boundary_check=(0, 1), cache_modifier=".cg")
-        b_v = tl.load(p_v, boundary_check=(0, 1), cache_modifier=".cg")
-
         b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
         b_s = tl.where((o_q[:, None] >= o_k[None, :]) & m_k[None, :], b_s, float('-inf'))
+        
+        # 计算当前块的最大值
+        block_max = tl.max(b_s, 1)
+        
+        # 统计总块数
+        local_total_count += 1
+        
+        # 判断是否跳过这个块
+        skip_block = tl.sum(block_max < threshold) == BT  # 所有行的最大值都小于阈值
+        
+        if skip_block:
+            # 跳过块计数
+            local_skip_count += 1
+        else:
+            # 不跳过，加载v并计算
+            p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1),
+                                    (i_s, 0), (BS, V), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1), cache_modifier=".cg")
 
-        b_m_new = tl.maximum(b_m, tl.max(b_s, 1))
-        b_r = tl.exp2(b_m - b_m_new)
-        b_m = b_m_new
+            b_m_new = tl.maximum(b_m, block_max)
+            b_r = tl.exp2(b_m - b_m_new)
+            b_m = b_m_new
 
-        b_p = tl.exp2(b_s - b_m[:, None])
-        b_acc = b_acc * b_r + tl.sum(b_p, 1)
-        # 修改：矩阵乘法输出现在是 [BT, V]
-        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+            b_p = tl.exp2(b_s - b_m[:, None])
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+            # 修改：矩阵乘法输出现在是 [BT, V]
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+
+    # 原子操作更新全局计数器
+    if local_total_count > 0:
+        tl.atomic_add(skip_counter, local_skip_count)
+        tl.atomic_add(total_counter, local_total_count)
 
     eps = 1e-12
     b_o = b_o / tl.maximum(b_acc[:, None], eps)
@@ -128,6 +158,8 @@ def parallel_attn_fwd(
     BT: Optional[int] = None,
     BS: Optional[int] = None,
     BK: Optional[int] = None,   # 需等于 head_dim
+    delta: float = 5.0,         # 新增：阈值参数
+    return_skip_ratio: bool = False,  # 新增：是否返回跳过比例
 ) -> torch.Tensor:
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dtype in (torch.float16, torch.bfloat16)
@@ -160,16 +192,29 @@ def parallel_attn_fwd(
         B * HQ,
     )
 
-    # 修改：移除BV相关参数
+    # 添加计数器
+    skip_counter = torch.zeros(1, device=device, dtype=torch.int32)
+    total_counter = torch.zeros(1, device=device, dtype=torch.int32)
+
+    # 修改：移除BV相关参数，添加delta和计数器
     launch_kwargs = dict(
         q=q, k=k, v=v, o=o, scale=scale, T=T,
         B=B, H=H, HQ=HQ, G=G, K=Kdim, V=Vdim,
-        BK=BK,
+        BK=BK, delta=delta,
+        skip_counter=skip_counter,  # 新增
+        total_counter=total_counter,  # 新增
     )
     if BT is not None: launch_kwargs['BT'] = BT
     if BS is not None: launch_kwargs['BS'] = BS
 
     parallel_attn_fwd_kernel[grid](**launch_kwargs)
+    
+    if return_skip_ratio:
+        # 计算跳过比例
+        skip_count = skip_counter.item()
+        total_count = total_counter.item()
+        skip_ratio = skip_count / total_count if total_count > 0 else 0.0
+        return o.transpose(1,2), skip_ratio
   
     return o.transpose(1,2)
 
@@ -213,16 +258,18 @@ if __name__ == "__main__":
     k_block_size = 128
     BK = 128
     causal = True
-    iters = 100
-    warmup = 10
+    iters = 500
+    warmup = 100
 
-    sample_length = 64 * 1024
+    sample_length = 128 * 1024
     # sample_length = -1
   
     # 计时参数
     iters = 10
     warmup = 10
-    
+
+    # from utils import load_qkvh
+  
     from utils.load import load_qkvh
 
     # torch.set_float32_matmul_precision("high")
@@ -234,6 +281,9 @@ if __name__ == "__main__":
     layer_data_root = os.path.join(exp_root, 'layer_data')
 
     dtype = torch.float16
+
+    # 测试不同的delta值
+    delta_values = [5.0,]
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         print(f"\n========== Layer {layer_idx} ==========")
@@ -261,44 +311,54 @@ if __name__ == "__main__":
 
         scale = 1.0 / math.sqrt(Kdim)
 
-        # --- Triton Kernel Call ---
-        o_triton = parallel_attn_fwd(
-            q=q,              # [B, T, Hq, K]
-            k=k,              # [B, T, Hkv, K]
-            v=v,              # [B, T, Hkv, V]
-            scale=scale, causal=causal,
-            # BT=q_block_size,    # 注意参数名是 BT/BS
-            # BS=k_block_size,
-            BK=BK,              # kernel 要求 BK == Kdim
-        )                       # 返回 [B, T, Hq, V]
-
-        # --- FlashAttention Baseline Call ---
-        o_flash = flash_compute(q, k, v, causal)  # [B, Hq, T, V]
-
-        # --- Numerical Comparison ---
-        # 将 Triton 输出转成与 Flash 相同布局 [B, Hq, T, V]
-        o_triton_hqt = o_triton.transpose(1, 2)
-        diff = (o_triton_hqt.float() - o_flash.float()).abs()
-        max_abs = diff.max().item()
-        mean_abs = diff.mean().item()
-        rel = diff.max() / (o_flash.float().abs().max().clamp_min(1e-6))
-        rel = rel.item()
-        print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
-
-        # --- Performance Benchmark ---
-        def run_triton():
-            return parallel_attn_fwd(
-                q=q, k=k, v=v,
+        # 测试不同的delta值
+        for delta in delta_values:
+            print(f"\n--- Testing with delta={delta} ---")
+            
+            # --- Triton Kernel Call ---
+            o_triton, skip_ratio = parallel_attn_fwd(
+                q=q,              # [B, T, Hq, K]
+                k=k,              # [B, T, Hkv, K]
+                v=v,              # [B, T, Hkv, V]
                 scale=scale, causal=causal,
-                # BT=q_block_size, 
+                # BT=q_block_size,    # 注意参数名是 BT/BS
                 # BS=k_block_size,
-                BK=BK,
-            )
+                BK=BK,              # kernel 要求 BK == Kdim
+                delta=delta,
+                return_skip_ratio=True,
+            )                       # 返回 [B, T, Hq, V]
 
-        def run_flash():
-            return flash_compute(q, k, v, causal=causal)
+            print(f"Skip ratio: {skip_ratio:.3f} ({skip_ratio*100:.1f}%)")
 
-        ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
-        ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
-        print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
-        break
+            # --- FlashAttention Baseline Call ---
+            o_flash = flash_compute(q, k, v, causal)  # [B, Hq, T, V]
+
+            # --- Numerical Comparison ---
+            # 将 Triton 输出转成与 Flash 相同布局 [B, Hq, T, V]
+            o_triton_hqt = o_triton.transpose(1, 2)
+            diff = (o_triton_hqt.float() - o_flash.float()).abs()
+            max_abs = diff.max().item()
+            mean_abs = diff.mean().item()
+            rel = diff.max() / (o_flash.float().abs().max().clamp_min(1e-6))
+            rel = rel.item()
+            print(f"Value diff vs Flash(GQA): max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}, rel={rel:.3e}")
+
+            # --- Performance Benchmark ---
+            def run_triton():
+                return parallel_attn_fwd(
+                    q=q, k=k, v=v,
+                    scale=scale, causal=causal,
+                    # BT=q_block_size, 
+                    # BS=k_block_size,
+                    BK=BK,
+                    delta=delta,
+                )
+
+            def run_flash():
+                return flash_compute(q, k, v, causal=causal)
+
+            ms_triton = bench_op(run_triton, iters=iters, warmup=warmup)
+            ms_flash = bench_op(run_flash, iters=iters, warmup=warmup)
+            print(f"Speed: Triton={ms_triton:.3f} ms, Flash={ms_flash:.3f} ms, ratio={ms_triton/ms_flash:.2f}x")
+        
+        break  # 只测试第一层

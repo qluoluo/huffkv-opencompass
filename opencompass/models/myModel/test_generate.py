@@ -3,14 +3,12 @@ import numpy as np
 import os
 import time
 import torch
-from peft import PeftModel
 
 from transformers import AutoTokenizer, AutoConfig
 from ffa.modeling_llama import LlamaForCausalLM
 
 # 模型路径
-# model_path = '/inspire/hdd/project/heziweiproject/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
-model_path = '/inspire/hdd/project/embodied-multimodality/liuxiaoran-240108120089/projects_zgliu/models/Llama-3_2-3B'
+model_path = '/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105/models/Llama-3_2-3B'
 
 print(f"{os.path.basename(model_path)=}")
 
@@ -20,12 +18,10 @@ config = AutoConfig.from_pretrained(
     trust_remote_code=True,
 )
 
-config_attn_settings = dict(
-    use_ffa = True,
-    BS = 256,
-    SBS = 256,
-    delta = 5.0,
-)
+config_attn_settings = {
+    "use_ffa_prefill": True,
+    "delta": 3.0,
+}
 
 config.attn_settings = config_attn_settings
 
@@ -54,4 +50,4 @@ print(f"{inputs.input_ids.shape=}")
 
 with torch.no_grad():
     outputs = model.generate(**inputs, max_new_tokens=30, do_sample=True)
-    # print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+    print(tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))

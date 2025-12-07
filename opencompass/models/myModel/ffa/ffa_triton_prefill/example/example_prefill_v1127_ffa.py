@@ -233,10 +233,10 @@ if __name__ == "__main__":
     k_block_size = 128
     BK = 128
     causal = True
-    iters = 100
-    warmup = 10
+    iters = 500
+    warmup = 100
 
-    sample_length = 64 * 1024
+    sample_length = 128 * 1024
     # sample_length = -1
   
     # 计时参数
@@ -258,7 +258,7 @@ if __name__ == "__main__":
     dtype = torch.float16
 
     # 测试不同的delta值
-    delta_values = [0.0, 2.0, 5.0, 10.0]
+    delta_values = [5.0,]
 
     for layer_idx, layer_qkvh_data in tqdm(enumerate(load_qkvh(layer_data_root))):
         print(f"\n========== Layer {layer_idx} ==========")

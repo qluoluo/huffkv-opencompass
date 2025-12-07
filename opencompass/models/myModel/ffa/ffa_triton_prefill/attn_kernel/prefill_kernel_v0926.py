@@ -118,6 +118,8 @@ def attn_forward_prefill(
     delta=5.0, return_skip_ratio=False,
     precomputed_threshold=False,
 ):
+    q, k, v = convert_to_triton_layout(q, k, v)
+    
     assert q.is_cuda and k.is_cuda and v.is_cuda
     assert q.dtype in (torch.float16, torch.bfloat16)
     assert causal
