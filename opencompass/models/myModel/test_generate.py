@@ -19,8 +19,8 @@ config = AutoConfig.from_pretrained(
 )
 
 config_attn_settings = {
-    "use_ffa_prefill": True,
-    "delta": 3.0,
+    "use_ffa_decode": True,
+    "delta": 5.0,
 }
 
 config.attn_settings = config_attn_settings

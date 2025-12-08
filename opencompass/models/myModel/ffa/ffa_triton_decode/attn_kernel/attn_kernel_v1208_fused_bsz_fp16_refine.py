@@ -34,7 +34,7 @@ def convert_to_triton_layout(
     return q_triton, k_triton_fp16, v_triton
 
 
-def pack_k_hi_lo(k_fp16: torch.Tensor):
+def pack_k_hi_lo(k: torch.Tensor):
     """
     将 [B, T, H, D] 的 fp16 拆分为高低位：
     - k_hi8: 使用 float8_e5m2 视图取高字节，便于内核直接载入近似值
@@ -43,10 +43,10 @@ def pack_k_hi_lo(k_fp16: torch.Tensor):
     - 高地址字节 (High Byte) 包含 Sign + Exponent + High Mantissa
     - 低地址字节 (Low Byte) 包含 Low Mantissa
     """
-    k_fp16 = k_fp16.contiguous()
+    k = k.contiguous()
     # 假设 Little Endian，Byte 1 是高位，Byte 0 是低位
-    k_hi8 = k_fp16.view(torch.float8_e5m2)[..., 1::2].contiguous()
-    k_lo8 = k_fp16.view(torch.uint8)[..., 0::2].contiguous()
+    k_hi8 = k.view(torch.float8_e5m2)[..., 1::2].contiguous()
+    k_lo8 = k.view(torch.uint8)[..., 0::2].contiguous()
     return k_hi8, k_lo8
 
 # ==========================================
@@ -55,7 +55,7 @@ def pack_k_hi_lo(k_fp16: torch.Tensor):
 
 @triton.jit
 def attn_forward_stage1_cascade(
-    q_ptr, k_hi_ptr, k_lo_ptr, k_fp16_ptr, v_ptr,
+    q_ptr, k_hi_ptr, k_lo_ptr, k_ptr, v_ptr,
     m_buf, l_buf, o_buf, mask_buf,
     scale, T, NTB, NTBS, delta,
     stride_qb, stride_qh, stride_qk,
@@ -107,7 +107,7 @@ def attn_forward_stage1_cascade(
     # 计算指针
     off_b_hkv = pid_b * stride_kb + pid_hkv * stride_kh
     
-    k_ptrs0 = k_fp16_ptr + off_b_hkv + (offs_t0[:, None] * stride_kt + offs_k[None, :] * stride_kk)
+    k_ptrs0 = k_ptr + off_b_hkv + (offs_t0[:, None] * stride_kt + offs_k[None, :] * stride_kk)
     k_val_0 = tl.load(k_ptrs0, mask=t_mask0[:, None], other=0.0).to(tl.float16)
     
     s0 = tl.dot(q_tile, k_val_0.trans(), out_dtype=tl.float32) * scale * RCP_LN2
@@ -119,7 +119,7 @@ def attn_forward_stage1_cascade(
     offs_t1 = tb1 * BS + tl.arange(0, T_BS) # 注意这里简化了，只取 BS 的前 T_BS
     t_mask1 = offs_t1 < T
     
-    k_ptrs1 = k_fp16_ptr + off_b_hkv + (offs_t1[:, None] * stride_kt + offs_k[None, :] * stride_kk)
+    k_ptrs1 = k_ptr + off_b_hkv + (offs_t1[:, None] * stride_kt + offs_k[None, :] * stride_kk)
     k_val_1 = tl.load(k_ptrs1, mask=t_mask1[:, None], other=0.0).to(tl.float16)
     
     s1 = tl.dot(q_tile, k_val_1.trans(), out_dtype=tl.float32) * scale * RCP_LN2
@@ -172,7 +172,7 @@ def attn_forward_stage1_cascade(
             # -------------------------------------------------
             # Step B: 精修 (Refine) - 读取全精度 K 重算
             # -------------------------------------------------
-            k_full_ptrs = k_fp16_ptr + off_b_hkv + (offs_t_sb[:, None] * stride_kt + offs_k[None, :] * stride_kk)
+            k_full_ptrs = k_ptr + off_b_hkv + (offs_t_sb[:, None] * stride_kt + offs_k[None, :] * stride_kk)
             k_full = tl.load(k_full_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
             
             # 精确计算 Score
@@ -278,7 +278,7 @@ def sparse_decode_cascade(
     q,
     k_hi,
     k_lo,
-    k_fp16,
+    k,
     v,
     delta=5.0,
     block_size=128,
@@ -290,13 +290,13 @@ def sparse_decode_cascade(
     Args:
         q: [B, HQ, K]
         k_hi, k_lo: [B, T, HKV, K] (Packed uint8)
-        k_fp16: [B, T, HKV, K] (Full precision K for refine)
+        k: [B, T, HKV, K] (Full precision K for refine)
         v: [B, T, HKV, V]
     """
     q = q.contiguous()
     k_hi = k_hi.contiguous()
     k_lo = k_lo.contiguous()
-    k_fp16 = k_fp16.contiguous()
+    k = k.contiguous()
     v = v.contiguous()
 
     block_size = int(block_size)
@@ -304,9 +304,9 @@ def sparse_decode_cascade(
     if sub_block_size < 16:
         raise ValueError(f"sub_block_size ({sub_block_size}) must be at least 16 to satisfy tl.dot requirements.")
     B, HQ, K = q.shape
-    Bk, T, HKV, Kk = k_fp16.shape
-    assert k_hi.shape == k_fp16.shape, "k_hi shape must match k_fp16 shape"
-    assert k_lo.shape == k_fp16.shape, "k_lo shape must match k_fp16 shape"
+    Bk, T, HKV, Kk = k.shape
+    assert k_hi.shape == k.shape, "k_hi shape must match k shape"
+    assert k_lo.shape == k.shape, "k_lo shape must match k shape"
     _, _, _, V = v.shape
     if HQ % HKV != 0:
         raise ValueError(f"HQ ({HQ}) must be divisible by HKV ({HKV})")
@@ -333,7 +333,7 @@ def sparse_decode_cascade(
     # Grid: (Time-Blocks, Batch, KV-Heads)
     grid_1 = (NTB, B, HKV)
     attn_forward_stage1_cascade[grid_1](
-        q, k_hi, k_lo, k_fp16, v,
+        q, k_hi, k_lo, k, v,
         m_buf, l_buf, o_buf, mask_buf,
         scale, T, NTB, NTBS, delta,
         *q.stride(),
@@ -370,11 +370,11 @@ def sparse_decode_cascade(
 
 
 def attn_forward_decode(
-    q: torch.Tensor,      # [B, HQ, K]
-    k_hi8: torch.Tensor | None,  # [B, T, HKV, K]
-    k_lo8: torch.Tensor | None,  # [B, T, HKV, K]
-    k_fp16: torch.Tensor | None, # [B, T, HKV, K]
-    v: torch.Tensor,      # [B, T, HKV, V]
+    q: torch.Tensor,      # [B, Hq, 1, K] or [B, Hq, K]
+    k: torch.Tensor | None, # [B, T, HKV, K] or [B, HKV, T, K]
+    v: torch.Tensor,      # [B, T, HKV, V] or [B, HKV, T, V]
+    k_hi8: torch.Tensor = None,  # same layout as k
+    k_lo8: torch.Tensor = None,  # same layout as k
     scale: float = None,
     BS: int = 128,
     SBS: int | None = None,
@@ -382,11 +382,38 @@ def attn_forward_decode(
     return_skip_ratio: bool = False,
     **kwargs,
 ):
-    # 允许从 k_fp16 生成高低位，以兼容旧接口
+    # Normalize shapes to match sparse_decode_cascade expectations:
+    # q -> [B, Hq, K]; k/v -> [B, T, HKV, K/V]
+    if q.dim() == 4:
+        # Handle either [B, Hq, 1, K] or [B, 1, Hq, K]
+        if q.shape[1] == 1:
+            q = q.permute(0, 2, 1, 3)
+        if q.shape[2] != 1:
+            raise ValueError(f"Decode expects single-token q, got shape {q.shape}")
+        q = q[:, :, 0, :].contiguous()
+    elif q.dim() != 3:
+        raise ValueError(f"Unsupported q shape {q.shape}")
+
+    def _normalize_kv(x: torch.Tensor | None, name: str):
+        if x is None:
+            return None
+        if x.dim() != 4:
+            raise ValueError(f"{name} must be 4D, got shape {x.shape}")
+        # If layout is [B, HKV, T, K], switch to [B, T, HKV, K]
+        if x.shape[1] < x.shape[2]:
+            x = x.permute(0, 2, 1, 3)
+        return x.contiguous()
+
+    k = _normalize_kv(k, "k")
+    v = _normalize_kv(v, "v")
+    k_hi8 = _normalize_kv(k_hi8, "k_hi8")
+    k_lo8 = _normalize_kv(k_lo8, "k_lo8")
+
+    # 允许从 k 生成高低位，以兼容旧接口
     if k_hi8 is None or k_lo8 is None:
-        if k_fp16 is None:
-            raise ValueError("k_fp16 is required when k_hi8/k_lo8 are not provided.")
-        k_hi8, k_lo8 = pack_k_hi_lo(k_fp16)
+        if k is None:
+            raise ValueError("k is required when k_hi8/k_lo8 are not provided.")
+        k_hi8, k_lo8 = pack_k_hi_lo(k)
 
     sub_block_size = BS if SBS is None else SBS
     if return_skip_ratio:
@@ -394,7 +421,7 @@ def attn_forward_decode(
             q=q,
             k_hi=k_hi8,
             k_lo=k_lo8,
-            k_fp16=k_fp16,
+            k=k,
             v=v,
             delta=delta,
             block_size=BS,
@@ -408,7 +435,7 @@ def attn_forward_decode(
         q=q,
         k_hi=k_hi8,
         k_lo=k_lo8,
-        k_fp16=k_fp16,
+        k=k,
         v=v,
         delta=delta,
         block_size=BS,
