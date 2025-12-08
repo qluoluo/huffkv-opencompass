@@ -256,6 +256,7 @@ class LlamaAttention(nn.Module):
         from flash_attn import flash_attn_func
         # from .ffa_attn import ffa_attn_forward
         from .ffa_fwd_prefill import attn_forward_prefill
+        from .ffa_fwd_decode import attn_forward_decode
 
         attn_settings:dict = self.config.attn_settings
         use_ffa_prefill = attn_settings.get("use_ffa_prefill", False)
@@ -274,8 +275,7 @@ class LlamaAttention(nn.Module):
             
         elif q_len == 1 and use_ffa_decode and self.layer_idx in pattern_layers:
             print(f"[DECODE] Using FFA in {self.layer_idx}")
-            raise NotImplementedError
-            attn_output = ffa_attn_forward(
+            attn_output = attn_forward_decode(
                 query_states, key_states, value_states, **attn_settings
             )
             

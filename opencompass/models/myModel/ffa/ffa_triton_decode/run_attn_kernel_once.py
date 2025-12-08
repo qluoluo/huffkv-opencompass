@@ -23,7 +23,7 @@ def parse_args():
         help="Python module path that exposes attn_forward_decode/convert_to_triton_layout/pack_k_hi_lo",
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
-    parser.add_argument("--target-length", type=int, default=2048, help="Sequence length to benchmark (clipped to data)")
+    parser.add_argument("--target-length", type=int, default=64 * 1024, help="Sequence length to benchmark (clipped to data)")
     parser.add_argument("--BS", type=int, default=128, help="Block size for the kernel")
     parser.add_argument("--SBS", type=int, default=None, help="Sub block size; defaults to BS when omitted")
     parser.add_argument("--delta", type=float, default=5.0, help="Delta threshold for skipping")
