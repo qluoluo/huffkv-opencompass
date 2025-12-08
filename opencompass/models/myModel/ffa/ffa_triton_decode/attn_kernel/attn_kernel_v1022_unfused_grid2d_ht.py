@@ -12,35 +12,35 @@ import triton.language as tl
 # Layout tools (merged)
 # ========================
 def convert_to_triton_layout(
-    q_rope_1: torch.Tensor,  # [B=1, Hq, 1, Dq]
-    k_rope: torch.Tensor,    # [B=1, Hkv, T, Dk]
-    v: torch.Tensor,         # [B=1, Hkv, T, Dv]
+    q_rope_1: torch.Tensor,  # [B, Hq, 1, Dq]
+    k_rope: torch.Tensor,    # [B, Hkv, T, Dk]
+    v: torch.Tensor,         # [B, Hkv, T, Dv]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Convert inputs to Triton-friendly tensors with time-major layout for K/V:
-    - q_triton: [Hq, Dq]
-    - k_triton_fp16: [T, Hkv, Dk]
-    - v_triton: [T, Hkv, Dv]
+    - q_triton: [B, Hq, Dq]
+    - k_triton_fp16: [B, T, Hkv, Dk]
+    - v_triton: [B, T, Hkv, Dv]
     """
     B, Hq, qlen, Dq = q_rope_1.shape
     Bk, Hkv, T, Dk = k_rope.shape
     Bv, Hvv, Tv, Dv = v.shape
-    assert B == 1 and qlen == 1 and Tv == T and Hvv == Hkv
+    assert B == Bk == Bv and qlen == 1 and Tv == T and Hvv == Hkv
 
-    q_triton = q_rope_1[0, :, 0, :].contiguous()                    # [Hq, D]
-    # Time-major for K: [T, Hkv, D]
-    k_triton_fp16 = k_rope[0].permute(1, 0, 2).contiguous()
-    # Time-major for V: [T, Hkv, Dv]
-    v_triton = v[0].permute(1, 0, 2).contiguous()
+    q_triton = q_rope_1[:, :, 0, :].contiguous()                    # [B, Hq, D]
+    # Time-major for K: [B, T, Hkv, D]
+    k_triton_fp16 = k_rope.permute(0, 2, 1, 3).contiguous()
+    # Time-major for V: [B, T, Hkv, Dv]
+    v_triton = v.permute(0, 2, 1, 3).contiguous()
     return q_triton, k_triton_fp16, v_triton
 
 
 def pack_k_hi_lo(k_fp16: torch.Tensor):
     """
-    Pack fp16 K into two 8-bit halves keeping the same [T, Hkv, D] layout.
+    Pack fp16 K into two 8-bit halves keeping the same [B, T, Hkv, D] layout.
     Returns:
-    - k_hi8: torch.float8_e5m2 (high 8 bits), shape [T, Hkv, D]
-    - k_lo8: torch.uint8        (low  8 bits), shape [T, Hkv, D]
+    - k_hi8: torch.float8_e5m2 (high 8 bits), shape [B, T, Hkv, D]
+    - k_lo8: torch.uint8        (low  8 bits), shape [B, T, Hkv, D]
     """
     k_fp16 = k_fp16.contiguous()
     k_hi8 = k_fp16.view(torch.float8_e5m2)[..., 1::2].contiguous()
@@ -55,12 +55,13 @@ def pack_k_hi_lo(k_fp16: torch.Tensor):
 def compute_thresholds_kernel(
     q, k_hi8, th_buf,
     scale, T, NTB, delta,
-    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, G: tl.constexpr,
+    B: tl.constexpr, HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, G: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
 ):
-    # 1D grid over HKV. Each program computes thresholds for G query rows of this KV head.
-    pid_hkv = tl.program_id(0)
+    # 2D grid = (B, HKV). Each program computes thresholds for G query rows of this KV head in batch pid_b.
+    pid_b = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
 
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
@@ -72,14 +73,16 @@ def compute_thresholds_kernel(
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
     offs_k   = tl.arange(0, K)
-    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    # q layout = [B, HQ, K]
+    q_ptrs   = q + pid_b * (HQ * K) + (base_hq + rows)[:, None] * K + offs_k[None, :]
     q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # First small time-chunk in tb0
     tb0 = 0
     offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
     t_mask0 = offs_t0 < T
-    kb_ptrs0 = k_hi8 + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
+    # k_hi8 layout = [B, T, HKV, K]
+    kb_ptrs0 = k_hi8 + pid_b * (T * HKV * K) + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile0 = tl.load(kb_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
     b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
     b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
@@ -89,7 +92,7 @@ def compute_thresholds_kernel(
     tb1 = NTB - 1
     offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
     t_mask1 = offs_t1 < T
-    kb_ptrs1 = k_hi8 + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
+    kb_ptrs1 = k_hi8 + pid_b * (T * HKV * K) + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
     k_tile1 = tl.load(kb_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
     b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
     b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
@@ -99,7 +102,8 @@ def compute_thresholds_kernel(
     th_rows = tl.maximum(m0, m1) - delta
 
     # Store to th_buf[base_hq : base_hq + G]
-    th_ptrs = th_buf + (base_hq + rows)
+    # th_buf layout = [B, HQ]
+    th_ptrs = th_buf + pid_b * HQ + (base_hq + rows)
     tl.store(th_ptrs, th_rows, mask=row_mask)
 
 
@@ -111,17 +115,19 @@ def attn_forward_stage1_pruning(
     q, k_hi8, v,
     m_buf, l_buf, o_buf,
     mask_buf,
-    th_buf,  # read-only thresholds of shape [HQ]
+    th_buf,  # read-only thresholds of shape [B, HQ]
     scale, T, NTB, NTBS,
-    HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    B: tl.constexpr, HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
 ):
-    # 2D grid = (HKV, NTB):
-    #   - program_id(0) => pid_hkv
-    #   - program_id(1) => pid_tb (big time-block)
-    pid_hkv = tl.program_id(0)
-    pid_tb = tl.program_id(1)
+    # 3D grid = (NTB, B, HKV):
+    #   - program_id(0) => pid_tb (big time-block)
+    #   - program_id(1) => pid_b
+    #   - program_id(2) => pid_hkv
+    pid_tb = tl.program_id(0)
+    pid_b = tl.program_id(1)
+    pid_hkv = tl.program_id(2)
 
     RCP_LN2 = 1.4426950408889634
     NEG_INF = float("-inf")
@@ -138,18 +144,20 @@ def attn_forward_stage1_pruning(
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
     offs_k   = tl.arange(0, K)
-    q_ptrs   = q + (base_hq + rows)[:, None] * K + offs_k[None, :]
+    # q layout = [B, HQ, K]
+    q_ptrs   = q + pid_b * (HQ * K) + (base_hq + rows)[:, None] * K + offs_k[None, :]
     q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
 
     # Load thresholds per row
-    th_rows = tl.load(th_buf + (base_hq + rows), mask=row_mask, other=float("-inf"))
+    # th_buf layout = [B, HQ]
+    th_rows = tl.load(th_buf + pid_b * HQ + (base_hq + rows), mask=row_mask, other=float("-inf"))
 
     # Iterate small blocks in this big block
     for sb in tl.static_range(NSB):
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        kb_ptrs = k_hi8 + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
+        kb_ptrs = k_hi8 + pid_b * (T * HKV * K) + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K) + offs_k[:, None]
         k_tile = tl.load(kb_ptrs, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
 
         b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
@@ -173,27 +181,30 @@ def attn_forward_stage1_pruning(
             need_v = tl.sum(t_mask_sb.to(tl.int32), axis=0) > 0
             o_tile = tl.zeros([BM_DOT, V], tl.float32)
             if need_v:
-                # v layout = [T, HKV, V] => ptr = t*(HKV*V) + hkv*V + v
-                v_ptrs = v + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
+                # v layout = [B, T, HKV, V] => ptr = b*(T*HKV*V) + t*(HKV*V) + hkv*V + v
+                v_ptrs = v + pid_b * (T * HKV * V) + (offs_t_sb[:, None] * (HKV * V)) + (pid_hkv * V) + v_offs[None, :]
                 b_v    = tl.load(v_ptrs, mask=t_mask_sb[:, None], other=0.0).to(tl.float16)
                 o_tile = tl.dot(b_p.to(tl.float16), b_v, out_dtype=tl.float32)
 
-            m_ptrs = m_buf + (base_hq + rows) * NTBS + tb_sb
-            l_ptrs = l_buf + (base_hq + rows) * NTBS + tb_sb
-            o_ptrs = o_buf + (base_hq + rows)[:, None] * (NTBS * V) + tb_sb * V + v_offs[None, :]
+            # m_buf/l_buf/o_buf layout = [B, HQ, NTBS] / [B, HQ, NTBS] / [B, HQ, NTBS, V]
+            m_ptrs = m_buf + pid_b * (HQ * NTBS) + (base_hq + rows) * NTBS + tb_sb
+            l_ptrs = l_buf + pid_b * (HQ * NTBS) + (base_hq + rows) * NTBS + tb_sb
+            o_ptrs = o_buf + pid_b * (HQ * NTBS * V) + (base_hq + rows)[:, None] * (NTBS * V) + tb_sb * V + v_offs[None, :]
             tl.store(m_ptrs, m_rows, mask=row_mask)
             tl.store(l_ptrs, l_rows, mask=row_mask)
             tl.store(o_ptrs, o_tile, mask=row_mask[:, None])
-            tl.store(mask_buf + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
+            # mask_buf layout = [B, HKV, NTBS]
+            tl.store(mask_buf + pid_b * (HKV * NTBS) + pid_hkv * NTBS + tb_sb, tl.full((), 1, tl.int8))
 
 
 @triton.jit
 def attn_forward_stage2_masked(
     m_buf, l_buf, o_buf, mask_buf, o, NTBS,
-    HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
+    B: tl.constexpr, HKV: tl.constexpr, G: tl.constexpr, HQ: tl.constexpr, V: tl.constexpr,
 ):
-    pid_hkv = tl.program_id(0)
-    g = tl.program_id(1)
+    pid_b = tl.program_id(0)
+    pid_hkv = tl.program_id(1)
+    g = tl.program_id(2)
     pid_hq = pid_hkv * G + g
     v_offs = tl.arange(0, V)
     neg_inf = tl.full((), float('-inf'), tl.float32)
@@ -201,11 +212,14 @@ def attn_forward_stage2_masked(
     b_acc = tl.zeros((), tl.float32)
     b_o = tl.zeros([V], tl.float32)
     for tb in range(0, NTBS):
-        keep = tl.load(mask_buf + pid_hkv * NTBS + tb).to(tl.int1)
+        # mask_buf layout = [B, HKV, NTBS]
+        keep = tl.load(mask_buf + pid_b * (HKV * NTBS) + pid_hkv * NTBS + tb).to(tl.int1)
         if keep:
-            m_b = tl.load(m_buf + pid_hq * NTBS + tb)
-            l_b = tl.load(l_buf + pid_hq * NTBS + tb)
-            o_b = tl.load(o_buf + pid_hq * (NTBS * V) + tb * V + v_offs)
+            # m_buf/l_buf layout = [B, HQ, NTBS]
+            m_b = tl.load(m_buf + pid_b * (HQ * NTBS) + pid_hq * NTBS + tb)
+            l_b = tl.load(l_buf + pid_b * (HQ * NTBS) + pid_hq * NTBS + tb)
+            # o_buf layout = [B, HQ, NTBS, V]
+            o_b = tl.load(o_buf + pid_b * (HQ * NTBS * V) + pid_hq * (NTBS * V) + tb * V + v_offs)
             new_m = tl.maximum(b_m, m_b)
             r_prev = tl.exp2(b_m - new_m)
             r_blk = tl.exp2(m_b - new_m)
@@ -214,7 +228,8 @@ def attn_forward_stage2_masked(
             b_m = new_m
     is_empty = b_acc == 0.0
     out_tile = tl.where(is_empty, tl.zeros([V], tl.float32), b_o / b_acc)
-    o_ptrs = o + pid_hq * V + v_offs
+    # o layout = [B, HQ, V]
+    o_ptrs = o + pid_b * (HQ * V) + pid_hq * V + v_offs
     tl.store(o_ptrs, out_tile.to(o_ptrs.dtype.element_ty))
 
 
@@ -222,22 +237,23 @@ def attn_forward_stage2_masked(
 # Host wrapper
 # ========================
 def attn_forward_decode(
-    q: torch.Tensor,      # [HQ, K]
-    k_hi8: torch.Tensor,  # [T, HKV, K], float8_e5m2
-    k_lo8: torch.Tensor,  # [T, HKV, K], uint8 (可选，不在本实现中使用)
-    k_fp16: torch.Tensor, # [T, HKV, K] (可选，仅便于打包/调试)
-    v: torch.Tensor,      # [T, HKV, V]
+    q: torch.Tensor,      # [B, HQ, K]
+    k_hi8: torch.Tensor,  # [B, T, HKV, K], float8_e5m2
+    k_lo8: torch.Tensor,  # [B, T, HKV, K], uint8 (可选，不在本实现中使用)
+    k_fp16: torch.Tensor, # [B, T, HKV, K] (可选，仅便于打包/调试)
+    v: torch.Tensor,      # [B, T, HKV, V]
     scale: float = None,
     BS: int = 128,
     SBS: int | None = None,
     delta: float = 5.0,
     return_skip_ratio: bool = False,
+    **kwargs,
 ):
     assert q.is_cuda and k_hi8.is_cuda and v.is_cuda
-    HQ, K = q.shape
-    T, HKV, Kk = k_hi8.shape
-    Tv, HKVv, V = v.shape
-    assert Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [T, HKV, D]"
+    B, HQ, K = q.shape
+    Bk, T, HKV, Kk = k_hi8.shape
+    Bv, Tv, HKVv, V = v.shape
+    assert B == Bk == Bv and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
     G = HQ // HKV
 
     if scale is None:
@@ -249,30 +265,31 @@ def attn_forward_decode(
     NSB = triton.cdiv(BS, SBS)
     NTBS = NTB * NSB
 
-    o = torch.empty((HQ, V), device=q.device, dtype=q.dtype)
-    m_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
-    l_buf = torch.empty((HQ, NTBS), device=q.device, dtype=torch.float32)
-    o_buf = torch.empty((HQ, NTBS, V), device=q.device, dtype=torch.float32)
-    mask_buf = torch.zeros((HKV, NTBS), device=q.device, dtype=torch.int8)
+    o = torch.empty((B, HQ, V), device=q.device, dtype=q.dtype)
+    m_buf = torch.empty((B, HQ, NTBS), device=q.device, dtype=torch.float32)
+    l_buf = torch.empty((B, HQ, NTBS), device=q.device, dtype=torch.float32)
+    o_buf = torch.empty((B, HQ, NTBS, V), device=q.device, dtype=torch.float32)
+    mask_buf = torch.zeros((B, HKV, NTBS), device=q.device, dtype=torch.int8)
 
     # 1) Compute thresholds in a dedicated kernel
-    threshold_buf = torch.empty((HQ,), device=q.device, dtype=torch.float32)
-    compute_thresholds_kernel[(HKV,)](
+    threshold_buf = torch.empty((B, HQ), device=q.device, dtype=torch.float32)
+    compute_thresholds_kernel[(B, HKV)](
         q, k_hi8, threshold_buf,
         scale, T, NTB, delta,
-        HKV=HKV, HQ=HQ, K=K, G=G,
+        B=B, HKV=HKV, HQ=HQ, K=K, G=G,
         # keep the same micro-params as before
         BM_DOT=16, T_BS=16,
     )
 
     # 2) Stage 1: prune and compute partial reductions (read thresholds)
-    attn_forward_stage1_pruning[(HKV, NTB)](
+    # grid aligned with v1109: (NTB, B, HKV) so time-block dimension varies fastest
+    attn_forward_stage1_pruning[(NTB, B, HKV)](
         q, k_hi8, v,
         m_buf, l_buf, o_buf,
         mask_buf,
         threshold_buf,
         scale, T, NTB, NTBS,
-        HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
+        B=B, HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
         BM_DOT=16,
     )
 
@@ -282,12 +299,12 @@ def attn_forward_decode(
         total = mask_buf.numel()
         skip_ratio = float((1.0 - (kept.float() / float(total))).item())
 
-    # 3) Stage 2: masked reduce across kept blocks
-    attn_forward_stage2_masked[(HKV, G)](
+    # 3) Stage 2: masked reduce across kept blocks（grid = (B, HKV, G)）
+    attn_forward_stage2_masked[(B, HKV, G)](
         m_buf, l_buf, o_buf,
         mask_buf,
         o, NTBS,
-        HKV=HKV, G=G, HQ=HQ, V=V,
+        B=B, HKV=HKV, G=G, HQ=HQ, V=V,
     )
 
     if return_skip_ratio:
