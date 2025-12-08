@@ -1,3 +1,5 @@
+# 版本0926：最早的全密集 prefill 实现，入口会做 layout 转换到 [B, T, H, D]，仅支持因果 Mask，未引入块级跳过/稀疏逻辑，可作为后续版本的基线。
+
 import math
 from typing import Optional, Tuple
 

@@ -167,6 +167,7 @@ def attn_forward_decode(
     SBS: int | None = None,
     delta: float = 5.0,   # kept for interface compatibility (unused)
     return_skip_ratio: bool = False,
+    precomputed_threshold: torch.Tensor | None = None,  # kept for interface compatibility (unused)
 ):
     # Use k_fp16; ignore k_hi8/k_lo8 and delta to keep interface unchanged
     assert q.is_cuda and k_fp16.is_cuda and v.is_cuda

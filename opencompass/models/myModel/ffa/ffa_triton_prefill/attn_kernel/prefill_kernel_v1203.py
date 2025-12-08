@@ -1,3 +1,5 @@
+# 版本1203：在 1202 的稀疏管线基础上新增 pattern 参数（dense/local/ffa 三档），稀疏核可切换全算、局部滑窗或基于重要性 mask 的 FFA 模式，并恢复入口的 layout 转换；计数/可视化/skip_ratio 逻辑沿用 1202，测试默认使用 local。
+
 import math
 import os
 from typing import Optional, Tuple, List

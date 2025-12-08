@@ -1,4 +1,4 @@
-# 计算逻辑有缺陷，该脚本只计算了q重要且k重要的位置对应的attn结果，但是可以当做之后的对比baseline
+# 版本1201：仅用最后一个 Q 块生成共享的 KV/Q 块重要性 mask（强制计算首尾块），然后基于该 mask 做稀疏计算；逻辑仅覆盖“Q 与 KV 均重要”部分，存在缺陷，但可作为稀疏基线与后续版本对比。
 
 import math
 from typing import Optional, Tuple, List

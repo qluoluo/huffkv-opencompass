@@ -1,3 +1,5 @@
+# 版本1202：在 1201 稀疏流程上补充计算块计数/skip_ratio、可视化 viz_mask，以及与 FlashAttn 的对比测试；稀疏核强制计算首块和对角线，其余由 mask 决定，默认输入已是 [B, T, H, D] 布局（不再自动转换）。
+
 import math
 import os
 from typing import Optional, Tuple, List

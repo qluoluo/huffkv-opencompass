@@ -1,3 +1,5 @@
+# 版本1127：在 0926 的密集实现上加入 delta 阈值的块裁剪逻辑，预先扫过已完成的 mask 区更新最大值，再对当前 Query 块的后续 KV 块估计 block_max，小于 (b_m-delta) 的整块直接跳过；未做布局转换，skip_ratio 仅占位。
+
 import math
 from typing import Optional, Tuple
 
@@ -123,6 +125,102 @@ def attn_fwd_prefill_kernel(
     tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
 
 
+@triton.jit
+def attn_fwd_prefill_kernel_count(
+    q, k, v, o, scale, T,
+    computed_blocks_ptr, total_blocks_ptr,
+    B: tl.constexpr, H: tl.constexpr, HQ: tl.constexpr, G: tl.constexpr,
+    K: tl.constexpr, V: tl.constexpr,
+    BT: tl.constexpr, BS: tl.constexpr, BK: tl.constexpr,
+    delta: tl.constexpr,  # 阈值参数
+):
+    i_t, i_bh = tl.program_id(0), tl.program_id(1)
+    i_b, i_hq = i_bh // HQ, i_bh % HQ
+    i_h = i_hq // G
+
+    i_n = i_b
+    bos, eos = i_n * T, i_n * T + T
+    RCP_LN2: tl.constexpr = 1.4426950216
+
+    p_q = tl.make_block_ptr(q + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1),
+                            (i_t * BT, 0), (BT, BK), (1, 0))
+    p_o = tl.make_block_ptr(o + (bos * HQ + i_hq) * V, (T, V), (HQ*V, 1),
+                            (i_t * BT, 0), (BT, V), (1, 0))
+
+    b_q = tl.load(p_q, boundary_check=(0, 1))
+    b_o = tl.zeros([BT, V], dtype=tl.float32)
+
+    b_m = tl.full([BT], float('-inf'), dtype=tl.float32)
+    b_acc = tl.zeros([BT], dtype=tl.float32)
+
+    blocks_total = 0
+    blocks_computed = 0
+
+    for i_s in range(0, i_t * BT, BS):
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H*K),
+                                (0, i_s), (BK, BS), (0, 1))
+        p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1),
+                                (i_s, 0), (BS, V), (1, 0))
+
+        b_k = tl.load(p_k, boundary_check=(0, 1), cache_modifier=".cg")
+        b_v = tl.load(p_v, boundary_check=(0, 1), cache_modifier=".cg")
+
+        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+
+        b_m_new = tl.maximum(b_m, tl.max(b_s, 1))
+        b_r = tl.exp2(b_m - b_m_new)
+        b_m = b_m_new
+
+        b_p = tl.exp2(b_s - b_m[:, None])
+        b_acc = b_acc * b_r + tl.sum(b_p, 1)
+        b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+
+        blocks_total += 1
+        blocks_computed += 1
+
+    o_q = i_t * BT + tl.arange(0, BT)
+    threshold = b_m - delta
+
+    for i_s in range(i_t * BT, min((i_t + 1) * BT, T), BS):
+        p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, H*K),
+                                (0, i_s), (BK, BS), (0, 1))
+
+        o_k = i_s + tl.arange(0, BS)
+        m_k = o_k < T
+
+        b_k = tl.load(p_k, boundary_check=(0, 1), cache_modifier=".cg")
+        b_s = tl.dot(b_q, b_k) * scale * RCP_LN2
+        b_s = tl.where((o_q[:, None] >= o_k[None, :]) & m_k[None, :], b_s, float('-inf'))
+
+        block_max = tl.max(b_s, 1)
+
+        skip_block = tl.sum(block_max < threshold) == BT
+
+        if not skip_block:
+            p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (H*V, 1),
+                                    (i_s, 0), (BS, V), (1, 0))
+            b_v = tl.load(p_v, boundary_check=(0, 1), cache_modifier=".cg")
+
+            b_m_new = tl.maximum(b_m, block_max)
+            b_r = tl.exp2(b_m - b_m_new)
+            b_m = b_m_new
+
+            b_p = tl.exp2(b_s - b_m[:, None])
+            b_acc = b_acc * b_r + tl.sum(b_p, 1)
+            b_o = b_o * b_r[:, None] + tl.dot(b_p.to(b_q.dtype), b_v)
+
+            blocks_computed += 1
+
+        blocks_total += 1
+
+    eps = 1e-12
+    b_o = b_o / tl.maximum(b_acc[:, None], eps)
+    tl.store(p_o, b_o.to(p_o.dtype.element_ty), boundary_check=(0, 1))
+
+    tl.atomic_add(computed_blocks_ptr + i_bh, blocks_computed)
+    tl.atomic_add(total_blocks_ptr + i_bh, blocks_total)
+
+
 def attn_forward_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -177,17 +275,23 @@ def attn_forward_prefill(
 
     # 调用修改后的kernel
     if return_skip_ratio:
-        # 这里需要修改kernel来返回跳过的块数
-        # 由于Triton的限制，我们可能需要使用额外的输出张量
-        # 简化版本：只返回输出，跳过比例在Python端计算
-        attn_fwd_prefill_kernel[grid](
+        computed_blocks = torch.zeros((Bq * HQ,), device=device, dtype=torch.int32)
+        total_blocks = torch.zeros((Bq * HQ,), device=device, dtype=torch.int32)
+        attn_fwd_prefill_kernel_count[grid](
             q=q, k=k, v=v, o=o, scale=scale, T=T,
+            computed_blocks_ptr=computed_blocks, total_blocks_ptr=total_blocks,
             B=Bq, H=H, HQ=HQ, G=G, K=Kdim, V=Vdim,
             BT=BT, BS=BS, BK=BK, delta=delta,
             num_warps=8, num_stages=3,
         )
-        # 返回一个估计的跳过比例（这里需要kernel支持准确计数）
-        return o, 0.0  # 暂时返回0，需要完善kernel来准确计数
+
+        total_blocks_sum = total_blocks.sum().item()
+        computed_blocks_sum = computed_blocks.sum().item()
+        if total_blocks_sum > 0:
+            skip_ratio = 1.0 - (computed_blocks_sum / total_blocks_sum)
+        else:
+            skip_ratio = 0.0
+        return o, float(skip_ratio)
     
     attn_fwd_prefill_kernel[grid](
         q=q, k=k, v=v, o=o, scale=scale, T=T,
@@ -197,3 +301,4 @@ def attn_forward_prefill(
     )
     
     return o
+
