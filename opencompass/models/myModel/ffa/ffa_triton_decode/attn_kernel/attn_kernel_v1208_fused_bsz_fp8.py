@@ -1,52 +1,9 @@
 # attn_kernel_v1109_fused_bsz.py
-import os
 import math
-from typing import Tuple
 
 import torch
 import triton
 import triton.language as tl
-
-
-
-# ========================
-# Layout tools (merged)
-# ========================
-def convert_to_triton_layout(
-    q_rope_1: torch.Tensor,  # [B, Hq, 1, Dq]
-    k_rope: torch.Tensor,    # [B, Hkv, T, Dk]
-    v: torch.Tensor,         # [B, Hkv, T, Dv]
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """
-    Convert inputs to Triton-friendly tensors with time-major layout for K/V:
-    - q_triton: [B, Hq, Dq]
-    - k_triton_fp16: [B, T, Hkv, Dk]
-    - v_triton: [B, T, Hkv, Dv]
-    """
-    B, Hq, qlen, Dq = q_rope_1.shape
-    Bk, Hkv, T, Dk = k_rope.shape
-    Bv, Hvv, Tv, Dv = v.shape
-    assert B == Bk == Bv and qlen == 1 and Tv == T and Hvv == Hkv
-
-    q_triton = q_rope_1[:, :, 0, :].contiguous()                    # [B, Hq, D]
-    # Time-major for K: [B, T, Hkv, D]
-    k_triton_fp16 = k_rope.permute(0, 2, 1, 3).contiguous()
-    # Time-major for V: [B, T, Hkv, Dv]
-    v_triton = v.permute(0, 2, 1, 3).contiguous()
-    return q_triton, k_triton_fp16, v_triton
-
-
-def pack_k_hi_lo(k_fp16: torch.Tensor):
-    """
-    Pack fp16 K into two 8-bit halves keeping the same [B, T, Hkv, D] layout.
-    Returns:
-    - k_hi8: torch.float8_e5m2 (high 8 bits), shape [B, T, Hkv, D]
-    - k_lo8: torch.uint8        (low  8 bits), shape [B, T, Hkv, D]
-    """
-    k_fp16 = k_fp16.contiguous()
-    k_hi8 = k_fp16.view(torch.float8_e5m2)[..., 1::2].contiguous()
-    k_lo8 = k_fp16.view(torch.uint8)[..., 0::2].contiguous()
-    return k_hi8, k_lo8
 
 
 # ========================
@@ -272,11 +229,11 @@ def compute_threshold_external(
 # Host wrapper
 # ========================
 def attn_forward_decode(
-    q: torch.Tensor,      # [B, HQ, K]
-    k_hi8: torch.Tensor,  # [B, T, HKV, K], float8_e5m2
-    k_lo8: torch.Tensor,  # [B, T, HKV, K], uint8 (可选，不在本实现中使用)
-    k_fp16: torch.Tensor, # [B, T, HKV, K] (可选，仅便于打包/调试/外部阈值计算)
-    v: torch.Tensor,      # [B, T, HKV, V]
+    q: torch.Tensor,           # [B, 1, HQ, K]
+    k: torch.Tensor=None,      # [B, T, HKV, K] (可选，仅便于打包/调试/外部阈值计算)
+    v: torch.Tensor=None,      # [B, T, HKV, V]
+    k_hi8: torch.Tensor=None,  # [B, T, HKV, K], float8_e5m2
+    k_lo8: torch.Tensor=None,  # [B, T, HKV, K], uint8 (可选，不在本实现中使用)
     scale: float = None,
     BS: int = 128,
     SBS: int | None = None,
@@ -284,11 +241,11 @@ def attn_forward_decode(
     return_skip_ratio: bool = False,
     precomputed_threshold: torch.Tensor | None = None,  # 外部提供的阈值（可选）
 ):
-    assert q.is_cuda and k_hi8.is_cuda and v.is_cuda
-    B, HQ, K = q.shape
+    assert q.is_cuda and k_hi8.is_cuda and v.is_cuda and k_hi8.dtype
+    B, Tq, HQ, K = q.shape
     Bk, T, HKV, Kk = k_hi8.shape
     Bv, Tv, HKVv, V = v.shape
-    assert B == Bk == Bv and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
+    assert B == Bk == Bv and Tq == 1 and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
     G = HQ // HKV
 
     if scale is None:

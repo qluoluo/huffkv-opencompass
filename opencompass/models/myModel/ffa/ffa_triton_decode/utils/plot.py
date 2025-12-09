@@ -15,7 +15,7 @@ def plot_speed_curve(x_lengths, fused_ms_list, flash_ms_list,
     plt.plot(x_lengths, flash_ms_list, label="FlashAttn", marker="o", markersize=2)
     plt.xlabel("Sequence length (T)")
     plt.ylabel("Latency per run (ms)")
-    plt.ylim(0, 0.4)
+    # plt.ylim(0, 0.4)
     Tmax_k_str = to_k_str(T_full)
     
     # 在标题中包含 attn kernel 名称

@@ -47,11 +47,6 @@ def parse_args():
         default=None,
         help="最大测试长度（若为 None 或 <0，则使用数据的完整长度）",
     )
-    parser.add_argument(
-        "--no-thres-time",
-        action="store_true",
-        help="排除阈值计算时间：外部预计算阈值并传入注意力内核",
-    )
     parser.add_argument("--bsz", type=int, default=1, help="Batch size (number of layers to combine)")
     return parser.parse_args()
 
@@ -66,19 +61,42 @@ def map_dtype(dtype_str: str):
     raise ValueError(f"Unsupported dtype string: {dtype_str}")
 
 
+def convert_layout(
+    q_rope_1: torch.Tensor,  # [B, Hq, 1, Dq]
+    k_rope: torch.Tensor,  # [B, Hkv, T, Dk]
+    v: torch.Tensor,  # [B, Hkv, T, Dv]
+):
+    B, Hq, qlen, Dq = q_rope_1.shape
+    Bk, Hkv, T, Dk = k_rope.shape
+    Bv, Hvv, Tv, Dv = v.shape
+    assert B == Bk == Bv and qlen == 1 and Tv == T and Hvv == Hkv
+
+    q = q_rope_1[:, :, 0, :].contiguous()  # [B, Hq, D]
+    k = k_rope.permute(0, 2, 1, 3).contiguous()  # [B, T, Hkv, D]
+    v = v.permute(0, 2, 1, 3).contiguous()  # [B, T, Hkv, Dv]
+    return q, k, v
+
+
+def pack_k_hi_lo(k_fp16: torch.Tensor):
+    """
+    Pack fp16 K into two 8-bit halves keeping the same [B, T, Hkv, D] layout.
+    Returns:
+    - k_hi8: torch.float8_e5m2 (high 8 bits), shape [B, T, Hkv, D]
+    - k_lo8: torch.uint8        (low  8 bits), shape [B, T, Hkv, D]
+    """
+    k_fp16 = k_fp16.contiguous()
+    k_hi8 = k_fp16.view(torch.float8_e5m2)[..., 1::2].contiguous()
+    k_lo8 = k_fp16.view(torch.uint8)[..., 0::2].contiguous()
+    return k_hi8, k_lo8
+
+
 def load_kernel_components(kernel_path: str):
     kernel_module = importlib.import_module(kernel_path)
     if not hasattr(kernel_module, "attn_forward_decode"):
         raise AttributeError(f"Module {kernel_path} does not define 'attn_forward_decode'")
 
-    if not hasattr(kernel_module, "convert_to_triton_layout") or not hasattr(kernel_module, "pack_k_hi_lo"):
-        raise AttributeError(f"Module {kernel_path} must define 'convert_to_triton_layout' and 'pack_k_hi_lo'")
-
     attn_forward_decode = getattr(kernel_module, "attn_forward_decode")
-    convert_to_triton_layout = getattr(kernel_module, "convert_to_triton_layout")
-    pack_k_hi_lo = getattr(kernel_module, "pack_k_hi_lo")
-    compute_threshold_external = getattr(kernel_module, "compute_threshold_external", None)
-    return kernel_module, attn_forward_decode, convert_to_triton_layout, pack_k_hi_lo, compute_threshold_external
+    return kernel_module, attn_forward_decode
 
 
 def get_gpu_info():
@@ -94,7 +112,7 @@ def get_gpu_info():
     return tag, name, total_mem_gb, device_idx
 
 
-def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, no_thres_time, base_dir):
+def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, base_dir):
     lmax_name = str(max_length) if max_length is not None else ""
     plot_root_dir = os.path.join(
         base_dir,
@@ -102,8 +120,7 @@ def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, 
         f"{attn_kernel_name}",
         gpu_tag,
         f"BS{BS}_SBS{SBS}_delta{delta}_bsz{bsz}"
-        + (f"_{lmax_name}" if max_length is not None else "")
-        + (f"_nothres" if no_thres_time else ""),
+        + (f"_{lmax_name}" if max_length is not None else ""),
     )
     os.makedirs(plot_root_dir, exist_ok=True)
 
@@ -146,13 +163,7 @@ def load_layer_batch(layer_data_root, layer_indices, dtype, max_length):
 def main():
     args = parse_args()
     max_length = None if args.max_length is not None and args.max_length < 0 else args.max_length
-    (
-        kernel_module,
-        attn_forward_decode,
-        convert_to_triton_layout,
-        pack_k_hi_lo,
-        compute_threshold_external,
-    ) = load_kernel_components(args.kernel)
+    (kernel_module, attn_forward_decode) = load_kernel_components(args.kernel)
 
     attn_kernel_name = kernel_module.__name__.split(".")[-1]
     torch.set_float32_matmul_precision("high")
@@ -175,9 +186,7 @@ def main():
 
     this_file = os.path.abspath(__file__)
     this_dir = os.path.dirname(this_file)
-    plot_root_dir, raw_data_dir = build_plot_dirs(
-        attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, args.no_thres_time, this_dir
-    )
+    plot_root_dir, raw_data_dir = build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, this_dir)
 
     layer_indices = list(range(1, 1 + bsz))
 
@@ -191,54 +200,41 @@ def main():
     print(f"[Info] Using batch size: {bsz_actual}, Hq: {Hq}, Hkv: {Hkv}, T_full: {T_full}, D: {D}, Dv: {Dv}")
 
     def bench_one_length(L):
-        q_rope_1 = q_rope_full[:, :, L - 1 : L, :]
-        k_rope = k_rope_full[:, :, :L, :]
-        v = v_full[:, :, :L, :]
+        q_rope_1 = q_rope_full[:, :, L - 1 : L, :].contiguous()
+        k_rope = k_rope_full[:, :, :L, :].contiguous()
+        v = v_full[:, :, :L, :].contiguous()
 
-        q_triton, k_triton_fp16, v_triton = convert_to_triton_layout(q_rope_1, k_rope, v)
-        k_hi8, k_lo8 = pack_k_hi_lo(k_triton_fp16)
-
-        pre_th = None
-        if args.no_thres_time:
-            if compute_threshold_external is None:
-                raise AttributeError(
-                    f"Module {args.kernel} does not define 'compute_threshold_external' required by --no-thres-time"
-                )
-            NTB = (L + BS - 1) // BS
-            pre_th = compute_threshold_external(
-                q=q_triton, k_fp16=k_triton_fp16, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
-            )
+        q, k, v = convert_layout(q_rope_1, k_rope, v)
+        k_hi8, k_lo8 = pack_k_hi_lo(k)
 
         def run_fused():
             return attn_forward_decode(
-                q=q_triton,
+                q=q,
                 k_hi8=k_hi8,
                 k_lo8=k_lo8,
-                k_fp16=k_triton_fp16,
-                v=v_triton,
+                k_fp16=k,
+                v=v,
                 scale=scale,
                 BS=BS,
                 SBS=SBS,
                 delta=delta,
                 return_skip_ratio=False,
-                precomputed_threshold=pre_th,
             )
 
         def run_flash():
-            return flash_attn_compute(q_rope_1, k_rope, v)
+            return flash_attn_compute(q, k, v)
 
         output, sr = attn_forward_decode(
-            q=q_triton,
+            q=q,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
-            k_fp16=k_triton_fp16,
-            v=v_triton,
+            k_fp16=k,
+            v=v,
             scale=scale,
             BS=BS,
             SBS=SBS,
             delta=delta,
             return_skip_ratio=True,
-            precomputed_threshold=pre_th,
         )
 
         ms_fused = benchmark(run_fused, iters=iters, warmup=warmup)
@@ -246,31 +242,23 @@ def main():
         return ms_fused, ms_flash, float(sr)
 
     def validate_full():
-        q_rope_1 = q_rope_full[:, :, T_full - 1 : T_full, :]
-        q_triton, k_triton_fp16, v_triton = convert_to_triton_layout(q_rope_1, k_rope_full, v_full)
-        k_hi8, k_lo8 = pack_k_hi_lo(k_triton_fp16)
-
-        pre_th = None
-        if args.no_thres_time:
-            NTB = (T_full + BS - 1) // BS
-            pre_th = compute_threshold_external(
-                q=q_triton, k_fp16=k_triton_fp16, scale=scale, NTB=NTB, delta=delta, HKV=Hkv, HQ=Hq
-            )
+        q_rope_1 = q_rope_full[:, :, T_full - 1 : T_full, :].contiguous()
+        q, k, v = convert_layout(q_rope_1, k_rope_full, v_full)
+        k_hi8, k_lo8 = pack_k_hi_lo(k)
 
         o_triton, skip_ratio = attn_forward_decode(
-            q=q_triton,
+            q=q,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
-            k_fp16=k_triton_fp16,
-            v=v_triton,
+            k_fp16=k,
+            v=v,
             scale=scale,
             BS=BS,
             SBS=SBS,
             delta=delta,
             return_skip_ratio=True,
-            precomputed_threshold=pre_th,
         )
-        o_flash = flash_attn_compute(q_rope_1, k_rope_full, v_full)
+        o_flash = flash_attn_compute(q, k, v)
 
         max_abs = (o_triton.float() - o_flash.float()).abs().max().item()
         mean_abs = (o_triton.float() - o_flash.float()).abs().mean().item()
@@ -322,7 +310,6 @@ def main():
             iters=int(iters),
             warmup=int(warmup),
             attn_kernel=attn_kernel_name,
-            no_thres_time=bool(args.no_thres_time),
             bsz=int(bsz),
         )
         save_raw_cache(cache_path, meta, x_lengths, fused_ms_list, flash_ms_list, skip_ratios)
