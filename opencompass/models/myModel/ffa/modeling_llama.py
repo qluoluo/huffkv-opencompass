@@ -240,27 +240,58 @@ class LlamaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
-        if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-            
         
-        q_len = query_states.shape[-2]
-        attn_weights = None
-
-        from flash_attn import flash_attn_func
-        # from .ffa_attn import ffa_attn_forward
-        from .ffa_fwd_prefill import attn_forward_prefill
-        from .ffa_fwd_decode import attn_forward_decode
-
         attn_settings:dict = self.config.attn_settings
         use_ffa_prefill = attn_settings.get("use_ffa_prefill", False)
         use_ffa_decode = attn_settings.get("use_ffa_decode", False)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        q_len = query_states.shape[-2]
+
+            
+        if q_len > 1:
+            
+            if use_ffa_decode:
+            # [B, H, T, D]
+                past_key_values.append({
+                    "key": key_states.transpose(1,2).view(torch.float8_e5m2)[..., 1::2].contiguous().transpose(1,2),
+                    "value": value_states,
+                })
+            else:
+                past_key_values.append({
+                    "key": key_states,
+                    "value": value_states,
+                })
+        else:
+            
+            assert type(past_key_values) == list
+            
+            key_states:torch.Tensor = key_states.transpose(1,2)
+            assert key_states.is_contiguous()
+            key_states = key_states.view(torch.float8_e5m2)[..., 1::2].contiguous().transpose(1,2)
+            # k_lo8 = key_states.view(torch.uint8)[..., 0::2].contiguous()
+
+            key_states = torch.cat([past_key_values['key'], key_states], dim=-2)
+            past_key_values[self.layer_idx]['key'] = key_states
+            value_states = torch.cat([past_key_values['value'], value_states], dim=-2)
+            past_key_values[self.layer_idx]['value'] = value_states
+                
+        # else:
+        #     if past_key_values is not None:
+        #         # sin and cos are specific to RoPE models; cache_position needed for the static cache
+        #         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+        #         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+        
+        
+        attn_weights = None
+
+        from flash_attn import flash_attn_func
+        from .ffa_fwd_prefill import attn_forward_prefill
+        from .ffa_fwd_decode import attn_forward_decode
+
+        
         
         pattern_layers = attn_settings.get("pattern_layers", None)
         if pattern_layers is None:
@@ -269,14 +300,16 @@ class LlamaAttention(nn.Module):
 
         if q_len > 1 and use_ffa_prefill and self.layer_idx in pattern_layers:
             print(f"[PREFILL] Using FFA in {self.layer_idx}")
+            raise NotImplementedError
             attn_output = attn_forward_prefill(
                 query_states, key_states, value_states, **attn_settings
             )
             
         elif q_len == 1 and use_ffa_decode and self.layer_idx in pattern_layers:
             print(f"[DECODE] Using FFA in {self.layer_idx}")
+            print(f"{query_states.shape=} {key_states.shape=} {value_states.shape=} {query_states.dtype=} {key_states.dtype=}")
             attn_output = attn_forward_decode(
-                query_states, key_states, value_states, **attn_settings
+                q=query_states.transpose(1,2), k_hi8=key_states.transpose(1,2), v=value_states.transpose(1,2), **attn_settings
             )
             
         else:
@@ -413,6 +446,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
+            past_key_values = []
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0

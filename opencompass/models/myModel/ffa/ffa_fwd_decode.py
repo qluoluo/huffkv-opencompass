@@ -1,1 +1,2 @@
-from .ffa_triton_decode.attn_kernel.attn_kernel_v1208_fused_bsz_fp16_refine import attn_forward_decode
+# from .ffa_triton_decode.attn_kernel.attn_kernel_v1208_fused_bsz_fp16_refine import attn_forward_decode
+from .ffa_triton_decode.attn_kernel.attn_kernel_v1208_fused_bsz_fp8 import attn_forward_decode
