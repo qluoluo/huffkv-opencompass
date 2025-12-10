@@ -118,6 +118,7 @@ def main():
         return attn_forward_decode(
             q=q_1,
             k_q=k_q,
+            k=k,
             k_scale=k_scale,
             k_zero=k_zero,
             v=v,

@@ -9,7 +9,7 @@ import triton.language as tl
 
 @triton.jit
 def attn_forward_stage1_fused_threshold_qbits(
-    q, k_q, k_scale, k_zp, v,
+    q, k_q, k_scale, k_zp, k_fp, v,
     m_buf, l_buf, o_buf,
     mask_buf,
     scale, T, NTB, NTBS, delta,
@@ -20,6 +20,7 @@ def attn_forward_stage1_fused_threshold_qbits(
     T_BS: tl.constexpr = 16,
     K_BITS: tl.constexpr = 2,
     USE_EXT_TH: tl.constexpr = False,
+    USE_FP_K: tl.constexpr = False,
 ):
     # 3D grid = (NTB, B, HKV)
     pid_tb = tl.program_id(0)
@@ -55,10 +56,14 @@ def attn_forward_stage1_fused_threshold_qbits(
         offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
         t_mask0 = offs_t0 < T
         base_tok0 = pid_b * (T * HKV * K) + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K)
-        kq_ptrs0 = k_q + base_tok0 + offs_k[:, None]
-        kq_tile0 = tl.load(kq_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0).to(tl.int32)
-        kq_tile0 = tl.minimum(kq_tile0, tl.full((), QMAX, tl.int32)).to(tl.float32)
-        k_tile0 = (kq_tile0 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
+        if USE_FP_K:
+            kfp_ptrs0 = k_fp + base_tok0 + offs_k[:, None]
+            k_tile0 = tl.load(kfp_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
+        else:
+            kq_ptrs0 = k_q + base_tok0 + offs_k[:, None]
+            kq_tile0 = tl.load(kq_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0).to(tl.int32)
+            kq_tile0 = tl.minimum(kq_tile0, tl.full((), QMAX, tl.int32)).to(tl.float32)
+            k_tile0 = (kq_tile0 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
         b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
         b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
         m0 = tl.max(b_s0, axis=1)
@@ -67,10 +72,14 @@ def attn_forward_stage1_fused_threshold_qbits(
         offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
         t_mask1 = offs_t1 < T
         base_tok1 = pid_b * (T * HKV * K) + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K)
-        kq_ptrs1 = k_q + base_tok1 + offs_k[:, None]
-        kq_tile1 = tl.load(kq_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0).to(tl.int32)
-        kq_tile1 = tl.minimum(kq_tile1, tl.full((), QMAX, tl.int32)).to(tl.float32)
-        k_tile1 = (kq_tile1 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
+        if USE_FP_K:
+            kfp_ptrs1 = k_fp + base_tok1 + offs_k[:, None]
+            k_tile1 = tl.load(kfp_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
+        else:
+            kq_ptrs1 = k_q + base_tok1 + offs_k[:, None]
+            kq_tile1 = tl.load(kq_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0).to(tl.int32)
+            kq_tile1 = tl.minimum(kq_tile1, tl.full((), QMAX, tl.int32)).to(tl.float32)
+            k_tile1 = (kq_tile1 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
         b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
         b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
         m1 = tl.max(b_s1, axis=1)
@@ -85,9 +94,9 @@ def attn_forward_stage1_fused_threshold_qbits(
         kq_ptrssb = k_q + base_toksb + offs_k[:, None]
         kq_tilesb = tl.load(kq_ptrssb, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0).to(tl.int32)
         kq_tilesb = tl.minimum(kq_tilesb, tl.full((), QMAX, tl.int32)).to(tl.float32)
-        k_tile = (kq_tilesb * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
-        b_s     = tl.dot(q_tile, k_tile, out_dtype=tl.float32) * scale * RCP_LN2
-        b_s_act = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
+        k_tile_q = (kq_tilesb * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
+        b_s_q     = tl.dot(q_tile, k_tile_q, out_dtype=tl.float32) * scale * RCP_LN2
+        b_s_act = tl.where(t_mask_sb[None, :], b_s_q, NEG_INF)
 
         m_rows_blk = tl.max(b_s_act, axis=1)
 
@@ -100,7 +109,16 @@ def attn_forward_stage1_fused_threshold_qbits(
         v_offs = tl.arange(0, V)
 
         if not prune_blk:
-            m_rows = m_rows_blk
+            if USE_FP_K:
+                kfp_ptrssb = k_fp + base_toksb + offs_k[:, None]
+                k_tile_fp = tl.load(kfp_ptrssb, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
+                b_s = tl.dot(q_tile, k_tile_fp, out_dtype=tl.float32) * scale * RCP_LN2
+                b_s = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
+                m_rows = tl.max(b_s, axis=1)
+            else:
+                b_s = b_s_q
+                m_rows = m_rows_blk
+
             b_p    = tl.where(t_mask_sb[None, :], tl.exp2(b_s - m_rows[:, None]), 0.0)
             l_rows = tl.sum(b_p, axis=1)
 
@@ -175,6 +193,7 @@ def attn_forward_decode_quantized(
     k_scale: torch.Tensor,     # [B, HKV, K] (token dimension removed)
     k_zero: torch.Tensor,      # same shape as k_scale
     v: torch.Tensor,           # [B, T, HKV, V]
+    k: torch.Tensor | None = None,    # [B, T, HKV, K], optional unquantized keys
     k_bits: int = 2,
     scale: float = None,
     BS: int = 128,
@@ -185,6 +204,8 @@ def attn_forward_decode_quantized(
     **kwargs,
 ):
     assert q.is_cuda and k_q.is_cuda and v.is_cuda
+    if k is not None and not k.is_cuda:
+        raise ValueError("k must be a CUDA tensor when provided")
     if k_bits != 2:
         raise ValueError(f"attn_forward_decode_quantized currently supports 2-bit keys, got k_bits={k_bits}")
     assert k_scale.is_cuda and k_zero.is_cuda, "k_scale/k_zero must be CUDA tensors"
@@ -192,11 +213,23 @@ def attn_forward_decode_quantized(
         raise ValueError("k_scale and k_zero must be floating point tensors for dequantization")
     if k_q.is_floating_point():
         raise ValueError("k_q must contain integer quantized values (e.g., uint8/int8)")
+    if k is not None and not k.is_floating_point():
+        raise ValueError("k must be a floating point tensor")
 
     B, Tq, HQ, K = q.shape
     Bk, T, HKV, Kk = k_q.shape
     Bv, Tv, HKVv, V = v.shape
-    assert B == Bk == Bv and Tq == 1 and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
+    if k is not None:
+        Bk_fp, T_fp, HKV_fp, K_fp = k.shape
+        assert (
+            B == Bk == Bv == Bk_fp
+            and Tq == 1
+            and Tv == T == T_fp
+            and HKVv == HKV == HKV_fp
+            and Kk == K == K_fp
+        ), "K/V layouts must be [B, T, HKV, D]"
+    else:
+        assert B == Bk == Bv and Tq == 1 and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
     G = HQ // HKV
 
     expect_shape = (B, HKV, K)
@@ -213,6 +246,8 @@ def attn_forward_decode_quantized(
 
     q = q.contiguous()
     k_q = k_q.contiguous()
+    use_fp_k = k is not None
+    k_fp = k.contiguous() if use_fp_k else k_q
     v = v.contiguous()
     o = torch.empty((B, HQ, V), device=q.device, dtype=q.dtype)
     m_buf = torch.empty((B, HQ, NTBS), device=q.device, dtype=torch.float32)
@@ -229,13 +264,13 @@ def attn_forward_decode_quantized(
         use_ext_th = False
 
     attn_forward_stage1_fused_threshold_qbits[(NTB, B, HKV)](
-        q, k_q, k_scale, k_zero, v,
+        q, k_q, k_scale, k_zero, k_fp, v,
         m_buf, l_buf, o_buf,
         mask_buf,
         scale, T, NTB, NTBS, delta,
         threshold_buf,
         B=B, HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
-        K_BITS=k_bits, USE_EXT_TH=use_ext_th,
+        K_BITS=k_bits, USE_EXT_TH=use_ext_th, USE_FP_K=use_fp_k,
     )
 
     skip_ratio = None
