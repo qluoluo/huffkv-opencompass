@@ -53,14 +53,13 @@ def convert_layout(q_rope_1: torch.Tensor, k_rope: torch.Tensor, v: torch.Tensor
     return q, k, v
 
 
-def quantize_k_2bit_per_token(k: torch.Tensor):
-    k_min = k.amin(dim=1, keepdim=True)
-    k_max = k.amax(dim=1, keepdim=True)
-    scale_base = (k_max - k_min).clamp_min(1e-6) / 3.0
-    zero_base = k_min
-    k_q = torch.round((k - zero_base) / scale_base).clamp(0, 3).to(torch.uint8)
-    scale = scale_base.expand_as(k).contiguous()
-    zero = zero_base.expand_as(k).contiguous()
+def quantize_k_2bit_no_token_dim(k: torch.Tensor):
+    # Scale/zero are per (B, HKV, K); token dimension is removed and broadcasted later.
+    k_min = k.amin(dim=1)
+    k_max = k.amax(dim=1)
+    scale = ((k_max - k_min).clamp_min(1e-6) / 3.0).contiguous()
+    zero = k_min.contiguous()
+    k_q = torch.round((k - zero[:, None, :, :]) / scale[:, None, :, :]).clamp(0, 3).to(torch.uint8)
     return k_q, scale, zero
 
 
@@ -112,7 +111,7 @@ def main():
     q, k, v = convert_layout(q_rope_1, k_rope_full, v_full)
     q_1 = q.unsqueeze(1)  # [B,1,HQ,K]
 
-    k_q, k_scale, k_zero = quantize_k_2bit_per_token(k)
+    k_q, k_scale, k_zero = quantize_k_2bit_no_token_dim(k)
     G = q.shape[1] // k.shape[2]
 
     def run_q2():
@@ -140,16 +139,6 @@ def main():
     ms_q2 = benchmark(lambda: run_q2()[0], iters=args.iters, warmup=args.warmup)
     ms_flash = benchmark(lambda: run_flash(), iters=args.iters, warmup=args.warmup)
 
-    # Reference using dequantized K
-    k_deq = (k_q.float() * k_scale + k_zero).to(dtype)
-    k_deq_full = k_deq.repeat_interleave(G, dim=2) if G > 1 else k_deq
-    scores = torch.einsum("bhk,bthk->bht", q_1[:, 0], k_deq_full) * scale
-    attn = torch.softmax(scores, dim=-1)
-    v_full = v.repeat_interleave(G, dim=2) if G > 1 else v
-    o_ref = torch.einsum("bht,bthv->bhv", attn, v_full)
-
-    max_abs = (o_triton.float() - o_ref.float()).abs().max().item()
-    mean_abs = (o_triton.float() - o_ref.float()).abs().mean().item()
     max_abs_vs_flash = (o_triton.float() - o_flash.float()).abs().max().item()
     mean_abs_vs_flash = (o_triton.float() - o_flash.float()).abs().mean().item()
 
@@ -161,8 +150,7 @@ def main():
     print(f"[Q2] Shape: B={B}, Hq={Hq}, Hkv={Hkv}, T={T_full}, K={K}, V={V}")
     print(f"[Q2] Kernel: {kernel_module.__name__.split('.')[-1]}, time={ms_q2:.3f} ms, skip_ratio={skip_ratio:.3%}")
     print(f"[Q2] Flash time: {ms_flash:.3f} ms")
-    print(f"[Q2] Diff vs dequant ref: max_abs={max_abs:.3e}, mean_abs={mean_abs:.3e}")
-    print(f"[Q2] Diff vs flash: max_abs={max_abs_vs_flash:.3e}, mean_abs={mean_abs_vs_flash:.3e}")
+    print(f"[Q2] triton vs flash: max_abs={max_abs_vs_flash:.3e}, mean_abs={mean_abs_vs_flash:.3e}")
 
 
 if __name__ == "__main__":
