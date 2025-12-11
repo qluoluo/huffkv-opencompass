@@ -30,6 +30,8 @@ def test_quantized_cache_keeps_fp_and_2bit_quantized_keys():
     torch.testing.assert_close(values, value_step1)
 
     layer = cache.layers[0]
+    assert layer.key_quantized.shape[-1] == 1  # packed 2-bit keys -> 4 vals per byte
+    assert layer.key_quantized.dtype == layer.key_quant_dtype
     expected_scale = torch.tensor([[[2.0 / 3.0, 2.0 / 3.0]]], dtype=key_step1.dtype)
     assert layer.key_scale.shape == expected_scale.shape
     torch.testing.assert_close(layer.key_scale, expected_scale)
@@ -37,8 +39,8 @@ def test_quantized_cache_keeps_fp_and_2bit_quantized_keys():
     expected_quant_step1 = torch.tensor(
         [
             [
-                [[0, 0]],
-                [[3, 3]],
+                [[0]],
+                [[15]],
             ]
         ],
         dtype=layer.key_quant_dtype,
@@ -56,9 +58,9 @@ def test_quantized_cache_keeps_fp_and_2bit_quantized_keys():
     expected_quant_full = torch.tensor(
         [
             [
-                [[0, 0]],
-                [[3, 3]],
-                [[0, 3]],
+                [[0]],
+                [[15]],
+                [[12]],
             ]
         ],
         dtype=layer.key_quant_dtype,

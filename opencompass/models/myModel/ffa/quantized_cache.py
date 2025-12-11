@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any, Optional
 
 import torch
@@ -9,7 +10,7 @@ from transformers.cache_utils import Cache, CacheLayerMixin
 def _select_quant_dtype(bits: int) -> torch.dtype:
     """Choose an integer dtype based on quantization bit width."""
     if bits <= 8:
-        return torch.int8
+        return torch.uint8
     if bits <= 16:
         return torch.int16
     return torch.int32
@@ -39,10 +40,36 @@ def _quantize_with_params(
     return x_quantized.to(dtype=_select_quant_dtype(nbit))
 
 
+def _pack_bits(x: torch.Tensor, nbit: int, vals_per_byte: Optional[int] = None) -> torch.Tensor:
+    """
+    Pack quantized values along the last dimension to reduce memory.
+
+    For example, 2-bit values are packed as 4 values per byte, so [B, T, H, K]
+    becomes [B, T, H, ceil(K / 4)].
+    """
+    vals_per_byte = vals_per_byte or (8 // nbit)
+    if vals_per_byte <= 1:
+        return x.to(dtype=_select_quant_dtype(nbit))
+
+    x = x.contiguous()
+    k = x.shape[-1]
+    k_pad = math.ceil(k / vals_per_byte) * vals_per_byte
+    if k_pad != k:
+        pad = torch.zeros(*x.shape[:-1], k_pad - k, device=x.device, dtype=x.dtype)
+        x = torch.cat([x, pad], dim=-1)
+
+    x_grouped = x.view(*x.shape[:-1], k_pad // vals_per_byte, vals_per_byte).to(torch.int32)
+    packed = torch.zeros(*x_grouped.shape[:-1], device=x.device, dtype=torch.int32)
+    for i in range(vals_per_byte):
+        packed |= x_grouped[..., i] << (i * nbit)
+    return packed.to(dtype=_select_quant_dtype(nbit))
+
+
 class QuantizedDynamicLayer(CacheLayerMixin):
     """
     Cache layer that quantizes incoming key/value tensors before appending them.
-    Only key tensors are quantized (2-bit); original key/value tensors are retained alongside the quantized keys.
+    Only key tensors are quantized (2-bit); quantized keys are bit-packed to shrink memory
+    while the original key/value tensors are retained alongside the packed keys.
     """
 
     is_sliding = False
@@ -56,6 +83,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.key_bits = key_bits
         self.key_quant_dim = key_quant_dim  # token dimension for [B, T, H, D] input
         self.seq_dim = 1  # sequence dimension for [B, T, H, D]
+        # Only pack when the bit-width evenly divides a byte; otherwise fall back to 1-value-per-byte.
+        self.vals_per_byte = 8 // self.key_bits if self.key_bits > 0 and 8 % self.key_bits == 0 else 1
 
         self.key_quantized: Optional[torch.Tensor] = None
         self.key_scale: Optional[torch.Tensor] = None
@@ -86,7 +115,10 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         elif self.key_scale.device != key_states.device:
             self.key_scale = self.key_scale.to(key_states.device, non_blocking=True)
             self.key_zero_point = self.key_zero_point.to(key_states.device, non_blocking=True)
-        return _quantize_with_params(key_states, self.key_scale, self.key_zero_point, self.key_bits, self.key_quant_dim)
+        k_quant = _quantize_with_params(key_states, self.key_scale, self.key_zero_point, self.key_bits, self.key_quant_dim)
+        if self.vals_per_byte > 1:
+            k_quant = _pack_bits(k_quant, self.key_bits, self.vals_per_byte)
+        return k_quant.to(self.key_quant_dtype)
 
     def update(
         self,
@@ -97,7 +129,7 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         if not self.is_initialized:
             self.lazy_initialization(key_states)
 
-        k_quant = self._quantize_keys(key_states).to(self.key_quant_dtype)
+        k_quant = self._quantize_keys(key_states)
 
         self.key_quantized = self._append(self.key_quantized, k_quant)
         self.key_original = self._append(self.key_original, key_states)
@@ -216,7 +248,7 @@ class QuantizedDynamicLayer(CacheLayerMixin):
 class QuantizedCache(Cache):
     """
     Drop-in Cache subclass that quantizes key tensors on every append operation.
-    Keys are stored both in 2-bit quantized form and in full-precision; values are stored in full-precision only.
+    Keys are stored both in 2-bit (packed) quantized form and in full-precision; values are stored in full-precision only.
 
     This keeps the public Cache API intact, so it can be passed directly to
     `modeling_llama.LlamaAttention` as `past_key_values`.
@@ -225,17 +257,13 @@ class QuantizedCache(Cache):
     def __init__(
         self,
         key_bits: int = 2,
-        value_bits: Optional[int] = None,
         key_quant_dim: int = 1,
-        value_quant_dim: Optional[int] = None,
         offloading: bool = False,
         offload_only_non_sliding: bool = True,
     ):
         super().__init__(layers=[], offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
         self.key_bits = key_bits
-        self.value_bits = value_bits
         self.key_quant_dim = key_quant_dim
-        self.value_quant_dim = value_quant_dim
 
     def _ensure_layer(self, layer_idx: int):
         while len(self.layers) <= layer_idx:

@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache
+from transformers.cache_utils import Cache, DynamicCache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
@@ -269,6 +269,10 @@ class LlamaAttention(nn.Module):
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
         attn_weights = None
+        if not isinstance(past_key_values, QuantizedCache):
+            raise TypeError(
+                f"past_key_values must be a QuantizedCache in LlamaAttention.forward, got {type(past_key_values).__name__}."
+            )
 
         from flash_attn import flash_attn_func
         from .ffa_fwd_prefill import attn_forward_prefill
@@ -280,15 +284,15 @@ class LlamaAttention(nn.Module):
         assert type(pattern_layers) is list
 
         if q_len > 1 and use_ffa_prefill and self.layer_idx in pattern_layers:
-            print(f"[PREFILL] Using FFA in {self.layer_idx}")
+            # print(f"[PREFILL] Using FFA in {self.layer_idx}")
             raise NotImplementedError
             attn_output = attn_forward_prefill(
                 query_states, key_states, value_states, **attn_settings
             )
             
         elif q_len == 1 and use_ffa_decode and self.layer_idx in pattern_layers:
-            print(f"[DECODE] Using FFA in {self.layer_idx}")
-            print(f"{query_states.shape=} {key_states.shape=} {value_states.shape=} {query_states.dtype=} {key_states.dtype=}")
+            # print(f"[DECODE] Using FFA in {self.layer_idx}")
+            # print(f"{query_states.shape=} {key_states.shape=} {value_states.shape=} {query_states.dtype=} {key_states.dtype=}")
             if isinstance(past_key_values, QuantizedCache):
                 # Pull quantized keys/scales from cache for the custom decode kernel.
                 cache_layer = cache_layer or past_key_values.layers[self.layer_idx]
@@ -455,10 +459,18 @@ class LlamaModel(LlamaPreTrainedModel):
         if inputs_embeds is None:
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
+        attn_settings = getattr(self.config, "attn_settings", {}) or {}
         if use_cache and past_key_values is None:
-            # past_key_values = DynamicCache(config=self.config)
-            # past_key_values = []
-            pass
+            k_bits = attn_settings.get("k_bits", None)
+            if k_bits is not None:
+                past_key_values = QuantizedCache(
+                    key_bits=k_bits,
+                    key_quant_dim=attn_settings.get("k_quant_dim", 1),
+                )
+            else:
+                past_key_values = DynamicCache(config=self.config)
+        elif use_cache and not isinstance(past_key_values, Cache):
+            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0

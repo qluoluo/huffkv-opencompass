@@ -22,6 +22,8 @@ config = AutoConfig.from_pretrained(
 config_attn_settings = {
     "use_ffa_decode": True,
     "delta": 5.0,
+    "k_bits": 2,
+    "k_quant_dim": 1,
 }
 
 config.attn_settings = config_attn_settings
@@ -51,10 +53,8 @@ print(f"{inputs.input_ids.shape=}")
 
 with torch.no_grad():
     cache = QuantizedCache(
-        key_bits=config.attn_settings.get("k_bits", 8),
-        value_bits=config.attn_settings.get("v_bits", 8),
-        key_quant_dim=config.attn_settings.get("k_quant_dim", -1),
-        value_quant_dim=config.attn_settings.get("v_quant_dim", -1),
+        key_bits=config.attn_settings.get("k_bits", 2),
+        key_quant_dim=config.attn_settings.get("k_quant_dim", 1),
     )
     outputs = model.generate(**inputs, past_key_values=cache, max_new_tokens=30, do_sample=True)
     print(tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))
