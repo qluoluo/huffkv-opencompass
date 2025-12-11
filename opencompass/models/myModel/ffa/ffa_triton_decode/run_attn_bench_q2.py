@@ -51,7 +51,7 @@ def parse_args():
         help="If set and >0, truncate to this length; if <0, use the full recorded length.",
     )
     p.add_argument("--step", type=int, default=1024, help="Step size for length sweep when plotting.")
-    p.add_argument("--iters", type=int, default=200, help="Benchmark iters")
+    p.add_argument("--iters", type=int, default=500, help="Benchmark iters")
     p.add_argument("--warmup", type=int, default=100, help="Benchmark warmup")
     return p.parse_args()
 
@@ -125,7 +125,7 @@ def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, layer_idx, max_le
         "plot",
         f"{attn_kernel_name}",
         gpu_tag,
-        f"layer{layer_idx}_BS{BS}_SBS{SBS}_delta{delta}"
+        f"delta{delta}_layer{layer_idx}_BS{BS}_SBS{SBS}"
         + (f"_{lmax_name}" if max_length is not None else ""),
     )
     os.makedirs(plot_root_dir, exist_ok=True)
