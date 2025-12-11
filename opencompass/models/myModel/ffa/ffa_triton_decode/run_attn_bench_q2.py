@@ -52,7 +52,7 @@ def parse_args():
     )
     p.add_argument("--step", type=int, default=1024, help="Step size for length sweep when plotting.")
     p.add_argument("--iters", type=int, default=200, help="Benchmark iters")
-    p.add_argument("--warmup", type=int, default=50, help="Benchmark warmup")
+    p.add_argument("--warmup", type=int, default=100, help="Benchmark warmup")
     return p.parse_args()
 
 

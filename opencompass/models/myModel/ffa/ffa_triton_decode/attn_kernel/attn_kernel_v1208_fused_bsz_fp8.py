@@ -230,7 +230,7 @@ def compute_threshold_external(
 # ========================
 def attn_forward_decode(
     q: torch.Tensor,           # [B, 1, HQ, K]
-    k: torch.Tensor=None,      # [B, T, HKV, K] (可选，仅便于打包/调试/外部阈值计算)
+    k_fp16: torch.Tensor=None,      # [B, T, HKV, K] (可选，仅便于打包/调试/外部阈值计算)
     v: torch.Tensor=None,      # [B, T, HKV, V]
     k_hi8: torch.Tensor=None,  # [B, T, HKV, K], float8_e5m2
     k_lo8: torch.Tensor=None,  # [B, T, HKV, K], uint8 (可选，不在本实现中使用)

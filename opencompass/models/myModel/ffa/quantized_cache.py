@@ -80,6 +80,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         key_quant_dim: int = 1,
     ):
         super().__init__()
+        print(f"{__class__} init!")
+        
         self.key_bits = key_bits
         self.key_quant_dim = key_quant_dim  # token dimension for [B, T, H, D] input
         self.seq_dim = 1  # sequence dimension for [B, T, H, D]
@@ -261,6 +263,7 @@ class QuantizedCache(Cache):
         offloading: bool = False,
         offload_only_non_sliding: bool = True,
     ):
+        print(f"{__class__} init!")
         super().__init__(layers=[], offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
         self.key_bits = key_bits
         self.key_quant_dim = key_quant_dim
@@ -291,5 +294,7 @@ class QuantizedCache(Cache):
 
         if self.offloading:
             self.offload(layer_idx, self.only_non_sliding)
+            
+        print(f"update for {layer_idx=}, {key_states.shape=} {value_states.shape=} {keys.shape=} {values.shape=}")
 
         return keys, values

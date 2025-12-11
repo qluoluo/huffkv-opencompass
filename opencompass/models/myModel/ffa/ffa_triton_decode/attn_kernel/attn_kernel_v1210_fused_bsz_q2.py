@@ -209,8 +209,8 @@ def attn_forward_decode_quantized(
     precomputed_threshold: torch.Tensor | None = None,
     **kwargs,
 ):
-    import os
-    print(f"ENTER {__file__} attn_forward_decode_quantized")
+    # import os
+    # print(f"ENTER {__file__} attn_forward_decode_quantized")
     
     assert q.is_cuda and k_q.is_cuda and v.is_cuda
     if k is not None and not k.is_cuda:

@@ -250,6 +250,11 @@ class LlamaAttention(nn.Module):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
         
         q_len = query_states.shape[-2]
+        
+        if not isinstance(past_key_values, QuantizedCache):
+            raise TypeError(
+                f"past_key_values must be a QuantizedCache in LlamaAttention.forward, got {type(past_key_values).__name__}."
+            )
 
         cache_layer = None
         if past_key_values is not None:
@@ -269,10 +274,6 @@ class LlamaAttention(nn.Module):
                 key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
         attn_weights = None
-        if not isinstance(past_key_values, QuantizedCache):
-            raise TypeError(
-                f"past_key_values must be a QuantizedCache in LlamaAttention.forward, got {type(past_key_values).__name__}."
-            )
 
         from flash_attn import flash_attn_func
         from .ffa_fwd_prefill import attn_forward_prefill
@@ -315,7 +316,8 @@ class LlamaAttention(nn.Module):
                     k_scale=k_scale,
                     k_zero=k_zero,
                     v=value_states.transpose(1, 2),
-                    k=cache_layer.key_original if decode_kwargs.get("use_fp_k", False) else None,
+                    # k=cache_layer.key_original if decode_kwargs.get("use_fp_k", False) else None,
+                    k=key_states.transpose(1,2),
                     **decode_kwargs,
                 )
             else:
@@ -460,17 +462,21 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         attn_settings = getattr(self.config, "attn_settings", {}) or {}
-        if use_cache and past_key_values is None:
-            k_bits = attn_settings.get("k_bits", None)
-            if k_bits is not None:
-                past_key_values = QuantizedCache(
-                    key_bits=k_bits,
-                    key_quant_dim=attn_settings.get("k_quant_dim", 1),
-                )
-            else:
-                past_key_values = DynamicCache(config=self.config)
-        elif use_cache and not isinstance(past_key_values, Cache):
-            past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+        # past_key_values = QuantizedCache(
+        #     key_bits=attn_settings.get("k_bits", None),
+        #     key_quant_dim=attn_settings.get("k_quant_dim", 1),
+        # )
+        # if use_cache and past_key_values is None:
+        #     k_bits = attn_settings.get("k_bits", None)
+        #     if k_bits is not None:
+        #         past_key_values = QuantizedCache(
+        #             key_bits=k_bits,
+        #             key_quant_dim=attn_settings.get("k_quant_dim", 1),
+        #         )
+        #     else:
+        #         past_key_values = DynamicCache(config=self.config)
+        # elif use_cache and not isinstance(past_key_values, Cache):
+        #     past_key_values = DynamicCache.from_legacy_cache(past_key_values)
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
