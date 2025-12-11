@@ -14,7 +14,7 @@ def attn_forward_stage1_fused_threshold_qbits(
     mask_buf,
     scale, T, NTB, NTBS, delta,
     th_in,
-    B: tl.constexpr, HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, V: tl.constexpr,
+    B: tl.constexpr, HKV: tl.constexpr, HQ: tl.constexpr, K: tl.constexpr, K_PACKED: tl.constexpr, V: tl.constexpr,
     G: tl.constexpr, BS: tl.constexpr, SBS: tl.constexpr,
     BM_DOT: tl.constexpr = 16,
     T_BS: tl.constexpr = 16,
@@ -31,6 +31,7 @@ def attn_forward_stage1_fused_threshold_qbits(
     NEG_INF = float("-inf")
     TRUE_K  = tl.full([K], True, tl.int1)
     QMAX = (1 << K_BITS) - 1
+    VALS_PER_BYTE: tl.constexpr = 8 // K_BITS
 
     s0 = pid_tb * BS
     NSB: tl.constexpr = (BS + SBS - 1) // SBS
@@ -39,6 +40,8 @@ def attn_forward_stage1_fused_threshold_qbits(
     rows     = tl.arange(0, BM_DOT)
     row_mask = rows < G
     offs_k   = tl.arange(0, K)
+    pack_idx = offs_k // VALS_PER_BYTE
+    pack_shifts = (offs_k % VALS_PER_BYTE) * K_BITS
 
     q_ptrs   = q + pid_b * (HQ * K) + (base_hq + rows)[:, None] * K + offs_k[None, :]
     q_tile   = tl.load(q_ptrs, mask=row_mask[:, None], other=0.0).to(tl.float16)
@@ -55,14 +58,15 @@ def attn_forward_stage1_fused_threshold_qbits(
         tb0 = 0
         offs_t0 = tb0 * T_BS + tl.arange(0, T_BS)
         t_mask0 = offs_t0 < T
-        base_tok0 = pid_b * (T * HKV * K) + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K)
+        base_tok0_q = pid_b * (T * HKV * K_PACKED) + (offs_t0[None, :] * (HKV * K_PACKED)) + (pid_hkv * K_PACKED)
+        base_tok0_fp = pid_b * (T * HKV * K) + (offs_t0[None, :] * (HKV * K)) + (pid_hkv * K)
         if USE_FP_K:
-            kfp_ptrs0 = k_fp + base_tok0 + offs_k[:, None]
+            kfp_ptrs0 = k_fp + base_tok0_fp + offs_k[:, None]
             k_tile0 = tl.load(kfp_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0.0).to(tl.float16)
         else:
-            kq_ptrs0 = k_q + base_tok0 + offs_k[:, None]
+            kq_ptrs0 = k_q + base_tok0_q + pack_idx[:, None]
             kq_tile0 = tl.load(kq_ptrs0, mask=(TRUE_K[:, None] & t_mask0[None, :]), other=0).to(tl.int32)
-            kq_tile0 = tl.minimum(kq_tile0, tl.full((), QMAX, tl.int32)).to(tl.float32)
+            kq_tile0 = ((kq_tile0 >> pack_shifts[:, None]) & tl.full((), QMAX, tl.int32)).to(tl.float32)
             k_tile0 = (kq_tile0 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
         b_s0 = tl.dot(q_tile, k_tile0, out_dtype=tl.float32) * scale * RCP_LN2
         b_s0 = tl.where(t_mask0[None, :], b_s0, NEG_INF)
@@ -71,14 +75,15 @@ def attn_forward_stage1_fused_threshold_qbits(
         tb1 = NTB - 1
         offs_t1 = tb1 * T_BS + tl.arange(0, T_BS)
         t_mask1 = offs_t1 < T
-        base_tok1 = pid_b * (T * HKV * K) + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K)
+        base_tok1_q = pid_b * (T * HKV * K_PACKED) + (offs_t1[None, :] * (HKV * K_PACKED)) + (pid_hkv * K_PACKED)
+        base_tok1_fp = pid_b * (T * HKV * K) + (offs_t1[None, :] * (HKV * K)) + (pid_hkv * K)
         if USE_FP_K:
-            kfp_ptrs1 = k_fp + base_tok1 + offs_k[:, None]
+            kfp_ptrs1 = k_fp + base_tok1_fp + offs_k[:, None]
             k_tile1 = tl.load(kfp_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0.0).to(tl.float16)
         else:
-            kq_ptrs1 = k_q + base_tok1 + offs_k[:, None]
+            kq_ptrs1 = k_q + base_tok1_q + pack_idx[:, None]
             kq_tile1 = tl.load(kq_ptrs1, mask=(TRUE_K[:, None] & t_mask1[None, :]), other=0).to(tl.int32)
-            kq_tile1 = tl.minimum(kq_tile1, tl.full((), QMAX, tl.int32)).to(tl.float32)
+            kq_tile1 = ((kq_tile1 >> pack_shifts[:, None]) & tl.full((), QMAX, tl.int32)).to(tl.float32)
             k_tile1 = (kq_tile1 * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
         b_s1 = tl.dot(q_tile, k_tile1, out_dtype=tl.float32) * scale * RCP_LN2
         b_s1 = tl.where(t_mask1[None, :], b_s1, NEG_INF)
@@ -90,10 +95,11 @@ def attn_forward_stage1_fused_threshold_qbits(
         offs_t_sb = s0 + sb * SBS + tl.arange(0, SBS)
         t_mask_sb = offs_t_sb < T
 
-        base_toksb = pid_b * (T * HKV * K) + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K)
-        kq_ptrssb = k_q + base_toksb + offs_k[:, None]
+        base_toksb_q = pid_b * (T * HKV * K_PACKED) + (offs_t_sb[None, :] * (HKV * K_PACKED)) + (pid_hkv * K_PACKED)
+        base_toksb_fp = pid_b * (T * HKV * K) + (offs_t_sb[None, :] * (HKV * K)) + (pid_hkv * K)
+        kq_ptrssb = k_q + base_toksb_q + pack_idx[:, None]
         kq_tilesb = tl.load(kq_ptrssb, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0).to(tl.int32)
-        kq_tilesb = tl.minimum(kq_tilesb, tl.full((), QMAX, tl.int32)).to(tl.float32)
+        kq_tilesb = ((kq_tilesb >> pack_shifts[:, None]) & tl.full((), QMAX, tl.int32)).to(tl.float32)
         k_tile_q = (kq_tilesb * scale_tile[:, None] + zp_tile[:, None]).to(tl.float16)
         b_s_q     = tl.dot(q_tile, k_tile_q, out_dtype=tl.float32) * scale * RCP_LN2
         b_s_act = tl.where(t_mask_sb[None, :], b_s_q, NEG_INF)
@@ -110,7 +116,7 @@ def attn_forward_stage1_fused_threshold_qbits(
 
         if not prune_blk:
             if USE_FP_K:
-                kfp_ptrssb = k_fp + base_toksb + offs_k[:, None]
+                kfp_ptrssb = k_fp + base_toksb_fp + offs_k[:, None]
                 k_tile_fp = tl.load(kfp_ptrssb, mask=(TRUE_K[:, None] & t_mask_sb[None, :]), other=0.0).to(tl.float16)
                 b_s = tl.dot(q_tile, k_tile_fp, out_dtype=tl.float32) * scale * RCP_LN2
                 b_s = tl.where(t_mask_sb[None, :], b_s, NEG_INF)
@@ -189,7 +195,7 @@ def _normalize_scale_zero(k_scale: torch.Tensor, k_zero: torch.Tensor, expect_sh
 
 def attn_forward_decode_quantized(
     q: torch.Tensor,           # [B, 1, HQ, K]
-    k_q: torch.Tensor,         # [B, T, HKV, K], quantized ints in [0, 2^k_bits-1]
+    k_q: torch.Tensor,         # [B, T, HKV, ceil(K / (8 / k_bits))], packed quantized ints
     k_scale: torch.Tensor,     # [B, HKV, K] (token dimension removed)
     k_zero: torch.Tensor,      # same shape as k_scale
     v: torch.Tensor,           # [B, T, HKV, V]
@@ -217,8 +223,14 @@ def attn_forward_decode_quantized(
         raise ValueError("k must be a floating point tensor")
 
     B, Tq, HQ, K = q.shape
-    Bk, T, HKV, Kk = k_q.shape
+    Bk, T, HKV, K_packed = k_q.shape
     Bv, Tv, HKVv, V = v.shape
+    if 8 % k_bits != 0:
+        raise ValueError(f"k_bits must divide 8 for packing, got {k_bits}")
+    vals_per_byte = 8 // k_bits
+    expected_k_packed = (K + vals_per_byte - 1) // vals_per_byte
+    if K_packed != expected_k_packed:
+        raise ValueError(f"k_q packed dim mismatch: got {K_packed}, expected {expected_k_packed} for K={K}, k_bits={k_bits}")
     if k is not None:
         Bk_fp, T_fp, HKV_fp, K_fp = k.shape
         assert (
@@ -226,10 +238,10 @@ def attn_forward_decode_quantized(
             and Tq == 1
             and Tv == T == T_fp
             and HKVv == HKV == HKV_fp
-            and Kk == K == K_fp
+            and K == K_fp
         ), "K/V layouts must be [B, T, HKV, D]"
     else:
-        assert B == Bk == Bv and Tq == 1 and Tv == T and HKVv == HKV and Kk == K, "K/V layouts must be [B, T, HKV, D]"
+        assert B == Bk == Bv and Tq == 1 and Tv == T and HKVv == HKV, "K/V layouts must be [B, T, HKV, D]"
     G = HQ // HKV
 
     expect_shape = (B, HKV, K)
@@ -269,7 +281,7 @@ def attn_forward_decode_quantized(
         mask_buf,
         scale, T, NTB, NTBS, delta,
         threshold_buf,
-        B=B, HKV=HKV, HQ=HQ, K=K, V=V, G=G, BS=BS, SBS=SBS,
+        B=B, HKV=HKV, HQ=HQ, K=K, K_PACKED=K_packed, V=V, G=G, BS=BS, SBS=SBS,
         K_BITS=k_bits, USE_EXT_TH=use_ext_th, USE_FP_K=use_fp_k,
     )
 

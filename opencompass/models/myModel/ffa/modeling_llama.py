@@ -241,8 +241,8 @@ class LlamaAttention(nn.Module):
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        
-        attn_settings:dict = self.config.attn_settings
+        # Make a shallow copy so we can tweak defaults without mutating the config.
+        attn_settings: dict = dict(getattr(self.config, "attn_settings", {}))
         use_ffa_prefill = attn_settings.get("use_ffa_prefill", False)
         use_ffa_decode = attn_settings.get("use_ffa_decode", False)
 
@@ -251,19 +251,28 @@ class LlamaAttention(nn.Module):
         
         q_len = query_states.shape[-2]
 
+        cache_layer = None
         if past_key_values is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if isinstance(past_key_values, QuantizedCache):
+                # QuantizedCache expects [B, T, HKV, K] to compute per-token quant params.
+                key_states_cache = key_states.transpose(1, 2)
+                value_states_cache = value_states.transpose(1, 2)
+                key_states_cache, value_states_cache = past_key_values.update(
+                    key_states_cache, value_states_cache, self.layer_idx, cache_kwargs
+                )
+                key_states = key_states_cache.transpose(1, 2)
+                value_states = value_states_cache.transpose(1, 2)
+                cache_layer = past_key_values.layers[self.layer_idx]
+            else:
+                key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
         attn_weights = None
 
         from flash_attn import flash_attn_func
         from .ffa_fwd_prefill import attn_forward_prefill
         from .ffa_fwd_decode import attn_forward_decode
-        
-        from .quantized_cache import QuantizedCache
-        assert type(past_key_values) == QuantizedCache
         
         pattern_layers = attn_settings.get("pattern_layers", None)
         if pattern_layers is None:
@@ -280,9 +289,39 @@ class LlamaAttention(nn.Module):
         elif q_len == 1 and use_ffa_decode and self.layer_idx in pattern_layers:
             print(f"[DECODE] Using FFA in {self.layer_idx}")
             print(f"{query_states.shape=} {key_states.shape=} {value_states.shape=} {query_states.dtype=} {key_states.dtype=}")
-            attn_output = attn_forward_decode(
-                q=query_states.transpose(1,2), k_hi8=key_states.transpose(1,2), v=value_states.transpose(1,2), **attn_settings
-            )
+            if isinstance(past_key_values, QuantizedCache):
+                # Pull quantized keys/scales from cache for the custom decode kernel.
+                cache_layer = cache_layer or past_key_values.layers[self.layer_idx]
+                k_q = cache_layer.key_quantized
+                k_scale = cache_layer.key_scale
+                k_zero = cache_layer.key_zero_point
+                if k_q is None or k_scale is None or k_zero is None:
+                    raise RuntimeError("QuantizedCache is missing quantized keys or scale/zero_point.")
+
+                decode_kwargs = {
+                    k: v
+                    for k, v in attn_settings.items()
+                    if k not in ("use_ffa_prefill", "use_ffa_decode", "pattern_layers")
+                }
+                decode_kwargs.setdefault("k_bits", getattr(past_key_values, "key_bits", 2))
+
+                attn_output = attn_forward_decode(
+                    q=query_states.transpose(1, 2),
+                    k_q=k_q,
+                    k_scale=k_scale,
+                    k_zero=k_zero,
+                    v=value_states.transpose(1, 2),
+                    k=cache_layer.key_original if decode_kwargs.get("use_fp_k", False) else None,
+                    **decode_kwargs,
+                )
+            else:
+                # Fallback to regular attention if an unexpected cache type is provided.
+                attn_output = flash_attn_func(
+                    query_states.transpose(1, 2),
+                    key_states.transpose(1, 2),
+                    value_states.transpose(1, 2),
+                    causal=self.is_causal,
+                )
             
         else:
             attn_output = flash_attn_func(

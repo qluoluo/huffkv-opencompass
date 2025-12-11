@@ -78,7 +78,23 @@ def quantize_k_2bit_no_token_dim(k: torch.Tensor):
     scale = ((k_max - k_min).clamp_min(1e-6) / 3.0).contiguous()
     zero = k_min.contiguous()
     k_q = torch.round((k - zero[:, None, :, :]) / scale[:, None, :, :]).clamp(0, 3).to(torch.uint8)
-    return k_q, scale, zero
+
+    # Pack 4x2-bit values into a single byte to avoid storing each 2-bit value as uint8
+    B, T, HKV, K = k_q.shape
+    values_per_byte = 4  # 8 bits / 2 bits
+    k_packed_len = (K + values_per_byte - 1) // values_per_byte
+    pad = k_packed_len * values_per_byte - K
+    if pad:
+        pad_tensor = torch.zeros((B, T, HKV, pad), device=k_q.device, dtype=k_q.dtype)
+        k_q = torch.cat([k_q, pad_tensor], dim=-1)
+    k_q = k_q.view(B, T, HKV, k_packed_len, values_per_byte)
+    k_q_packed = (
+        k_q[..., 0]
+        | (k_q[..., 1] << 2)
+        | (k_q[..., 2] << 4)
+        | (k_q[..., 3] << 6)
+    ).contiguous()
+    return k_q_packed, scale, zero
 
 
 def load_kernel_components(kernel_path: str):
