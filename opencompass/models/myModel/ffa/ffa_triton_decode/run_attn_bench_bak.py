@@ -235,8 +235,17 @@ if __name__ == "__main__":
         save_raw_cache(cache_path, meta, x_lengths, fused_ms_list, flash_ms_list, skip_ratios)
 
     plot_path = plot_speed_curve(
-        x_lengths, fused_ms_list, flash_ms_list,
-        T_full, BS, SBS, delta, layer_idx, plot_root_dir, attn_kernel_name
+        x_lengths,
+        fused_ms_list,
+        flash_ms_list,
+        T_full,
+        BS,
+        SBS,
+        delta,
+        layer_idx,
+        plot_root_dir,
+        attn_kernel_name,
+        skip_ratios=skip_ratios,
     )
 
     print(f"Layer {layer_idx} | T={to_k_str(T_full)} Hq={Hq} Hkv={Hkv} D={D} Dv={Dv} "

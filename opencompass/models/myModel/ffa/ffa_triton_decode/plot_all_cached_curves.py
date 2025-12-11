@@ -16,6 +16,7 @@ if THIS_DIR not in sys.path:
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 # 依赖 run_attn_bench.py 同目录的 utils
 try:
@@ -158,7 +159,7 @@ def main():
         sys.exit(0)
 
     print(f"[Info] Found {len(raw_files)} raw file(s). Start loading...")
-    curves = []  # list of dict: {x, fused, flash, meta, label}
+    curves = []  # list of dict: {x, fused, flash, skip, meta, label}
     skipped = 0
 
     for f in sorted(raw_files):
@@ -181,6 +182,7 @@ def main():
             "x": x_lengths,
             "fused": fused_ms,
             "flash": flash_ms,
+            "skip": skip_ratios,
             "meta": meta,
             "label": label,
             "path": f,
@@ -197,7 +199,7 @@ def main():
     save_name = args.save_name or f"layer{args.layer}_summary.png"
     save_path = os.path.join(plot_root, "summary", save_name)
 
-    plt.figure(figsize=(args.width, args.height))
+    fig, ax1 = plt.subplots(figsize=(args.width, args.height))
 
     # 固定颜色循环，fused 实线，flash 同色虚线
     color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", [])
@@ -215,36 +217,60 @@ def main():
         title_left = f"{kernel_name} | layer {args.layer}"
         if T_full0 is not None:
             title_left += f" | T_full={to_k_str(T_full0)}"
-        plt.title(title_left)
+        ax1.set_title(title_left)
     except Exception:
-        plt.title(f"{kernel_name} | layer {args.layer}")
+        ax1.set_title(f"{kernel_name} | layer {args.layer}")
 
     # X 轴：token length，Y 轴：ms
-    plt.xlabel("Sequence length (tokens)")
-    plt.ylabel("Latency (ms)")
+    ax1.set_xlabel("Sequence length (tokens)")
+    ax1.set_ylabel("Latency (ms)")
     if args.y_log:
-        plt.yscale("log")
+        ax1.set_yscale("log")
 
     legend_entries = 0
     color_idx = 0
+    has_skip_ratio = any(
+        any(sr is not None for sr in c.get("skip", []))
+        for c in curves
+    )
+    ax2 = ax1.twinx() if has_skip_ratio else None
+    all_skip_pct = []
 
     for c in curves:
         x = c["x"]
         fused = c["fused"]
         flash = c["flash"]
+        skip = c.get("skip", [])
         label = c["label"]
 
         color = color_cycle[color_idx % len(color_cycle)]
         color_idx += 1
 
         # fused
-        h1, = plt.plot(x, fused, color=color, linestyle="-", linewidth=2.0, label=label)
+        h1, = ax1.plot(x, fused, color=color, linestyle="-", linewidth=2.0, label=label)
         legend_entries += 1
 
         # flash（可选）
         if not args.hide_flash:
-            h2, = plt.plot(x, flash, color=color, linestyle="--", linewidth=1.5, label=label + "+flash")
+            h2, = ax1.plot(x, flash, color=color, linestyle="--", linewidth=1.5, label=label + "+flash")
             legend_entries += 1
+
+        if ax2 is not None:
+            skip_series = [
+                (sr * 100.0) if sr is not None else float("nan")
+                for sr in skip
+            ]
+            if any(not math.isnan(v) for v in skip_series):
+                ax2.plot(
+                    x,
+                    skip_series,
+                    color=color,
+                    linestyle=":",
+                    linewidth=1.4,
+                    marker="x",
+                    markersize=3.0,
+                )
+                all_skip_pct.extend([v for v in skip_series if not math.isnan(v)])
 
         # 限制 legend 数量，避免太大
         if legend_entries >= args.max_legend:
@@ -257,17 +283,62 @@ def main():
         x = c["x"]
         fused = c["fused"]
         flash = c["flash"]
+        skip = c.get("skip", [])
         color = color_cycle[color_idx % len(color_cycle)]
         color_idx += 1
 
-        plt.plot(x, fused, color=color, linestyle="-", linewidth=2.0)
+        ax1.plot(x, fused, color=color, linestyle="-", linewidth=2.0)
         if not args.hide_flash:
-            plt.plot(x, flash, color=color, linestyle="--", linewidth=1.5)
+            ax1.plot(x, flash, color=color, linestyle="--", linewidth=1.5)
+        if ax2 is not None:
+            skip_series = [
+                (sr * 100.0) if sr is not None else float("nan")
+                for sr in skip
+            ]
+            if any(not math.isnan(v) for v in skip_series):
+                ax2.plot(
+                    x,
+                    skip_series,
+                    color=color,
+                    linestyle=":",
+                    linewidth=1.4,
+                    marker="x",
+                    markersize=3.0,
+                )
+                all_skip_pct.extend([v for v in skip_series if not math.isnan(v)])
 
-    plt.grid(True, linestyle="--", alpha=0.3)
-    plt.legend(loc="best", fontsize=8)
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=args.dpi)
+    if ax2 is not None and all_skip_pct:
+        skip_min = min(all_skip_pct)
+        skip_max = max(all_skip_pct)
+        span = skip_max - skip_min
+        lower = skip_min - (0.1 * span if span > 0 else 5.0)
+        upper = skip_max + (0.05 * span if span > 0 else 5.0)
+        if lower >= skip_min:
+            lower = skip_min * 0.9 if skip_min > 0 else -1.0
+        if lower == 0:
+            lower = -1.0
+        ax2.set_ylim(lower, upper)
+        ax2.set_ylabel("Skip ratio (%)")
+
+    ax1.grid(True, linestyle="--", alpha=0.3)
+
+    handles, labels = ax1.get_legend_handles_labels()
+    if ax2 is not None:
+        skip_handle = Line2D(
+            [0], [0],
+            color="black",
+            linestyle=":",
+            linewidth=1.4,
+            marker="x",
+            markersize=3.0,
+            label="Skip ratio (%)",
+        )
+        handles.append(skip_handle)
+        labels.append("Skip ratio (%)")
+
+    ax1.legend(handles, labels, loc="best", fontsize=8)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=args.dpi)
     print(f"[Done] Saved summary figure to: {save_path}")
 
 

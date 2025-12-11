@@ -325,6 +325,7 @@ def main():
         f"layers_{layer_indices[0]}_bsz_{bsz}",
         plot_root_dir,
         attn_kernel_name,
+        skip_ratios=skip_ratios,
     )
 
     print(
