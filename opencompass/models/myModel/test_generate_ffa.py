@@ -6,6 +6,7 @@ import torch
 
 from transformers import AutoTokenizer, AutoConfig
 from ffa.modeling_llama import LlamaForCausalLM
+from ffa.quantized_cache import QuantizedCache
 
 # 模型路径
 model_path = '/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105/models/Llama-3_2-3B'
@@ -49,5 +50,11 @@ inputs = tokenizer(text, return_tensors="pt").to(model.device)
 print(f"{inputs.input_ids.shape=}")
 
 with torch.no_grad():
-    outputs = model.generate(**inputs, max_new_tokens=30, do_sample=True)
+    cache = QuantizedCache(
+        key_bits=config.attn_settings.get("k_bits", 8),
+        value_bits=config.attn_settings.get("v_bits", 8),
+        key_quant_dim=config.attn_settings.get("k_quant_dim", -1),
+        value_quant_dim=config.attn_settings.get("v_quant_dim", -1),
+    )
+    outputs = model.generate(**inputs, past_key_values=cache, max_new_tokens=30, do_sample=True)
     print(tokenizer.decode(outputs[0, inputs.input_ids.shape[1]:], skip_special_tokens=True))

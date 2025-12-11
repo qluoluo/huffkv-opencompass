@@ -261,8 +261,9 @@ class LlamaAttention(nn.Module):
         from flash_attn import flash_attn_func
         from .ffa_fwd_prefill import attn_forward_prefill
         from .ffa_fwd_decode import attn_forward_decode
-
         
+        from .quantized_cache import QuantizedCache
+        assert type(past_key_values) == QuantizedCache
         
         pattern_layers = attn_settings.get("pattern_layers", None)
         if pattern_layers is None:

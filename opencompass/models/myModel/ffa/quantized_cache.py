@@ -15,50 +15,57 @@ def _select_quant_dtype(bits: int) -> torch.dtype:
     return torch.int32
 
 
-def _quantize_tensor(x: torch.Tensor, nbit: int, dim: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    x_min = x.amin(dim=dim, keepdim=True)
-    x_max = x.amax(dim=dim, keepdim=True)
+def _compute_quant_params(x: torch.Tensor, nbit: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-channel scale/zero-point along a given dimension."""
+    x_min = x.amin(dim=dim)
+    x_max = x.amax(dim=dim)
     scale = (x_max - x_min).clamp_min(torch.finfo(x.dtype).eps) / (2**nbit - 1)
     zero_point = x_min
-    x_quantized = ((x - zero_point) / scale).round().clamp(0, 2**nbit - 1)
-    return x_quantized.to(dtype=_select_quant_dtype(nbit)), scale, zero_point
+    return scale, zero_point
 
 
-def _dequantize_tensor(x_quantized: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor) -> torch.Tensor:
-    return x_quantized.to(dtype=scale.dtype) * scale + zero_point
+def _quantize_with_params(
+    x: torch.Tensor, scale: torch.Tensor, zero_point: torch.Tensor, nbit: int, dim: int
+) -> torch.Tensor:
+    """Quantize using fixed per-channel parameters (clamps out-of-range values)."""
+    qmax = 2**nbit - 1
+    scale = scale.to(dtype=x.dtype, device=x.device)
+    zero_point = zero_point.to(dtype=x.dtype, device=x.device)
+    # Insert the quantization dimension for broadcasting if missing.
+    if scale.dim() == x.dim() - 1:
+        scale = scale.unsqueeze(dim)
+        zero_point = zero_point.unsqueeze(dim)
+    x_quantized = ((x - zero_point) / scale).round().clamp(0, qmax)
+    return x_quantized.to(dtype=_select_quant_dtype(nbit))
 
 
 class QuantizedDynamicLayer(CacheLayerMixin):
     """
     Cache layer that quantizes incoming key/value tensors before appending them.
-    Dequantized tensors are reconstructed on-the-fly to keep the downstream attention code unchanged.
+    Only key tensors are quantized (2-bit); original key/value tensors are retained alongside the quantized keys.
     """
 
     is_sliding = False
 
     def __init__(
         self,
-        key_bits: int,
-        value_bits: int,
-        key_quant_dim: int = -1,
-        value_quant_dim: int = -1,
+        key_bits: int = 2,
+        key_quant_dim: int = 1,
     ):
         super().__init__()
         self.key_bits = key_bits
-        self.value_bits = value_bits
-        self.key_quant_dim = key_quant_dim
-        self.value_quant_dim = value_quant_dim
-        self.seq_dim = -2
+        self.key_quant_dim = key_quant_dim  # token dimension for [B, T, H, D] input
+        self.seq_dim = 1  # sequence dimension for [B, T, H, D]
 
         self.key_quantized: Optional[torch.Tensor] = None
         self.key_scale: Optional[torch.Tensor] = None
         self.key_zero_point: Optional[torch.Tensor] = None
-        self.value_quantized: Optional[torch.Tensor] = None
-        self.value_scale: Optional[torch.Tensor] = None
-        self.value_zero_point: Optional[torch.Tensor] = None
+        self.key_original: Optional[torch.Tensor] = None
+        self.value_original: Optional[torch.Tensor] = None
+        self.keys: Optional[torch.Tensor] = None
+        self.values: Optional[torch.Tensor] = None
 
         self.key_quant_dtype = _select_quant_dtype(self.key_bits)
-        self.value_quant_dtype = _select_quant_dtype(self.value_bits)
 
     def lazy_initialization(self, key_states: torch.Tensor):
         self.dtype, self.device = key_states.dtype, key_states.device
@@ -70,12 +77,16 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         return torch.cat([stored, new], dim=self.seq_dim)
 
     def _refresh_fp_cache(self):
-        if self.key_quantized is None or self.value_quantized is None:
-            self.keys, self.values = None, None
-            return
+        self.keys = self.key_original
+        self.values = self.value_original
 
-        self.keys = _dequantize_tensor(self.key_quantized, self.key_scale, self.key_zero_point)
-        self.values = _dequantize_tensor(self.value_quantized, self.value_scale, self.value_zero_point)
+    def _quantize_keys(self, key_states: torch.Tensor) -> torch.Tensor:
+        if self.key_scale is None or self.key_zero_point is None:
+            self.key_scale, self.key_zero_point = _compute_quant_params(key_states, self.key_bits, self.key_quant_dim)
+        elif self.key_scale.device != key_states.device:
+            self.key_scale = self.key_scale.to(key_states.device, non_blocking=True)
+            self.key_zero_point = self.key_zero_point.to(key_states.device, non_blocking=True)
+        return _quantize_with_params(key_states, self.key_scale, self.key_zero_point, self.key_bits, self.key_quant_dim)
 
     def update(
         self,
@@ -86,34 +97,14 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         if not self.is_initialized:
             self.lazy_initialization(key_states)
 
-        # 反量化已有缓存，用于返回值拼接（不对当前分片做量化-反量化）
-        prev_keys = None
-        prev_values = None
-        if self.key_quantized is not None and self.value_quantized is not None:
-            prev_keys = _dequantize_tensor(self.key_quantized, self.key_scale, self.key_zero_point)
-            prev_values = _dequantize_tensor(self.value_quantized, self.value_scale, self.value_zero_point)
+        k_quant = self._quantize_keys(key_states).to(self.key_quant_dtype)
 
-        k_quant, k_scale, k_zero_point = _quantize_tensor(key_states, self.key_bits, self.key_quant_dim)
-        v_quant, v_scale, v_zero_point = _quantize_tensor(value_states, self.value_bits, self.value_quant_dim)
+        self.key_quantized = self._append(self.key_quantized, k_quant)
+        self.key_original = self._append(self.key_original, key_states)
+        self.value_original = self._append(self.value_original, value_states)
+        self._refresh_fp_cache()
 
-        self.key_quantized = self._append(self.key_quantized, k_quant.to(self.key_quant_dtype))
-        self.key_scale = self._append(self.key_scale, k_scale)
-        self.key_zero_point = self._append(self.key_zero_point, k_zero_point)
-
-        self.value_quantized = self._append(self.value_quantized, v_quant.to(self.value_quant_dtype))
-        self.value_scale = self._append(self.value_scale, v_scale)
-        self.value_zero_point = self._append(self.value_zero_point, v_zero_point)
-
-        # 返回：旧缓存的反量化结果拼接当前未量化的分片
-        if prev_keys is None:
-            ret_keys = key_states
-            ret_values = value_states
-        else:
-            ret_keys = torch.cat([prev_keys, key_states], dim=self.seq_dim)
-            ret_values = torch.cat([prev_values, value_states], dim=self.seq_dim)
-
-        self.keys, self.values = ret_keys, ret_values
-        return ret_keys, ret_values
+        return self.keys, self.values
 
     def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
         kv_offset = 0
@@ -142,24 +133,20 @@ class QuantizedDynamicLayer(CacheLayerMixin):
             return
 
         self.key_quantized = self._slice_along_seq(self.key_quantized, max_length)
-        self.key_scale = self._slice_along_seq(self.key_scale, max_length)
-        self.key_zero_point = self._slice_along_seq(self.key_zero_point, max_length)
-
-        self.value_quantized = self._slice_along_seq(self.value_quantized, max_length)
-        self.value_scale = self._slice_along_seq(self.value_scale, max_length)
-        self.value_zero_point = self._slice_along_seq(self.value_zero_point, max_length)
+        self.key_original = self._slice_along_seq(self.key_original, max_length)
+        self.value_original = self._slice_along_seq(self.value_original, max_length)
         self._refresh_fp_cache()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
         if self.get_seq_length() == 0:
             return
         self.key_quantized = self.key_quantized.repeat_interleave(repeats, dim=0)
-        self.key_scale = self.key_scale.repeat_interleave(repeats, dim=0)
-        self.key_zero_point = self.key_zero_point.repeat_interleave(repeats, dim=0)
-
-        self.value_quantized = self.value_quantized.repeat_interleave(repeats, dim=0)
-        self.value_scale = self.value_scale.repeat_interleave(repeats, dim=0)
-        self.value_zero_point = self.value_zero_point.repeat_interleave(repeats, dim=0)
+        self.key_original = self.key_original.repeat_interleave(repeats, dim=0)
+        self.value_original = self.value_original.repeat_interleave(repeats, dim=0)
+        if self.key_scale is not None:
+            self.key_scale = self.key_scale.repeat_interleave(repeats, dim=0)
+        if self.key_zero_point is not None:
+            self.key_zero_point = self.key_zero_point.repeat_interleave(repeats, dim=0)
         self._refresh_fp_cache()
 
     def batch_select_indices(self, indices: torch.Tensor) -> None:
@@ -167,12 +154,12 @@ class QuantizedDynamicLayer(CacheLayerMixin):
             return
         indices = indices.to(self.key_quantized.device)
         self.key_quantized = self.key_quantized.index_select(0, indices)
-        self.key_scale = self.key_scale.index_select(0, indices)
-        self.key_zero_point = self.key_zero_point.index_select(0, indices)
-
-        self.value_quantized = self.value_quantized.index_select(0, indices)
-        self.value_scale = self.value_scale.index_select(0, indices)
-        self.value_zero_point = self.value_zero_point.index_select(0, indices)
+        self.key_original = self.key_original.index_select(0, indices)
+        self.value_original = self.value_original.index_select(0, indices)
+        if self.key_scale is not None:
+            self.key_scale = self.key_scale.index_select(0, indices)
+        if self.key_zero_point is not None:
+            self.key_zero_point = self.key_zero_point.index_select(0, indices)
         self._refresh_fp_cache()
 
     def reorder_cache(self, beam_idx: torch.LongTensor) -> None:
@@ -180,26 +167,25 @@ class QuantizedDynamicLayer(CacheLayerMixin):
             return
         beam_idx = beam_idx.to(self.key_quantized.device)
         self.key_quantized = self.key_quantized.index_select(0, beam_idx)
-        self.key_scale = self.key_scale.index_select(0, beam_idx)
-        self.key_zero_point = self.key_zero_point.index_select(0, beam_idx)
-
-        self.value_quantized = self.value_quantized.index_select(0, beam_idx)
-        self.value_scale = self.value_scale.index_select(0, beam_idx)
-        self.value_zero_point = self.value_zero_point.index_select(0, beam_idx)
+        self.key_original = self.key_original.index_select(0, beam_idx)
+        self.value_original = self.value_original.index_select(0, beam_idx)
+        if self.key_scale is not None:
+            self.key_scale = self.key_scale.index_select(0, beam_idx)
+        if self.key_zero_point is not None:
+            self.key_zero_point = self.key_zero_point.index_select(0, beam_idx)
         self._refresh_fp_cache()
 
     def reset(self) -> None:
         if not self.is_initialized:
             return
-        self.key_quantized = self.key_quantized[..., :0, :].contiguous() if self.key_quantized is not None else None
-        self.key_scale = self.key_scale[..., :0, :].contiguous() if self.key_scale is not None else None
-        self.key_zero_point = self.key_zero_point[..., :0, :].contiguous() if self.key_zero_point is not None else None
-
-        self.value_quantized = self.value_quantized[..., :0, :].contiguous() if self.value_quantized is not None else None
-        self.value_scale = self.value_scale[..., :0, :].contiguous() if self.value_scale is not None else None
-        self.value_zero_point = (
-            self.value_zero_point[..., :0, :].contiguous() if self.value_zero_point is not None else None
-        )
+        if self.key_quantized is not None:
+            self.key_quantized = self.key_quantized.narrow(self.seq_dim, 0, 0).contiguous()
+        if self.key_original is not None:
+            self.key_original = self.key_original.narrow(self.seq_dim, 0, 0).contiguous()
+        if self.value_original is not None:
+            self.value_original = self.value_original.narrow(self.seq_dim, 0, 0).contiguous()
+        self.key_scale = None
+        self.key_zero_point = None
         self._refresh_fp_cache()
 
     def offload(self):
@@ -208,10 +194,10 @@ class QuantizedDynamicLayer(CacheLayerMixin):
                 self.key_quantized = self.key_quantized.to("cpu", non_blocking=True)
                 self.key_scale = self.key_scale.to("cpu", non_blocking=True)
                 self.key_zero_point = self.key_zero_point.to("cpu", non_blocking=True)
-            if self.value_quantized is not None:
-                self.value_quantized = self.value_quantized.to("cpu", non_blocking=True)
-                self.value_scale = self.value_scale.to("cpu", non_blocking=True)
-                self.value_zero_point = self.value_zero_point.to("cpu", non_blocking=True)
+            if self.key_original is not None:
+                self.key_original = self.key_original.to("cpu", non_blocking=True)
+            if self.value_original is not None:
+                self.value_original = self.value_original.to("cpu", non_blocking=True)
         super().offload()
 
     def prefetch(self):
@@ -220,16 +206,17 @@ class QuantizedDynamicLayer(CacheLayerMixin):
                 self.key_quantized = self.key_quantized.to(self.device, non_blocking=True)
                 self.key_scale = self.key_scale.to(self.device, non_blocking=True)
                 self.key_zero_point = self.key_zero_point.to(self.device, non_blocking=True)
-            if self.value_quantized is not None:
-                self.value_quantized = self.value_quantized.to(self.device, non_blocking=True)
-                self.value_scale = self.value_scale.to(self.device, non_blocking=True)
-                self.value_zero_point = self.value_zero_point.to(self.device, non_blocking=True)
+            if self.key_original is not None:
+                self.key_original = self.key_original.to(self.device, non_blocking=True)
+            if self.value_original is not None:
+                self.value_original = self.value_original.to(self.device, non_blocking=True)
         super().prefetch()
 
 
 class QuantizedCache(Cache):
     """
-    Drop-in Cache subclass that quantizes every append operation.
+    Drop-in Cache subclass that quantizes key tensors on every append operation.
+    Keys are stored both in 2-bit quantized form and in full-precision; values are stored in full-precision only.
 
     This keeps the public Cache API intact, so it can be passed directly to
     `modeling_llama.LlamaAttention` as `past_key_values`.
@@ -237,10 +224,10 @@ class QuantizedCache(Cache):
 
     def __init__(
         self,
-        key_bits: int = 8,
-        value_bits: int = 8,
-        key_quant_dim: int = -1,
-        value_quant_dim: int = -1,
+        key_bits: int = 2,
+        value_bits: Optional[int] = None,
+        key_quant_dim: int = 1,
+        value_quant_dim: Optional[int] = None,
         offloading: bool = False,
         offload_only_non_sliding: bool = True,
     ):
@@ -255,9 +242,7 @@ class QuantizedCache(Cache):
             self.layers.append(
                 QuantizedDynamicLayer(
                     key_bits=self.key_bits,
-                    value_bits=self.value_bits,
                     key_quant_dim=self.key_quant_dim,
-                    value_quant_dim=self.value_quant_dim,
                 )
             )
 
