@@ -27,7 +27,7 @@ import torch
 from torch import nn
 
 from transformers.activations import ACT2FN
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import Cache
 from transformers.generation import GenerationMixin
 from transformers.integrations import use_kernel_forward_from_hub
 from transformers.masking_utils import create_causal_mask
@@ -49,6 +49,7 @@ from transformers.utils.deprecation import deprecate_kwarg
 from transformers.utils.generic import check_model_inputs
 from transformers.models.llama.configuration_llama import LlamaConfig
 
+from .quantized_cache import QuantizedCache
 
 logger = logging.get_logger(__name__)
 
@@ -250,40 +251,10 @@ class LlamaAttention(nn.Module):
         
         q_len = query_states.shape[-2]
 
-            
-        if q_len > 1:
-            
-            if use_ffa_decode:
-            # [B, H, T, D]
-                past_key_values.append({
-                    "key": key_states.transpose(1,2).view(torch.float8_e5m2)[..., 1::2].contiguous().transpose(1,2),
-                    "value": value_states,
-                })
-            else:
-                past_key_values.append({
-                    "key": key_states,
-                    "value": value_states,
-                })
-        else:
-            
-            assert type(past_key_values) == list
-            
-            key_states:torch.Tensor = key_states.transpose(1,2)
-            assert key_states.is_contiguous()
-            key_states = key_states.view(torch.float8_e5m2)[..., 1::2].contiguous().transpose(1,2)
-            # k_lo8 = key_states.view(torch.uint8)[..., 0::2].contiguous()
-
-            key_states = torch.cat([past_key_values['key'], key_states], dim=-2)
-            past_key_values[self.layer_idx]['key'] = key_states
-            value_states = torch.cat([past_key_values['value'], value_states], dim=-2)
-            past_key_values[self.layer_idx]['value'] = value_states
-                
-        # else:
-        #     if past_key_values is not None:
-        #         # sin and cos are specific to RoPE models; cache_position needed for the static cache
-        #         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-        #         key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
-        
+        if past_key_values is not None:
+            # sin and cos are specific to RoPE models; cache_position needed for the static cache
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
         
         attn_weights = None
 
@@ -445,8 +416,9 @@ class LlamaModel(LlamaPreTrainedModel):
             inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
         if use_cache and past_key_values is None:
-            past_key_values = DynamicCache(config=self.config)
-            past_key_values = []
+            # past_key_values = DynamicCache(config=self.config)
+            # past_key_values = []
+            pass
 
         if cache_position is None:
             past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
