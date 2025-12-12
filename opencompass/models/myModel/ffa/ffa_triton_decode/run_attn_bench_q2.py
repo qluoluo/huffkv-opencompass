@@ -44,6 +44,7 @@ def parse_args():
         help="Delta value for skipping; run the script once per delta to compare (e.g., 3, 5, 8, 10).",
     )
     p.add_argument("--layer", type=int, default=1, help="Layer index to load")
+    p.add_argument("--bsz", type=int, default=1, help="Batch size (number of layers to combine)")
     p.add_argument(
         "--max-length",
         type=int,
@@ -118,14 +119,15 @@ def get_gpu_info():
     return tag, name, total_mem_gb, device_idx
 
 
-def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, layer_idx, max_length, base_dir):
+def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, layer_indices, bsz, max_length, base_dir):
+    layer_range = f"{layer_indices[0]}" if len(layer_indices) == 1 else f"{layer_indices[0]}-{layer_indices[-1]}"
     lmax_name = str(max_length) if max_length is not None else ""
     plot_root_dir = os.path.join(
         base_dir,
         "plot",
         f"{attn_kernel_name}",
         gpu_tag,
-        f"delta{delta}_layer{layer_idx}_BS{BS}_SBS{SBS}"
+        f"delta{delta}_layers{layer_range}_BS{BS}_SBS{SBS}_bsz{bsz}"
         + (f"_{lmax_name}" if max_length is not None else ""),
     )
     os.makedirs(plot_root_dir, exist_ok=True)
@@ -135,27 +137,31 @@ def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, layer_idx, max_le
     return plot_root_dir, raw_data_dir
 
 
-def load_layer_batch(layer_data_root, layer_idx, dtype, max_length):
-    data_iter = load_qkvh(layer_data_root, device="cpu", start_layer=layer_idx)
-    try:
-        layer_data = next(data_iter)
-    except StopIteration:
-        raise RuntimeError(f"No layer data found for layer_{layer_idx}")
+def load_layer_batch(layer_data_root, layer_indices, dtype, max_length):
+    layer_qkvh_data_list = []
+    data_iter = load_qkvh(
+        layer_data_root, device="cuda", start_layer=layer_indices[0], max_length=max_length
+    )
+    for i, layer_idx in enumerate(layer_indices):
+        try:
+            layer_data = next(data_iter)
+        except StopIteration:
+            raise RuntimeError(
+                f"Not enough layers to form batch size {len(layer_indices)} starting from layer_{layer_indices[0]}. "
+                f"Only found {i} layers."
+            )
+        layer_qkvh_data_list.append(layer_data)
+        print(f"[Info] Loaded data for layer_{layer_idx}")
 
-    q_rope = layer_data["q_rope"]
-    k_rope = layer_data["k_rope"]
-    v = layer_data["v"]
+    q_rope_list = [layer_data["q_rope"] for layer_data in layer_qkvh_data_list]
+    k_rope_list = [layer_data["k_rope"] for layer_data in layer_qkvh_data_list]
+    v_list = [layer_data["v"] for layer_data in layer_qkvh_data_list]
 
-    q_rope = q_rope.to("cuda", dtype=dtype)
-    k_rope = k_rope.to("cuda", dtype=dtype)
-    v = v.to("cuda", dtype=dtype)
+    q_rope_full = torch.cat(q_rope_list, dim=0).to(dtype=dtype)
+    k_rope_full = torch.cat(k_rope_list, dim=0).to(dtype=dtype)
+    v_full = torch.cat(v_list, dim=0).to(dtype=dtype)
 
-    if max_length is not None and max_length > 0:
-        q_rope = q_rope[..., :max_length, :]
-        k_rope = k_rope[..., :max_length, :]
-        v = v[..., :max_length, :]
-
-    return q_rope, k_rope, v
+    return q_rope_full, k_rope_full, v_full
 
 
 def main():
@@ -169,6 +175,7 @@ def main():
     step = int(args.step)
     iters = int(args.iters)
     warmup = int(args.warmup)
+    bsz = int(args.bsz)
     max_length = None if args.max_length is not None and args.max_length < 0 else args.max_length
 
     kernel_module, attn_forward_decode = load_kernel_components(args.kernel)
@@ -176,17 +183,19 @@ def main():
 
     exp_root = os.path.join(EXP_ROOT_DIR, EXP_ROOT_SUBDIR)
     layer_data_root = os.path.join(exp_root, "layer_data")
+    layer_indices = list(range(args.layer, args.layer + bsz))
+    layer_range_str = f"{layer_indices[0]}" if len(layer_indices) == 1 else f"{layer_indices[0]}-{layer_indices[-1]}"
 
     gpu_tag, gpu_name, gpu_mem_gb, gpu_idx = get_gpu_info()
     print(f"[Info] Using GPU[{gpu_idx}]: {gpu_name} ({gpu_mem_gb}GB)")
 
-    q_rope_full, k_rope_full, v_full = load_layer_batch(layer_data_root, args.layer, dtype, max_length)
+    q_rope_full, k_rope_full, v_full = load_layer_batch(layer_data_root, layer_indices, dtype, max_length)
 
-    B, Hq, T_full, K = q_rope_full.shape
+    bsz_actual, Hq, T_full, K = q_rope_full.shape
     _, Hkv, _, V = v_full.shape
     scale = 1.0 / math.sqrt(K)
 
-    print(f"[Info] Layer={args.layer}, B={B}, Hq={Hq}, Hkv={Hkv}, T_full={T_full}, K={K}, V={V}")
+    print(f"[Info] Layers={layer_indices}, bsz={bsz_actual}, Hq={Hq}, Hkv={Hkv}, T_full={T_full}, K={K}, V={V}")
 
     lengths = list(range(step, T_full, step)) + [T_full]
 
@@ -266,11 +275,13 @@ def main():
             f"max_abs={max_abs_vs_flash:.3e}, mean_abs={mean_abs_vs_flash:.3e}"
         )
 
-    print(f"[Info] Running delta={delta}")
-    plot_root_dir, raw_data_dir = build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, args.layer, max_length, THIS_DIR)
+    print(f"[Info] Running delta={delta} | layers={layer_range_str} | bsz={bsz}")
+    plot_root_dir, raw_data_dir = build_plot_dirs(
+        attn_kernel_name, gpu_tag, BS, SBS, delta, layer_indices, bsz, max_length, THIS_DIR
+    )
     cache_path = make_cache_file_path(
         raw_data_dir,
-        f"layer_{args.layer}",
+        f"layers_{layer_range_str}",
         T_full,
         Hq,
         Hkv,
@@ -283,6 +294,7 @@ def main():
         step,
         iters,
         warmup,
+        bsz=bsz,
     )
 
     if os.path.exists(cache_path):
@@ -290,14 +302,14 @@ def main():
         print(f"[Info] Loaded cached results from {cache_path}")
     else:
         q2_ms_list, flash_ms_list, skip_ratios = [], [], []
-        for L in tqdm(lengths, desc=f"delta={delta:g}"):
+        for L in tqdm(lengths, desc=f"delta={delta:g}, layers{layer_range_str}(bsz={bsz})"):
             ms_q2, ms_flash, sr = bench_one_length(L, delta)
             q2_ms_list.append(ms_q2)
             flash_ms_list.append(ms_flash)
             skip_ratios.append(sr)
         x_lengths = lengths
         meta = dict(
-            layer_idx=int(args.layer),
+            layer_indices=layer_indices,
             T_full=int(T_full),
             Hq=int(Hq),
             Hkv=int(Hkv),
@@ -311,6 +323,7 @@ def main():
             iters=int(iters),
             warmup=int(warmup),
             attn_kernel=attn_kernel_name,
+            bsz=int(bsz),
         )
         save_raw_cache(cache_path, meta, x_lengths, q2_ms_list, flash_ms_list, skip_ratios)
         print(f"[Info] Saved raw benchmark data to {cache_path}")
@@ -323,13 +336,13 @@ def main():
         BS,
         SBS,
         delta,
-        f"layer_{args.layer}",
+        f"layers_{layer_range_str}_bsz_{bsz}",
         plot_root_dir,
         attn_kernel_name,
         skip_ratios=skip_ratios,
     )
     print(
-        f"[Result] Layer {args.layer} | T={to_k_str(T_full)} | BS={BS} SBS={SBS} delta={delta} | "
+        f"[Result] Layers {layer_range_str} | bsz={bsz} | T={to_k_str(T_full)} | BS={BS} SBS={SBS} delta={delta} | "
         f"Q2={q2_ms_list[-1]:.3f} ms, Flash={flash_ms_list[-1]:.3f} ms"
     )
     print(f"[Result] Saved plot to: {plot_path}")

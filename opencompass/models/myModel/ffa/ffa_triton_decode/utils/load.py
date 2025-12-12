@@ -1,4 +1,5 @@
 import os, torch
+from typing import Optional
 # from tqdm import tqdm
 
 def load_attn_input(load_dir: str, device='cpu'):
@@ -25,13 +26,14 @@ def load_attn_input(load_dir: str, device='cpu'):
 
         yield data
         
-def load_qkvh(load_dir: str, device='cpu', start_layer: int = 0):
+def load_qkvh(load_dir: str, device='cpu', start_layer: int = 0, max_length: Optional[int] = None):
     """
     从指定的层开始加载每层的 q/k/v/h 数据。
     参数:
         load_dir (str): 根目录，包含 layer_0, layer_1, ... 子目录。
         device (str): 加载到的设备，例如 'cpu' 或 'cuda'。
         start_layer (int): 从该层开始（包含该层），例如 0 表示从 layer_0 开始。
+        max_length (int | None): 若设置为正数，则在加载后将序列长度截断到该值，防止显存溢出。
     生成:
         dict: 包含该层的 'q_rope', 'k_rope', 'q_unrope', 'k_unrope', 'v', 'h' 的张量。
     """
@@ -48,15 +50,26 @@ def load_qkvh(load_dir: str, device='cpu', start_layer: int = 0):
     # 校验起始层
     if not (0 <= start_layer < layer_num):
         raise ValueError(f"start_layer must be in [0, {layer_num - 1}], got {start_layer}")
+
+    def _truncate_tensor(t: torch.Tensor):
+        if max_length is None or max_length <= 0:
+            return t
+        if t.dim() >= 3:
+            return t[..., :max_length, :]
+        if t.dim() == 2:
+            return t[:, :max_length]
+        return t
+
     for i in range(start_layer, layer_num):
         layer_dir = os.path.join(load_dir, f"layer_{i}")
         load_data_list = ["q_rope", "k_rope", "q_unrope", "k_unrope", "v", "h"]
         data = {}
         for data_name in load_data_list:
             data_path = os.path.join(layer_dir, f"{data_name}.pt")
-            data[data_name] = torch.load(
+            tensor = torch.load(
                 data_path, weights_only=True, map_location=device
             )
+            data[data_name] = _truncate_tensor(tensor)
         yield data
 
 

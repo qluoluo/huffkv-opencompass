@@ -259,6 +259,8 @@ def attn_forward_decode_quantized(
     NSB = triton.cdiv(BS, SBS)
     NTBS = NTB * NSB
 
+    assert q.is_contiguous() and k_q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+    
     q = q.contiguous()
     k_q = k_q.contiguous()
     use_fp_k = k is not None

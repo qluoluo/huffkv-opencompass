@@ -131,7 +131,9 @@ def build_plot_dirs(attn_kernel_name, gpu_tag, BS, SBS, delta, bsz, max_length, 
 
 def load_layer_batch(layer_data_root, layer_indices, dtype, max_length):
     layer_qkvh_data_list = []
-    layer_qkvh_data_iter = load_qkvh(layer_data_root, device="cpu", start_layer=layer_indices[0])
+    layer_qkvh_data_iter = load_qkvh(
+        layer_data_root, device="cuda", start_layer=layer_indices[0], max_length=max_length
+    )
 
     for i, layer_idx in enumerate(layer_indices):
         try:
@@ -147,15 +149,10 @@ def load_layer_batch(layer_data_root, layer_indices, dtype, max_length):
         k_rope_full_list.append(layer_data["k_rope"])
         v_full_list.append(layer_data["v"])
 
-    q_rope_full = torch.cat(q_rope_full_list, dim=0).to("cuda", dtype=dtype)
-    k_rope_full = torch.cat(k_rope_full_list, dim=0).to("cuda", dtype=dtype)
-    v_full = torch.cat(v_full_list, dim=0).to("cuda", dtype=dtype)
+    q_rope_full = torch.cat(q_rope_full_list, dim=0).to(dtype=dtype)
+    k_rope_full = torch.cat(k_rope_full_list, dim=0).to(dtype=dtype)
+    v_full = torch.cat(v_full_list, dim=0).to(dtype=dtype)
     print(f"{q_rope_full.shape=}, {k_rope_full.shape=}, {v_full.shape=}")
-
-    if max_length is not None and max_length > 0:
-        q_rope_full = q_rope_full[..., :max_length, :]
-        k_rope_full = k_rope_full[..., :max_length, :]
-        v_full = v_full[..., :max_length, :]
 
     return q_rope_full, k_rope_full, v_full
 
