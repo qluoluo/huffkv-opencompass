@@ -114,3 +114,9 @@ try:
     print("[IMPORT] FFA import sucess!")
 except:
     pass
+
+try:
+    from .myModel.quest.oc_model import LlamaForCausalLM_Quest_OC
+    print("[IMPORT] Quest import success!")
+except:
+    pass
