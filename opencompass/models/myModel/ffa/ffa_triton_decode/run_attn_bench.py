@@ -4,6 +4,7 @@ import importlib
 import math
 import os
 import re
+import sys
 
 import torch
 from tqdm import tqdm
@@ -20,6 +21,10 @@ from utils.flash import flash_attn_compute
 from utils.load import load_qkvh
 from utils.plot import plot_speed_curve
 
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.append(THIS_DIR)
+
 EXP_ROOT_DIR = "/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105/projects/ffa/huffkv-opencompass/opencompass/models/myModel/ffa/attn_analysis/result"
 EXP_ROOT_SUBDIR = "Llama-3_2-3B/longbench_gov_report_48_68_256k"
 
@@ -29,7 +34,7 @@ def parse_args():
     parser.add_argument(
         "--kernel",
         type=str,
-        default="attn_kernel.attn_kernel_v1109_fused_bsz",
+        default="attn_kernel.attn_kernel_v1208_fused_bsz_fp8",
         help="Python module path for attn_forward_decode (e.g., attn_kernel.attn_kernel_v1029_fused_nothres)",
     )
     parser.add_argument("--dtype", type=str, default="fp16", choices=["fp16", "bf16", "fp32"])
@@ -91,7 +96,17 @@ def pack_k_hi_lo(k_fp16: torch.Tensor):
 
 
 def load_kernel_components(kernel_path: str):
-    kernel_module = importlib.import_module(kernel_path)
+    try:
+        kernel_module = importlib.import_module(kernel_path)
+    except ModuleNotFoundError as e:
+        # Allow passing bare module names such as "attn_kernel_vxxx.py" by automatically
+        # prefixing with the local attn_kernel package.
+        if "." not in kernel_path:
+            alt_kernel_path = f"attn_kernel.{kernel_path}"
+            kernel_module = importlib.import_module(alt_kernel_path)
+            kernel_path = alt_kernel_path
+        else:
+            raise e
     if not hasattr(kernel_module, "attn_forward_decode"):
         raise AttributeError(f"Module {kernel_path} does not define 'attn_forward_decode'")
 
@@ -202,11 +217,12 @@ def main():
         v = v_full[:, :, :L, :].contiguous()
 
         q, k, v = convert_layout(q_rope_1, k_rope, v)
+        q_4d = q.unsqueeze(1).contiguous()  # attn kernel expects [B, 1, Hq, D]
         k_hi8, k_lo8 = pack_k_hi_lo(k)
 
         def run_fused():
             return attn_forward_decode(
-                q=q,
+                q=q_4d,
                 k_hi8=k_hi8,
                 k_lo8=k_lo8,
                 k_fp16=k,
@@ -222,7 +238,7 @@ def main():
             return flash_attn_compute(q, k, v)
 
         output, sr = attn_forward_decode(
-            q=q,
+            q=q_4d,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
             k_fp16=k,
@@ -241,10 +257,11 @@ def main():
     def validate_full():
         q_rope_1 = q_rope_full[:, :, T_full - 1 : T_full, :].contiguous()
         q, k, v = convert_layout(q_rope_1, k_rope_full, v_full)
+        q_4d = q.unsqueeze(1).contiguous()
         k_hi8, k_lo8 = pack_k_hi_lo(k)
 
         o_triton, skip_ratio = attn_forward_decode(
-            q=q,
+            q=q_4d,
             k_hi8=k_hi8,
             k_lo8=k_lo8,
             k_fp16=k,
