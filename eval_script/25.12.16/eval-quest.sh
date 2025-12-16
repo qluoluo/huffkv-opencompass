@@ -1,14 +1,16 @@
 #!/bin/bash
 
-root_path=/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105
+root_path=/inspire/qb-ilm/project/exploration-topic/liuzhigeng-253108120105
+
+global_user_path=/inspire/hdd/global_user/liuzhigeng-253108120105
 
 script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)
 
-conda_path=${root_path}/miniconda/etc/profile.d/conda.sh
+conda_path=${global_user_path}/miniconda/etc/profile.d/conda.sh
 source ${conda_path}
 
 echo "### start quest eval ###"
-conda activate oc
+conda activate quest
 
 which python
 
