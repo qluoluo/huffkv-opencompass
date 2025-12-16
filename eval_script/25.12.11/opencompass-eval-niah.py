@@ -17,7 +17,8 @@ with read_base():
     # from opencompass.configs.datasets.longbench.longbench import longbench_datasets
 
 # 全局配置
-MODEL_PATH = "/inspire/hdd/project/exploration-topic/liuzhigeng-253108120105/models/Llama-3_2-3B"
+MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
+# MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3-8B"
 
 MAX_SEQ_LEN = 32 * 1024
 MAX_OUT_LEN = 50
