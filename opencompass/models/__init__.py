@@ -120,3 +120,9 @@ try:
     print("[IMPORT] Quest import success!")
 except:
     pass
+
+try:
+    from .myModel.twilight.oc_model import LlamaForCausalLM_Twilight_OC
+    print("[IMPORT] Twilight import success!")
+except:
+    pass
