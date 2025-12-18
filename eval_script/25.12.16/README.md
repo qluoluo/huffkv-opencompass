@@ -11,7 +11,7 @@
 ```bash
 bash eval-quest.sh
 # 或附加 OpenCompass 额外参数
-bash eval-quest.sh --max-partition-size 1
+bash eval-quest.sh -r
 ```
 
 如需修改模型路径或 Quest 配置，请编辑 `opencompass-eval-quest.py` 中的 `MODEL_PATH`、`MODEL_CONFIG_LIST`。

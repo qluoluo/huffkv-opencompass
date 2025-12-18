@@ -42,11 +42,11 @@ models = []
 
 # Quest 配置
 MODEL_CONFIG_LIST = [
-    # {
-    #     "abbr": "quest-ps16-b256",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 256,
-    # },
+    {
+        "abbr": "quest-ps16-b256",
+        "quest_page_size": 16,
+        "quest_token_budget": 256,
+    },
     # {
     #     "abbr": "quest-ps16-b512",
     #     "quest_page_size": 16,

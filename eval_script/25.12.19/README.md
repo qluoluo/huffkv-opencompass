@@ -11,7 +11,7 @@
 ```bash
 bash eval-twilight.sh
 # 或附加 OpenCompass 额外参数
-bash eval-twilight.sh --max-partition-size 1
+bash eval-twilight.sh -r
 ```
 
 如需修改模型路径或 Twilight 配置，请编辑 `opencompass-eval-twilight.py` 中的 `MODEL_PATH`、`MODEL_CONFIG_LIST`，或在运行脚本时覆盖 OpenCompass 参数。
