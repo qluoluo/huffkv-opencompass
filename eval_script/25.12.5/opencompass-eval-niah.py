@@ -4,7 +4,7 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 from mmengine.config import read_base
 
-from opencompass.models import LlamaForCausalLM_FFA_OC as LlamaForCausalLM_OC
+from opencompass.models import LlamaForCausalLM_FFA_OC as LlamaForCausalLM_FFA_OC
 
 # 导入数据集和汇总器配置
 with read_base():
@@ -86,7 +86,7 @@ for model_config in MODEL_CONFIG_LIST:
     model_kwargs = model_config
     
     models.append(dict(
-        type=LlamaForCausalLM_OC,
+        type=LlamaForCausalLM_FFA_OC,
         # abbr=config["abbr"],
         abbr=abbr,
         path=MODEL_PATH,

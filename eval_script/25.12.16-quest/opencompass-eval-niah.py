@@ -9,9 +9,14 @@ from opencompass.models import LlamaForCausalLM_Quest_OC as LlamaForCausalLM_OC
 
 # 导入数据集和汇总器配置
 with read_base():
+    # from ...opencompass.configs.datasets.needlebench.needlebench_32k.needlebench_32k import (
+    #     needlebench_origin_en_datasets,
+    # )
+    
     from ...opencompass.configs.datasets.needlebench.needlebench_32k.needlebench_32k import (
-        needlebench_origin_en_datasets,
+        needlebench_datasets
     )
+    
     from ...opencompass.configs.summarizers.needlebench import (
         needlebench_32k_summarizer as summarizer,
     )
@@ -42,7 +47,8 @@ DEFAULT_MODEL_KWARGS = dict(
 
 # 数据集配置
 datasets = []
-datasets += needlebench_origin_en_datasets
+# datasets += needlebench_origin_en_datasets
+datasets += needlebench_datasets
 
 # 构建模型列表
 models = []
@@ -53,38 +59,22 @@ MODEL_CONFIG_LIST = [
         "abbr": "quest-ps16-b256",
         "quest_page_size": 16,
         "quest_token_budget": 256,
-        "quest_max_seq_len": 33 * 1024,
+        "quest_max_seq_len": 32 * 1024,
     },
-    # {
-    #     "abbr": "quest-ps16-b512",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 512,
-    # },
-    # {
-    #     "abbr": "quest-ps16-b1024",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 1024,
-    # },
-    # {
-    #     "abbr": "quest-ps16-b2048",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 2048,
-    # },
-    # {
-    #     "abbr": "quest-ps16-b4096",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 4096,
-    # },
-    # {
-    #     "abbr": "quest-ps16-b8192",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 8192,
-    # },
-    # {
-    #     "abbr": "quest-ps16-b16384",
-    #     "quest_page_size": 16,
-    #     "quest_token_budget": 16384,
-    # },
+    
+    {
+        "abbr": "quest-ps16-b2048",
+        "quest_page_size": 16,
+        "quest_token_budget": 2048,
+        "quest_max_seq_len": 32 * 1024,
+    },
+    
+    {
+        "abbr": "quest-ps16-b4096",
+        "quest_page_size": 16,
+        "quest_token_budget": 4096,
+        "quest_max_seq_len": 32 * 1024,
+    },
 ]
 
 

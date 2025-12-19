@@ -4,17 +4,16 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 from mmengine.config import read_base
 
-from opencompass.models import LlamaForCausalLM_FFA_OC as LlamaForCausalLM_OC
+from opencompass.models import LlamaForCausalLM_FFA_OC
+from opencompass.models import HuggingFaceCausalLM_Strip as HuggingFaceCausalLM
 
 # 导入数据集和汇总器配置
 with read_base():
-    # from opencompass.configs.datasets.needlebench.needlebench_32k.needlebench_32k import needlebench_origin_en_datasets
-    # from opencompass.configs.summarizers.needlebench import needlebench_32k_summarizer as summarizer
-    
-    from ...opencompass.configs.datasets.needlebench.needlebench_32k.needlebench_32k import needlebench_origin_en_datasets
-    from ...opencompass.configs.summarizers.needlebench import needlebench_32k_summarizer as summarizer
-    
-    # from opencompass.configs.datasets.longbench.longbench import longbench_datasets
+    from ...opencompass.configs.datasets.ruler.ruler_32k_gen import ruler_datasets
+    # from ...opencompass.configs.summarizers.ruler import (
+    #     ruler_32k_summarizer as summarizer,
+    # )
+
 
 # 全局配置
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
@@ -23,7 +22,7 @@ MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3.1-
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3-8B"
 
 MAX_SEQ_LEN = 32 * 1024
-MAX_OUT_LEN = 50
+MAX_OUT_LEN = 64
 BATCH_SIZE = 1
 RUN_CFG = dict(num_gpus=1, num_procs=1)
 
@@ -37,8 +36,7 @@ DEFAULT_MODEL_KWARGS = dict(
 
 # 数据集配置
 datasets = []
-datasets += needlebench_origin_en_datasets
-# datasets += longbench_datasets
+datasets += ruler_datasets
 
 # 模型量化配置
 MODEL_CONFIG_LIST = [
@@ -46,10 +44,10 @@ MODEL_CONFIG_LIST = [
         "use_ffa_decode": True,
         "delta": 5.0,
     },
-    # {"abbr": "ffa-decode-delta3", 
-    #     "use_ffa_decode": True,
-    #     "delta": 3.0,
-    # },
+    {"abbr": "ffa-decode-delta3", 
+        "use_ffa_decode": True,
+        "delta": 3.0,
+    },
     # {"abbr": "ffa-decode-delta8", 
     #     "use_ffa_decode": True,
     #     "delta": 8.0,
@@ -60,9 +58,7 @@ MODEL_CONFIG_LIST = [
     },
 ]
 
-MODEL_CONFIG_LIST.append(
-    {"abbr": "base",}
-)
+
 
 # 构建模型列表
 models = []
@@ -71,12 +67,18 @@ for model_config in MODEL_CONFIG_LIST:
     model_kwargs = model_config
     
     models.append(dict(
-        type=LlamaForCausalLM_OC,
+        type=LlamaForCausalLM_FFA_OC,
         # abbr=config["abbr"],
         abbr=abbr,
         path=MODEL_PATH,
         model_kwargs=model_kwargs,
     ))
+    
+models.append(dict(
+    type=HuggingFaceCausalLM,
+    abbr="base",
+    path=MODEL_PATH,
+))
 
 # 为所有模型添加通用配置
 for model in models:

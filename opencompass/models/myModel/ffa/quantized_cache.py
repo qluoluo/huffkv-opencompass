@@ -295,6 +295,6 @@ class QuantizedCache(Cache):
         if self.offloading:
             self.offload(layer_idx, self.only_non_sliding)
             
-        print(f"update for {layer_idx=}, {key_states.shape=} {value_states.shape=} {keys.shape=} {values.shape=}")
+        # print(f"update for {layer_idx=}, {key_states.shape=} {value_states.shape=} {keys.shape=} {values.shape=}")
 
         return keys, values
