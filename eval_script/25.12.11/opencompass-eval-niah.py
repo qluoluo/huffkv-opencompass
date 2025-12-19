@@ -17,7 +17,9 @@ with read_base():
     # from opencompass.configs.datasets.longbench.longbench import longbench_datasets
 
 # 全局配置
-MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
+# MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
+MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3.1-8B"
+
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3-8B"
 
 MAX_SEQ_LEN = 32 * 1024
@@ -44,40 +46,18 @@ MODEL_CONFIG_LIST = [
         "use_ffa_decode": True,
         "delta": 5.0,
     },
-    {"abbr": "ffa-decode-delta3", 
-        "use_ffa_decode": True,
-        "delta": 3.0,
-    },
-    {"abbr": "ffa-decode-delta8", 
-        "use_ffa_decode": True,
-        "delta": 8.0,
-    },
+    # {"abbr": "ffa-decode-delta3", 
+    #     "use_ffa_decode": True,
+    #     "delta": 3.0,
+    # },
+    # {"abbr": "ffa-decode-delta8", 
+    #     "use_ffa_decode": True,
+    #     "delta": 8.0,
+    # },
     {"abbr": "ffa-decode-delta10", 
         "use_ffa_decode": True,
         "delta": 10.0,
     },
-    
-    # {"abbr": "ffa-decode-delta5-firsthalf", 
-    #     "use_ffa_decode": True,
-    #     "delta": 5.0,
-    #     "pattern_layers": list(range(0, 14))
-    # },
-    # {"abbr": "ffa-decode-delta8-firsthalf", 
-    #     "use_ffa_decode": True,
-    #     "delta": 8.0,
-    #     "pattern_layers": list(range(0, 14))
-    # },
-    
-    # {"abbr": "ffa-decode-delta5-lasthalf", 
-    #     "use_ffa_decode": True,
-    #     "delta": 5.0,
-    #     "pattern_layers": list(range(14, 28))
-    # },
-    # {"abbr": "ffa-decode-delta8-lasthalf", 
-    #     "use_ffa_decode": True,
-    #     "delta": 8.0,
-    #     "pattern_layers": list(range(14, 28))
-    # },
 ]
 
 MODEL_CONFIG_LIST.append(

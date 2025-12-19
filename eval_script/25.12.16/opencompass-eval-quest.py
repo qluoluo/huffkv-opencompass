@@ -15,6 +15,13 @@ with read_base():
     from ...opencompass.configs.summarizers.needlebench import (
         needlebench_32k_summarizer as summarizer,
     )
+    
+    # from ...opencompass.configs.datasets.needlebench.needlebench_128k.needlebench_128k import (
+    #     needlebench_origin_en_datasets,
+    # )
+    # from ...opencompass.configs.summarizers.needlebench import (
+    #     needlebench_128k_summarizer as summarizer,
+    # )
 
 # 全局配置
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
@@ -46,6 +53,7 @@ MODEL_CONFIG_LIST = [
         "abbr": "quest-ps16-b256",
         "quest_page_size": 16,
         "quest_token_budget": 256,
+        "quest_max_seq_len": 33 * 1024,
     },
     # {
     #     "abbr": "quest-ps16-b512",
@@ -72,11 +80,11 @@ MODEL_CONFIG_LIST = [
     #     "quest_page_size": 16,
     #     "quest_token_budget": 8192,
     # },
-    {
-        "abbr": "quest-ps16-b16384",
-        "quest_page_size": 16,
-        "quest_token_budget": 16384,
-    },
+    # {
+    #     "abbr": "quest-ps16-b16384",
+    #     "quest_page_size": 16,
+    #     "quest_token_budget": 16384,
+    # },
 ]
 
 
