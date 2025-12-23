@@ -309,6 +309,15 @@ class LlamaAttention(nn.Module):
                     if k not in ("use_ffa_prefill", "use_ffa_decode", "pattern_layers")
                 }
                 decode_kwargs.setdefault("k_bits", getattr(past_key_values, "key_bits", 2))
+                decode_kernel = decode_kwargs.get("ffa_decode_kernel")
+                use_q2fp8 = (
+                    isinstance(decode_kernel, str)
+                    and decode_kernel.strip().lower() in ("q2fp8", "q2_fp8", "fp8")
+                )
+                use_fp8_residual = decode_kwargs.get("use_fp8_residual", True)
+                k_residual = cache_layer.key_residual if use_q2fp8 else None
+                if use_q2fp8 and use_fp8_residual and k_residual is None:
+                    raise RuntimeError("QuantizedCache is missing fp8 residual keys for q2fp8 decode.")
 
                 attn_output = attn_forward_decode(
                     q=query_states.transpose(1, 2),
@@ -318,6 +327,7 @@ class LlamaAttention(nn.Module):
                     v=value_states.transpose(1, 2),
                     # k=cache_layer.key_original if decode_kwargs.get("use_fp_k", False) else None,
                     k=key_states.transpose(1,2),
+                    k_residual=k_residual,
                     **decode_kwargs,
                 )
             else:

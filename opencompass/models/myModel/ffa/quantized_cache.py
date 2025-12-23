@@ -16,6 +16,11 @@ def _select_quant_dtype(bits: int) -> torch.dtype:
     return torch.int32
 
 
+def _default_fp8_dtype() -> torch.dtype:
+    fp8_dtype = getattr(torch, "float8_e5m2", None)
+    return fp8_dtype or torch.float16
+
+
 def _compute_quant_params(x: torch.Tensor, nbit: int, dim: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute per-channel scale/zero-point along a given dimension."""
     x_min = x.amin(dim=dim)
@@ -78,6 +83,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self,
         key_bits: int = 2,
         key_quant_dim: int = 1,
+        store_fp8_residual: bool = False,
+        fp8_residual_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         print(f"{__class__} init!")
@@ -87,12 +94,15 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.seq_dim = 1  # sequence dimension for [B, T, H, D]
         # Only pack when the bit-width evenly divides a byte; otherwise fall back to 1-value-per-byte.
         self.vals_per_byte = 8 // self.key_bits if self.key_bits > 0 and 8 % self.key_bits == 0 else 1
+        self.store_fp8_residual = store_fp8_residual
+        self.fp8_residual_dtype = fp8_residual_dtype or _default_fp8_dtype()
 
         self.key_quantized: Optional[torch.Tensor] = None
         self.key_scale: Optional[torch.Tensor] = None
         self.key_zero_point: Optional[torch.Tensor] = None
         self.key_original: Optional[torch.Tensor] = None
         self.value_original: Optional[torch.Tensor] = None
+        self.key_residual: Optional[torch.Tensor] = None
         self.keys: Optional[torch.Tensor] = None
         self.values: Optional[torch.Tensor] = None
 
@@ -111,16 +121,32 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.keys = self.key_original
         self.values = self.value_original
 
-    def _quantize_keys(self, key_states: torch.Tensor) -> torch.Tensor:
+    def _quantize_keys(self, key_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.key_scale is None or self.key_zero_point is None:
             self.key_scale, self.key_zero_point = _compute_quant_params(key_states, self.key_bits, self.key_quant_dim)
         elif self.key_scale.device != key_states.device:
             self.key_scale = self.key_scale.to(key_states.device, non_blocking=True)
             self.key_zero_point = self.key_zero_point.to(key_states.device, non_blocking=True)
-        k_quant = _quantize_with_params(key_states, self.key_scale, self.key_zero_point, self.key_bits, self.key_quant_dim)
+        k_quant = _quantize_with_params(
+            key_states, self.key_scale, self.key_zero_point, self.key_bits, self.key_quant_dim
+        )
         if self.vals_per_byte > 1:
-            k_quant = _pack_bits(k_quant, self.key_bits, self.vals_per_byte)
-        return k_quant.to(self.key_quant_dtype)
+            k_quant_packed = _pack_bits(k_quant, self.key_bits, self.vals_per_byte)
+        else:
+            k_quant_packed = k_quant
+        return k_quant_packed.to(self.key_quant_dtype), k_quant
+
+    def _compute_fp8_residual(self, key_states: torch.Tensor, k_quant: torch.Tensor) -> torch.Tensor:
+        scale = self.key_scale
+        zero_point = self.key_zero_point
+        if scale is None or zero_point is None:
+            raise RuntimeError("QuantizedCache missing scale/zero for residual computation.")
+        if scale.dim() == key_states.dim() - 1:
+            scale = scale.unsqueeze(self.key_quant_dim)
+            zero_point = zero_point.unsqueeze(self.key_quant_dim)
+        k_dequant = k_quant.to(torch.float32) * scale.to(torch.float32) + zero_point.to(torch.float32)
+        residual = (key_states.to(torch.float32) - k_dequant).to(self.fp8_residual_dtype)
+        return residual.contiguous()
 
     def update(
         self,
@@ -131,11 +157,14 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         if not self.is_initialized:
             self.lazy_initialization(key_states)
 
-        k_quant = self._quantize_keys(key_states)
+        k_quant_packed, k_quant = self._quantize_keys(key_states)
 
-        self.key_quantized = self._append(self.key_quantized, k_quant)
+        self.key_quantized = self._append(self.key_quantized, k_quant_packed)
         self.key_original = self._append(self.key_original, key_states)
         self.value_original = self._append(self.value_original, value_states)
+        if self.store_fp8_residual:
+            k_residual = self._compute_fp8_residual(key_states, k_quant)
+            self.key_residual = self._append(self.key_residual, k_residual)
         self._refresh_fp_cache()
 
         return self.keys, self.values
@@ -169,6 +198,7 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.key_quantized = self._slice_along_seq(self.key_quantized, max_length)
         self.key_original = self._slice_along_seq(self.key_original, max_length)
         self.value_original = self._slice_along_seq(self.value_original, max_length)
+        self.key_residual = self._slice_along_seq(self.key_residual, max_length)
         self._refresh_fp_cache()
 
     def batch_repeat_interleave(self, repeats: int) -> None:
@@ -177,6 +207,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.key_quantized = self.key_quantized.repeat_interleave(repeats, dim=0)
         self.key_original = self.key_original.repeat_interleave(repeats, dim=0)
         self.value_original = self.value_original.repeat_interleave(repeats, dim=0)
+        if self.key_residual is not None:
+            self.key_residual = self.key_residual.repeat_interleave(repeats, dim=0)
         if self.key_scale is not None:
             self.key_scale = self.key_scale.repeat_interleave(repeats, dim=0)
         if self.key_zero_point is not None:
@@ -190,6 +222,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.key_quantized = self.key_quantized.index_select(0, indices)
         self.key_original = self.key_original.index_select(0, indices)
         self.value_original = self.value_original.index_select(0, indices)
+        if self.key_residual is not None:
+            self.key_residual = self.key_residual.index_select(0, indices)
         if self.key_scale is not None:
             self.key_scale = self.key_scale.index_select(0, indices)
         if self.key_zero_point is not None:
@@ -203,6 +237,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
         self.key_quantized = self.key_quantized.index_select(0, beam_idx)
         self.key_original = self.key_original.index_select(0, beam_idx)
         self.value_original = self.value_original.index_select(0, beam_idx)
+        if self.key_residual is not None:
+            self.key_residual = self.key_residual.index_select(0, beam_idx)
         if self.key_scale is not None:
             self.key_scale = self.key_scale.index_select(0, beam_idx)
         if self.key_zero_point is not None:
@@ -218,6 +254,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
             self.key_original = self.key_original.narrow(self.seq_dim, 0, 0).contiguous()
         if self.value_original is not None:
             self.value_original = self.value_original.narrow(self.seq_dim, 0, 0).contiguous()
+        if self.key_residual is not None:
+            self.key_residual = self.key_residual.narrow(self.seq_dim, 0, 0).contiguous()
         self.key_scale = None
         self.key_zero_point = None
         self._refresh_fp_cache()
@@ -232,6 +270,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
                 self.key_original = self.key_original.to("cpu", non_blocking=True)
             if self.value_original is not None:
                 self.value_original = self.value_original.to("cpu", non_blocking=True)
+            if self.key_residual is not None:
+                self.key_residual = self.key_residual.to("cpu", non_blocking=True)
         super().offload()
 
     def prefetch(self):
@@ -244,6 +284,8 @@ class QuantizedDynamicLayer(CacheLayerMixin):
                 self.key_original = self.key_original.to(self.device, non_blocking=True)
             if self.value_original is not None:
                 self.value_original = self.value_original.to(self.device, non_blocking=True)
+            if self.key_residual is not None:
+                self.key_residual = self.key_residual.to(self.device, non_blocking=True)
         super().prefetch()
 
 
@@ -260,6 +302,8 @@ class QuantizedCache(Cache):
         self,
         key_bits: int = 2,
         key_quant_dim: int = 1,
+        store_fp8_residual: bool = False,
+        fp8_residual_dtype: torch.dtype | None = None,
         offloading: bool = False,
         offload_only_non_sliding: bool = True,
     ):
@@ -267,6 +311,8 @@ class QuantizedCache(Cache):
         super().__init__(layers=[], offloading=offloading, offload_only_non_sliding=offload_only_non_sliding)
         self.key_bits = key_bits
         self.key_quant_dim = key_quant_dim
+        self.store_fp8_residual = store_fp8_residual
+        self.fp8_residual_dtype = fp8_residual_dtype or _default_fp8_dtype()
 
     def _ensure_layer(self, layer_idx: int):
         while len(self.layers) <= layer_idx:
@@ -274,6 +320,8 @@ class QuantizedCache(Cache):
                 QuantizedDynamicLayer(
                     key_bits=self.key_bits,
                     key_quant_dim=self.key_quant_dim,
+                    store_fp8_residual=self.store_fp8_residual,
+                    fp8_residual_dtype=self.fp8_residual_dtype,
                 )
             )
 

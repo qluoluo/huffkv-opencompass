@@ -48,6 +48,9 @@ class LlamaForCausalLM_FFA_OC(HuggingFaceCausalLM):
             SBS=None,
             return_skip_ratio=False,
             use_fp_k=False,
+            ffa_decode_kernel="q2",
+            use_fp8_residual=True,
+            fp8_residual_dtype=None,
         )
         # 允许外部传入 use_ffa 作为简写，默认只开启 decode 路径（prefill 尚未实现）
         use_ffa_flag = model_kwargs.pop("use_ffa", None)
@@ -82,10 +85,19 @@ class LlamaForCausalLM_FFA_OC(HuggingFaceCausalLM):
         self.model.generation_config.do_sample = False
 
     def generate(self, inputs: List[str], **kwargs) -> List[str]:
-        
+        decode_kernel = self.config_attn_settings.get("ffa_decode_kernel", "q2")
+        use_fp8_residual = self.config_attn_settings.get("use_fp8_residual", True)
+        store_fp8_residual = (
+            isinstance(decode_kernel, str)
+            and decode_kernel.strip().lower() in ("q2fp8", "q2_fp8", "fp8")
+            and use_fp8_residual
+        )
+
         self.generation_kwargs['past_key_values'] = QuantizedCache(
             key_bits=self.config_attn_settings.get("k_bits", 2),
             key_quant_dim=self.config_attn_settings.get("k_quant_dim", 1),
+            store_fp8_residual=store_fp8_residual,
+            fp8_residual_dtype=self.config_attn_settings.get("fp8_residual_dtype"),
         )
         
         return super().generate(inputs, **kwargs)
