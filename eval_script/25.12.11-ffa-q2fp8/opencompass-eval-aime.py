@@ -11,9 +11,6 @@ from opencompass.datasets import MATHEvaluator
 # Dataset config imports
 with read_base():
     from ...opencompass.configs.datasets.aime2024.aime2024_gen import aime2024_datasets
-    # from ...opencompass.configs.datasets.aime2025.aime2025_cascade_eval_gen_5e9f4f import (
-    #     aime2025_datasets
-    # )
 
 
 # Global config
@@ -38,7 +35,6 @@ DEFAULT_MODEL_KWARGS = dict(
 # Dataset config
 datasets = []
 datasets += aime2024_datasets
-datasets += aime2025_datasets
 
 for dataset in datasets:
     if dataset.get('abbr') == 'aime2024':
