@@ -4,7 +4,7 @@ from opencompass.runners import LocalRunner
 from opencompass.tasks import OpenICLInferTask, OpenICLEvalTask
 from mmengine.config import read_base
 
-from opencompass.models import LlamaForCausalLM_FFA_OC
+from opencompass.models import HF_ForCausalLM_FFA_OC
 from opencompass.models import HuggingFaceCausalLM_Strip as HuggingFaceCausalLM
 
 # Dataset config imports
@@ -14,11 +14,13 @@ with read_base():
 
 # Global config
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3_2-3B"
-MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3.1-8B"
+# MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3.1-8B"
+
+MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Qwen3-4B"
 
 # MODEL_PATH = "/inspire/hdd/global_user/liuzhigeng-253108120105/models/Llama-3-8B"
 
-MAX_SEQ_LEN = 32 * 1024
+MAX_SEQ_LEN = 32 * 1024 
 MAX_OUT_LEN = 64
 BATCH_SIZE = 1
 RUN_CFG = dict(num_gpus=1, num_procs=1)
@@ -66,7 +68,7 @@ for model_config in MODEL_CONFIG_LIST:
     model_kwargs = model_config
     
     models.append(dict(
-        type=LlamaForCausalLM_FFA_OC,
+        type=HF_ForCausalLM_FFA_OC,
         # abbr=config["abbr"],
         abbr=abbr,
         path=MODEL_PATH,

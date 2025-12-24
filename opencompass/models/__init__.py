@@ -110,7 +110,7 @@ except:
 
 
 try:
-    from .myModel.ffa.oc_model import LlamaForCausalLM_FFA_OC
+    from .myModel.ffa.oc_model import HF_ForCausalLM_FFA_OC
     print("[IMPORT] FFA import sucess!")
 except:
     pass

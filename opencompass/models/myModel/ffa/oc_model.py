@@ -22,12 +22,13 @@ from opencompass.models.myModel.hf_strip_model import (
     HuggingFaceCausalLM_Strip as HuggingFaceCausalLM,
 )
 from .modeling_llama import LlamaForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM
 from .quantized_cache import QuantizedCache
-from transformers import LlamaConfig
+from transformers import AutoConfig
 
 
 @MODELS.register_module()
-class LlamaForCausalLM_FFA_OC(HuggingFaceCausalLM):
+class HF_ForCausalLM_FFA_OC(HuggingFaceCausalLM):
     def _load_model(
         self,
         path: str,
@@ -66,13 +67,24 @@ class LlamaForCausalLM_FFA_OC(HuggingFaceCausalLM):
         # self._set_model_kwargs_torch_dtype(model_kwargs)
 
         # 从预训练路径加载配置
-        config = LlamaConfig.from_pretrained(path)
+        trust_remote_code = model_kwargs.get("trust_remote_code", False)
+
+        config = AutoConfig.from_pretrained(path, trust_remote_code=trust_remote_code)
+        model_type = getattr(config, "model_type", None)
+        if model_type not in ("llama", "qwen3"):
+            raise ValueError(
+                "LlamaForCausalLM_FFA_OC only supports llama/qwen3 models, "
+                f"got model_type={model_type} for path={path}"
+            )
         config.attn_settings = config_attn_settings
         self.config_attn_settings = config_attn_settings
 
-        self.model = LlamaForCausalLM.from_pretrained(
-            pretrained_model_name_or_path=path, config=config, **model_kwargs
-        )
+        if model_type == "llama":
+            self.model = LlamaForCausalLM.from_pretrained(
+                pretrained_model_name_or_path=path, config=config, **model_kwargs
+            )
+        else:
+            self.model = Qwen3ForCausalLM.from_pretrained(path, config=config, **model_kwargs)
 
         # self.model = AutoModelForCausalLM.from_pretrained(path, **model_kwargs)
         if peft_path is not None:
