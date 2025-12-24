@@ -6,7 +6,6 @@ from mmengine.config import read_base
 
 from opencompass.models import LlamaForCausalLM_FFA_OC
 from opencompass.models import HuggingFaceCausalLM_Strip as HuggingFaceCausalLM
-from opencompass.datasets import MATHEvaluator
 
 # Dataset config imports
 with read_base():
@@ -35,11 +34,6 @@ DEFAULT_MODEL_KWARGS = dict(
 # Dataset config
 datasets = []
 datasets += aime2024_datasets
-
-for dataset in datasets:
-    if dataset.get('abbr') == 'aime2024':
-        dataset.setdefault('eval_cfg', {})['evaluator'] = dict(
-            type=MATHEvaluator)
 
 # Model quantization config
 MODEL_CONFIG_LIST = [

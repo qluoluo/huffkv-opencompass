@@ -8,7 +8,7 @@ script_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)
 conda_path=${global_user_path}/miniconda/etc/profile.d/conda.sh
 source ${conda_path}
 
-echo "### start aime eval ###"
+echo "### start aime llmverify eval ###"
 conda activate oc
 
 which python
@@ -18,7 +18,7 @@ cd $OC_PATH_ROOT
 
 sleep 3
 
-opencompass ${script_dir}/opencompass-eval-aime.py -w ${script_dir}/oc-eval-result/aime "$@"
+opencompass ${script_dir}/opencompass-eval-aime-llmverify.py -w ${script_dir}/oc-eval-result/aime-llmverify "$@"
 
 sleep 3
 
